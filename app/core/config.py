@@ -35,6 +35,41 @@ DEFAULT_SESSION_TTL_HOURS = 12
 DEFAULT_BOXOFFICE_URL = "https://www.boxofficemojo.com/weekly/"
 
 
+def unwritable_data_dir_message(data_dir: Path) -> str:
+    """What to tell someone whose data directory is not theirs to write.
+
+    Names the uid that owns it, because that is the difference between the two causes:
+    root means Docker made the directory and nothing prepared it, anything else means
+    the app and its data belong to different users.
+    """
+    # Imported here rather than repeated, so the uid a user is told to chown to cannot
+    # drift from the one the app actually runs as. Local import: provision is a
+    # root-only entrypoint and has no business loading on every settings import.
+    from app.core.provision import APP_UID
+
+    try:
+        owner = str(data_dir.stat().st_uid)
+    except OSError:
+        owner = "unknown"
+    return (
+        "\n" + "=" * 70 + "\n"
+        f"  BoxMedia cannot write to {data_dir}.\n"
+        "\n"
+        f"  It runs as uid {APP_UID}, but that directory belongs to uid {owner}.\n"
+        "  Docker creates a missing bind-mount directory as root, and this container\n"
+        "  is unprivileged with a read-only filesystem, so it cannot fix that itself.\n"
+        "\n"
+        "  Using the published docker-compose.yml? The `init` service does this for\n"
+        "  you on first run. Check that it is present, and that BM_DATA_PATH in .env\n"
+        "  points at the same directory this service mounts — init preparing one path\n"
+        "  while the app mounts another looks exactly like this.\n"
+        "\n"
+        "  Otherwise, on the host:\n"
+        f"    sudo chown -R {APP_UID}:{APP_UID} <your data directory>\n"
+        + "=" * 70 + "\n"
+    )
+
+
 class Settings(BaseSettings):
     """Validated application settings.
 
@@ -130,7 +165,15 @@ class Settings(BaseSettings):
         return self.data_dir / "backups"
 
     def ensure_data_dirs(self) -> None:
-        """Create the runtime directory layout if missing (idempotent)."""
+        """Create the runtime directory layout if missing (idempotent).
+
+        A PermissionError here is not a fault in the app — it is the data directory
+        belonging to somebody else, which is far and away the most common way a first
+        install goes wrong. Docker creates a missing bind-mount source as root, and this
+        container runs unprivileged on a read-only filesystem, so it cannot repair that
+        itself. What it CAN do is say so in words, instead of a forty-line traceback
+        that names pathlib and blames nothing.
+        """
         for directory in (
             self.config_dir,
             self.history_dir,
@@ -138,7 +181,10 @@ class Settings(BaseSettings):
             self.cache_dir / "posters",
             self.backups_dir,
         ):
-            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                raise SystemExit(unwritable_data_dir_message(self.data_dir)) from None
 
     def public_summary(self) -> dict[str, object]:
         """Non-secret config for the config-check entrypoint and logs."""

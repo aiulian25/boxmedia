@@ -129,3 +129,47 @@ def test_a_key_path_docker_turned_into_a_directory_is_cleared(
 
     assert provision.prepare_key(key, tmp_path / "data") is True
     assert key.is_file()
+
+
+# --- what the app says when nothing prepared its data directory ---
+
+
+def test_an_unwritable_data_dir_explains_itself_instead_of_crashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported failure, twice: a forty-line traceback ending in `os.mkdir` that
+    names pathlib and blames nothing. It must name the directory, both uids, and the
+    two things that actually cause it."""
+    from app.core.config import Settings
+
+    data = tmp_path / "data"
+    data.mkdir()
+    data.chmod(0o500)  # readable, not writable — what a root-owned mount looks like
+    settings = Settings(
+        _env_file=None, session_secret="s" * 40,
+        encryption_key_file=tmp_path / "k.key", data_dir=data,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        settings.ensure_data_dirs()
+
+    message = str(raised.value)
+    assert str(data) in message
+    assert str(provision.APP_UID) in message
+    assert "init" in message                    # the compose service that prepares it
+    assert "BM_DATA_PATH" in message            # the desync cause
+    assert "chown" in message                   # the manual escape hatch
+    assert "Traceback" not in message
+
+
+def test_the_compose_services_cannot_be_pointed_at_different_directories() -> None:
+    """init preparing one path while the app mounts another fails IDENTICALLY to an
+    unprepared install — a footgun this file's own fix introduced. Both services must
+    read the same variables, so a user changes a path once, in .env."""
+    compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text()
+
+    assert compose.count("${BM_DATA_PATH:-./data}:/data") == 2
+    assert compose.count("${BM_SECRETS_PATH:-./secrets}:/secrets") == 2
+    # No bare host paths left to drift out of sync.
+    assert "- ./data:/data" not in compose
+    assert "- ./secrets:/secrets" not in compose
