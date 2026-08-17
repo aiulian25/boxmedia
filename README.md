@@ -111,32 +111,22 @@ Grab [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.exampl
 into an empty folder, then:
 
 ```bash
-# 0. Create the app's two folders and hand them to its user. The container runs
-#    as non-root uid 65532 on a read-only filesystem, so it cannot create or
-#    chown these itself — skipping this step fails at the next one with
-#    "Permission denied".
-mkdir -p data secrets
-sudo chown 65532:65532 data secrets
-#    (no sudo? docker can do it: docker run --rm -u 0 -v "$PWD:/w" \
-#     --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.0.0 \
-#     -c "import os; [os.chown(f'/w/{d}', 65532, 65532) for d in ('data','secrets')]")
-
-# 1. Generate the encryption key (encrypts stored Radarr API keys + backups).
-#    Keep it OUTSIDE ./data — see "The encryption key" below. The key file will
-#    be owned by uid 65532; use sudo when copying it somewhere safe.
-docker run --rm -v "$PWD/secrets:/secrets" --entrypoint /usr/bin/python3.11 \
-  ghcr.io/aiulian25/boxmedia:1.0.0 -m app.core.crypto genkey /secrets/boxmedia.key
-
-# 2. Create your .env from the template and set BM_SESSION_SECRET.
+# 1. Create your .env from the template and set BM_SESSION_SECRET.
 cp .env.example .env
 #    Generate a session secret:
-docker run --rm --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.0.0 \
+docker run --rm --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.0.1 \
   -c "import secrets; print(secrets.token_urlsafe(48))"
 #    Paste it into BM_SESSION_SECRET in .env.
 
-# 3. Bring it up (pulls ghcr.io/aiulian25/boxmedia — no build step, ever).
+# 2. Bring it up (pulls ghcr.io/aiulian25/boxmedia — no build step, ever).
 docker compose up -d
 ```
+
+The first `up` runs a one-shot `init` container that creates `./data` and
+`./secrets`, hands them to the app's user, and generates your encryption key.
+**Back that key up** — `./secrets/boxmedia.key` decrypts your stored Radarr API
+keys and every backup archive, and nothing can recover them without it. See
+[The encryption key](#the-encryption-key--read-this).
 
 Then point a reverse proxy (nginx/Traefik/Caddy/Pangolin/Cloudflare) at
 `127.0.0.1:${BM_HOST_PORT}` (default `58546`) and terminate TLS there.
@@ -226,9 +216,9 @@ docker compose down
 
 # 2. Generate a new key next to the old one, then rotate the stored connections.
 docker run --rm -v "$PWD/secrets:/secrets" --entrypoint /usr/bin/python3.11 \
-  boxmedia:0.1.0 -m app.core.crypto genkey /secrets/boxmedia-new.key
+  ghcr.io/aiulian25/boxmedia:1.0.1 -m app.core.crypto genkey /secrets/boxmedia-new.key
 docker run --rm -v "$PWD/secrets:/secrets" -v "$PWD/data:/data" \
-  --entrypoint /usr/bin/python3.11 boxmedia:0.1.0 \
+  --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.0.1 \
   -m app.core.crypto rotate /secrets/boxmedia.key /secrets/boxmedia-new.key /data
 
 # 3. Point BM_ENCRYPTION_KEY_FILE (or the compose mount) at the new key, then start.
