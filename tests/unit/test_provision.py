@@ -162,14 +162,44 @@ def test_an_unwritable_data_dir_explains_itself_instead_of_crashing(
     assert "Traceback" not in message
 
 
+def _compose() -> dict:
+    """The published compose file, with YAML anchors expanded — which the parser does
+    natively, so this needs no Docker and runs anywhere the suite does. The `${VAR}`
+    strings stay unexpanded, which is exactly right: two services agree when they name
+    the same variable, whatever it resolves to on a given host."""
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "docker-compose.yml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _mount(service: dict, target: str) -> str:
+    return next(entry for entry in service["volumes"] if entry.endswith(f":{target}"))
+
+
 def test_the_compose_services_cannot_be_pointed_at_different_directories() -> None:
     """init preparing one path while the app mounts another fails IDENTICALLY to an
-    unprepared install — a footgun this file's own fix introduced. Both services must
-    read the same variables, so a user changes a path once, in .env."""
-    compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text()
+    unprepared install — a footgun this file's own fix introduced. However the YAML is
+    written, both services must name the same data directory."""
+    services = _compose()["services"]
 
-    assert compose.count("${BM_DATA_PATH:-./data}:/data") == 2
-    assert compose.count("${BM_SECRETS_PATH:-./secrets}:/secrets") == 2
-    # No bare host paths left to drift out of sync.
-    assert "- ./data:/data" not in compose
-    assert "- ./secrets:/secrets" not in compose
+    assert _mount(services["init"], "/data") == _mount(services["boxmedia"], "/data")
+    # And no bare host path, which is how they drifted apart in the first place.
+    assert "./data:/data" not in _mount(services["boxmedia"], "/data")
+
+
+def test_both_services_run_the_same_build() -> None:
+    """Two image references meant two places to bump by hand every release. An app
+    running against an init from another version is a failure nobody would look for."""
+    services = _compose()["services"]
+
+    assert services["init"]["image"] == services["boxmedia"]["image"]
+
+
+def test_only_the_init_may_write_the_key() -> None:
+    """The key is created once and never touched again. Read-only on the app is what
+    stops a compromised app rewriting the thing that decrypts its own backups."""
+    services = _compose()["services"]
+
+    assert _mount(services["init"], "/secrets").endswith(":/secrets")
+    assert _mount(services["boxmedia"], "/secrets:ro").endswith(":ro")
