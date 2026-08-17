@@ -107,9 +107,23 @@ Engine 20.10+ (any currently supported version) with Compose v2. 32‑bit ARM
 
 ## Quick start (Docker Compose)
 
+Grab [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.example)
+into an empty folder, then:
+
 ```bash
+# 0. Create the app's two folders and hand them to its user. The container runs
+#    as non-root uid 65532 on a read-only filesystem, so it cannot create or
+#    chown these itself — skipping this step fails at the next one with
+#    "Permission denied".
+mkdir -p data secrets
+sudo chown 65532:65532 data secrets
+#    (no sudo? docker can do it: docker run --rm -u 0 -v "$PWD:/w" \
+#     --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.0.0 \
+#     -c "import os; [os.chown(f'/w/{d}', 65532, 65532) for d in ('data','secrets')]")
+
 # 1. Generate the encryption key (encrypts stored Radarr API keys + backups).
-#    Keep it OUTSIDE ./data — see "The encryption key" below.
+#    Keep it OUTSIDE ./data — see "The encryption key" below. The key file will
+#    be owned by uid 65532; use sudo when copying it somewhere safe.
 docker run --rm -v "$PWD/secrets:/secrets" --entrypoint /usr/bin/python3.11 \
   ghcr.io/aiulian25/boxmedia:1.0.0 -m app.core.crypto genkey /secrets/boxmedia.key
 
