@@ -25,7 +25,6 @@ docs/Push.md
 build and push.md
 build and push.txt
 docker-compose.prod.yml
-Plex.md
 
 # Compiled Tailwind output (produced at build time)
 /app/static/css/app.css
