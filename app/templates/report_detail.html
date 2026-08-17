@@ -100,6 +100,16 @@
     {% if movie.guessed and not movie.in_radarr %}
     <span class="guess-hint" title="No candidate matched the chart title — this is Radarr's first suggestion">Best guess — verify</span>
     {% endif %}
+    {# The media server already holds this — say so before the Add button gets pressed.
+       Two registers on purpose: an id match is Plex's own catalogue agreeing with the
+       card's, and reads confident; a title+year match is an educated guess and borrows
+       the same amber every other unverified claim in this app wears. Add stays offered
+       either way — upgrading a copy Plex holds badly is a legitimate choice. #}
+    {% if movie.plex_state == "yes" %}
+    <span class="plex-hint" title="Your Plex server holds this film (matched by id) — adding it to Radarr would fetch a second copy">Already in Plex</span>
+    {% elif movie.plex_state == "probably" %}
+    <span class="guess-hint" title="A Plex title of the same name and year — nothing verified it is the same film">Probably in Plex — verify</span>
+    {% endif %}
     {# How far along, for a copy on its way. A body line rather than the badge: the badge
        is a fixed overlay sharing its row with the rank chip, and the percent pushed it to
        198px and two lines across that chip. This wraps for a longer connection name or a

@@ -48,11 +48,13 @@ from app.services.filters import (
 )
 from app.services.ignore import IgnoredMovie
 from app.services.pipeline import SCRAPE_FAILURE_SUBDIR
+from app.services.plex import PlexAuthError, PlexError
 from app.services.posters import POSTER_SUBDIR, POSTER_WIDTH, sized
 from app.services.radarr import RadarrAuthError, RadarrConnectionError, RadarrError
 from app.services.radarr_options import RadarrOptions
 from app.services.reports import Report
 from app.web.deps import (
+    PLEX_BACKOFF_KEY,
     client_ip,
     current_user,
     format_timestamp,
@@ -124,6 +126,14 @@ class SettingsStatus:
     BACKUP_SCHEDULE_INVALID = "backup_schedule_invalid"
     UNIGNORED = "unignored"
     CLEANED = "cleaned"
+    PLEX_SAVED = "plex_saved"
+    PLEX_INVALID = "plex_invalid"
+    PLEX_REMOVED = "plex_removed"
+    PLEX_TEST_OK = "plex_test_ok"
+    PLEX_TEST_AUTH = "plex_test_auth"
+    PLEX_TEST_CONN = "plex_test_conn"
+    PLEX_REFRESHED = "plex_refreshed"
+    PLEX_REFRESH_FAILED = "plex_refresh_failed"
 
 
 _SUCCESS = "success"
@@ -166,6 +176,17 @@ STATUS_MESSAGES: dict[str, tuple[str, str]] = {
     SettingsStatus.REGION_SAVED: (
         _SUCCESS,
         "Box office region saved — it applies to the next fetch.",
+    ),
+    SettingsStatus.PLEX_SAVED: (_SUCCESS, "Plex connection saved."),
+    SettingsStatus.PLEX_INVALID: (_ERROR, "Please check the Plex address and token."),
+    SettingsStatus.PLEX_REMOVED: (_SUCCESS, "Plex connection removed."),
+    SettingsStatus.PLEX_TEST_OK: (_SUCCESS, "Connection succeeded — Plex responded."),
+    SettingsStatus.PLEX_TEST_AUTH: (_ERROR, "Plex rejected the token."),
+    SettingsStatus.PLEX_TEST_CONN: (_ERROR, "Could not reach Plex (check the address / TLS)."),
+    SettingsStatus.PLEX_REFRESHED: (_SUCCESS, "Plex library refreshed."),
+    SettingsStatus.PLEX_REFRESH_FAILED: (
+        _ERROR,
+        "Could not read the Plex library — check the connection and try Test.",
     ),
     SettingsStatus.REGION_INVALID: (
         _ERROR,
@@ -290,6 +311,9 @@ async def settings_page(request: Request) -> object:
         filters=filters,
         chart_size_bounds=(MIN_CHART_SIZE, MAX_CHART_SIZE),
         regions=REGIONS,
+        plex=(lambda server: server.public() if server else None)(
+            request.app.state.plex.load()
+        ),
         report_keep_bounds=(MIN_REPORT_KEEP, MAX_REPORT_KEEP),
         options=options,
         backups=backups,
@@ -634,6 +658,85 @@ def _validated_mode(mode: str) -> str:
     if mode not in SCHEDULE_MODES:
         raise ValueError(f"unknown schedule mode: {mode!r}")
     return mode
+
+
+def _plex_client(request: Request, *, timeout: float | None = None):  # noqa: ANN202
+    settings = request.app.state.settings
+    return request.app.state.plex.build_client(
+        tls_verify=settings.outbound_tls_verify,
+        ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+        timeout=timeout,
+    )
+
+
+@router.post("/settings/plex")
+async def save_plex(
+    request: Request, url: str = Form(""), token: str = Form("")
+) -> RedirectResponse:
+    """Create or update the one Plex connection.
+
+    A blank token keeps the stored one, the Radarr cards' contract. The stale library
+    snapshot is dropped on save: pointing at a different server must not leave the old
+    server's films decorating cards for up to a TTL.
+    """
+    user = current_user(request)
+    try:
+        request.app.state.plex.save(url=url, token=token.strip() or None)
+    except InvalidAppError:
+        return _redirect(request, SettingsStatus.PLEX_INVALID)
+    request.app.state.plex_cache.forget()
+    request.app.state.audit.record(
+        AuditAction.PLEX_UPDATED, actor=user.username, source_ip=client_ip(request)
+    )
+    return _redirect(request, SettingsStatus.PLEX_SAVED)
+
+
+@router.post("/settings/plex/test")
+async def test_plex(request: Request) -> RedirectResponse:
+    """Really try, every time — the backoff is for decorating pages, not for this."""
+    user = current_user(request)
+    if request.app.state.plex.load() is None:
+        return _redirect(request, SettingsStatus.PLEX_TEST_CONN)
+    try:
+        sections = await _plex_client(request).movie_section_keys()
+    except PlexAuthError:
+        outcome = SettingsStatus.PLEX_TEST_AUTH
+    except PlexError:
+        outcome = SettingsStatus.PLEX_TEST_CONN
+    else:
+        outcome = SettingsStatus.PLEX_TEST_OK if sections else SettingsStatus.PLEX_TEST_CONN
+    request.app.state.audit.record(
+        AuditAction.PLEX_TESTED, actor=user.username, source_ip=client_ip(request),
+        outcome=outcome,
+    )
+    return _redirect(request, outcome)
+
+
+@router.post("/settings/plex/refresh")
+async def refresh_plex(request: Request) -> RedirectResponse:
+    """Fetch the library now, TTL be damned — the "I just added a film" button."""
+    current_user(request)
+    if request.app.state.plex.load() is None:
+        return _redirect(request, SettingsStatus.PLEX_REFRESH_FAILED)
+    try:
+        fetch = await _plex_client(request).list_movies()
+    except PlexError:
+        return _redirect(request, SettingsStatus.PLEX_REFRESH_FAILED)
+    request.app.state.plex_cache.save(fetch)
+    request.app.state.plex_backoff.note_success(PLEX_BACKOFF_KEY)
+    return _redirect(request, SettingsStatus.PLEX_REFRESHED)
+
+
+@router.post("/settings/plex/remove")
+async def remove_plex(request: Request) -> RedirectResponse:
+    user = current_user(request)
+    removed = request.app.state.plex.remove()
+    request.app.state.plex_cache.forget()
+    if removed:
+        request.app.state.audit.record(
+            AuditAction.PLEX_REMOVED, actor=user.username, source_ip=client_ip(request)
+        )
+    return _redirect(request, SettingsStatus.PLEX_REMOVED)
 
 
 @router.post("/settings/region")

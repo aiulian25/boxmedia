@@ -26,6 +26,7 @@ from app.web.deps import (
     format_timestamp,
     load_all_radarr_libraries,
     load_all_radarr_queues,
+    load_plex_snapshot,
     parse_timestamp,
     radarr_locations,
     render,
@@ -233,6 +234,17 @@ async def dashboard(request: Request, q: str = "", limit: int = DEFAULT_LIMIT) -
     # Library view: only titles that are actually in Radarr (stored-status fallback
     # when Radarr is unreachable and the live snapshot above was skipped).
     movies = [movie for movie in movies if movie["status"] in LIBRARY_STATUSES]
+    # A WANTED title Plex already holds is worth a chip here: you are waiting on a
+    # download of something your media server can already play. In-library titles get
+    # nothing — Radarr holding the file is the stronger, more specific statement.
+    plex_snapshot = await load_plex_snapshot(request)
+    if plex_snapshot is not None:
+        for movie in movies:
+            if movie["status"] != MovieStatus.WANTED:
+                continue
+            movie["plex_state"] = plex_snapshot.holds(
+                movie["tmdb_id"], None, movie["title"], movie.get("year")
+            )
 
     # Matched on the normalized title, the same folding of punctuation, diacritics,
     # numerals and articles the weekly search and the pipeline's own matcher use — so

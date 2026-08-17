@@ -9,6 +9,7 @@ different quality of something already downloaded.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable
 from datetime import date
 
@@ -31,6 +32,7 @@ from app.services.corrections import Correction
 from app.services.filters import SCHEDULE_MODE_CADENCE
 from app.services.ignore import IgnoreSnapshot
 from app.services.matcher import normalize_title
+from app.services.plex import PlexSnapshot
 from app.services.radarr import RadarrClient, RadarrError, RadarrLookupResult, RadarrMovie
 from app.services.radarr_options import RadarrOptions
 from app.services.reports import MATCHED_BY_GUESS, Report, RunStatus, RunTrigger, imdb_url
@@ -45,6 +47,7 @@ from app.web.deps import (
     load_all_radarr_libraries,
     load_all_radarr_options,
     load_all_radarr_queues,
+    load_plex_snapshot,
     load_radarr_library,
     load_radarr_options,
     optional_int,
@@ -446,12 +449,46 @@ def _upgrade_target(holders_with_file: list[dict[str, object]]) -> dict[str, obj
     return None
 
 
+def _plex_state(
+    plex: PlexSnapshot | None,
+    movie: object,
+    *,
+    in_radarr: bool,
+    holders: list[dict[str, object]],
+) -> str | None:
+    """Whether the media server holds a film NO Radarr does. None otherwise.
+
+    Gated on "missing everywhere" because that is the only place the hint changes a
+    decision: a title any Radarr holds or is fetching already tells its story through
+    the badge and the chips, and stacking "In Plex" on top would be noise. Computed at
+    render and never stored, the `in_radarr` rule — the library moves constantly.
+    """
+    if plex is None or in_radarr or holders:
+        return None
+    return plex.holds(
+        movie.tmdb_id,
+        _imdb_id_from_url(movie.imdb_url),
+        movie.title,
+        movie.year,
+    )
+
+
+def _imdb_id_from_url(imdb_url: str | None) -> str | None:
+    """The tt-id back out of the stored IMDb link — the reverse of `imdb_url`, which is
+    the only shape this app ever writes into a report."""
+    if not imdb_url:
+        return None
+    match = re.search(r"(tt\d{7,9})(?!\d)", imdb_url)
+    return match.group(1) if match else None
+
+
 def _movie_view(
     movie: object,
     library: dict[int, RadarrMovie] | None,
     ignored: IgnoreSnapshot,
     history: list[tuple[str, int, int]] | None = None,
     holders: list[dict[str, object]] | None = None,
+    plex: PlexSnapshot | None = None,
 ) -> dict:
     tmdb = movie.tmdb_id
     radarr_movie = library.get(tmdb) if (library is not None and tmdb is not None) else None
@@ -531,6 +568,9 @@ def _movie_view(
         "trend": _trend_view((history or [])[-TREND_WEEKS:]),
         "badge_label": badge_label,
         "badge_dot": badge_dot,
+        # HOLDS_YES, HOLDS_PROBABLY, or None — only ever set on a title missing from
+        # every Radarr, because that is the only card where it changes a decision.
+        "plex_state": _plex_state(plex, movie, in_radarr=in_radarr, holders=holders or []),
     }
 
 
@@ -691,6 +731,7 @@ async def report_detail(request: Request, report_id: str) -> object:
     histories = request.app.state.reports.histories(all_reports)
     # One read for the whole grid, so every card is judged against the same list.
     ignored = request.app.state.ignore.snapshot()
+    plex_snapshot = await load_plex_snapshot(request)
     movies = [
         _movie_view(
             movie,
@@ -698,6 +739,7 @@ async def report_detail(request: Request, report_id: str) -> object:
             ignored,
             histories.get(movie.normalized_title),
             radarr_locations(movie.tmdb_id, libraries, apps_by_id, queues),
+            plex_snapshot,
         )
         for movie in report.movies
     ]

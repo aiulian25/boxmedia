@@ -559,6 +559,11 @@ html.light {
   /* The run admitting it guessed. Wraps rather than truncates — unlike the facts line
      above it this is a sentence, and a longer translation of it has to stay readable. */
   .guess-hint { @apply block text-label-sm text-warn mt-1; }
+  /* The media server already holds this film, matched by id. The calm register, not the
+     amber one: it is a verified fact, and painting it as a warning would read as a
+     problem when it is the exact opposite. Wraps like .guess-hint, and for the same
+     reason — it is a sentence, and translations grow. */
+  .plex-hint { @apply block text-label-sm text-ok mt-1; }
   /* How far a copy on its way has got. The third card-body annotation line, after
      .card-facts and .guess-hint, and for the same reason: the overlays above are fixed
      boxes and this text has to be free to wrap. */

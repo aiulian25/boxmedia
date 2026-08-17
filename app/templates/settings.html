@@ -221,6 +221,50 @@
 </section>
 
 <section class="settings-section">
+  <h3 class="section-title">Media Server</h3>
+  <p class="subtle">Optional. Connect Plex and the weekly cards say when a title is already on your media server — so you don’t add a second copy of something another tool fetched. BoxMedia only ever <strong>reads</strong> Plex; nothing is written, changed, or deleted there.</p>
+  <div class="app-card">
+    {# One connection, not a list: multiple Radarrs exist because quality profiles
+       differ per instance, and Plex has no analogue of that. #}
+    <form method="post" action="{{ url_base }}/settings/plex" class="app-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div>
+        <label for="plex-url">Address</label>
+        <input id="plex-url" name="url" type="text" value="{{ plex.url if plex }}" placeholder="192.168.1.100:32400 or https://plex.example" required>
+      </div>
+      <div>
+        <label for="plex-token">Plex token</label>
+        {# Masked once saved, exactly as the Radarr keys are: leave it blank to keep
+           the stored token when only the address changes. #}
+        <input id="plex-token" name="token" type="password" placeholder="{{ plex.token_mask if plex }}" {% if not plex %}required{% endif %}>
+        <p class="field-note">Sent as a header, never in a URL. Encrypted at rest with the same key as your Radarr API keys.</p>
+      </div>
+      <div class="app-actions">
+        <button type="submit" class="btn-primary">{% if plex %}Save{% else %}Connect{% endif %}</button>
+      </div>
+    </form>
+    {% if plex %}
+    {# Siblings of the save form, never nested inside it — the Radarr cards' layout,
+       because a form inside a form is invalid HTML and browsers eject the inner one. #}
+    <div class="app-actions-row">
+      <form method="post" action="{{ url_base }}/settings/plex/refresh">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-ghost" title="Fetch the library now instead of waiting for the next automatic refresh">Refresh Library</button>
+      </form>
+      <form method="post" action="{{ url_base }}/settings/plex/test">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-ghost">Test Connection</button>
+      </form>
+      <form method="post" action="{{ url_base }}/settings/plex/remove">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-danger">Remove</button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="settings-section">
   <h3 class="section-title">Weekly Check</h3>
   <div class="app-card">
     <form method="post" action="{{ url_base }}/settings/filters" class="app-grid">
