@@ -1,0 +1,38 @@
+{# The Add control, in one place. Every page that offers to add a film includes this —
+   the weekly card, a search result, the movie modal — so a multi-instance setup gets the
+   same caret naming each Radarr wherever it is offered, and there is one form to audit.
+
+   Quality and folder are never asked per title: each connection carries its own, set once
+   in Settings. `target` names WHICH connection and is the only thing the browser chooses;
+   `add_movie` refuses an id that is not in apps.yml. One connection: a plain button.
+   Several: the caret names them, so you pick a box rather than a quality.
+
+   Expects `tmdb_id`, `title`, `year` and `report_id` bound by the caller; `targets`,
+   `show_targets`, `csrf_token` and `url_base` come from the page context. `report_id` is
+   where the add returns to — blank means the film has no report context (the modal opened
+   from the dashboard, say), and `add_movie` sends those back to the film's own page. #}
+<form method="post" action="{{ url_base }}/add-movie" class="add-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="report_id" value="{{ report_id }}">
+  <input type="hidden" name="tmdb_id" value="{{ tmdb_id }}">
+  <input type="hidden" name="title" value="{{ title }}">
+  <input type="hidden" name="year" value="{{ year if year is not none }}">
+  {% if show_targets %}
+  <div class="split-add">
+    <button type="submit" class="btn-add" name="target" value="">Add to Radarr</button>
+    <details class="split-more">
+      <summary aria-label="Choose which Radarr">▾</summary>
+      <div class="target-menu">
+        {% for entry in targets %}
+        <button type="submit" class="target-option" name="target" value="{{ entry.id }}"{% if not entry.ready %} disabled{% endif %}>
+          <span class="target-name">{{ entry.name }}</span>
+          {% if not entry.ready %}<span class="target-detail">Pick a quality &amp; folder in Settings</span>{% endif %}
+        </button>
+        {% endfor %}
+      </div>
+    </details>
+  </div>
+  {% else %}
+  <button type="submit" class="btn-add">Add to Radarr</button>
+  {% endif %}
+</form>

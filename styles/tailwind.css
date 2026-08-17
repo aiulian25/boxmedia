@@ -1,0 +1,620 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens. Every colour in tailwind.config.js resolves to one of these, so a
+   theme is this block and nothing else — no `dark:`/`light:` variant on any rule.
+
+   Deliberately at the stylesheet's TOP LEVEL rather than inside @layer: Tailwind
+   tree-shakes layered rules against the templates, and a token block referenced only
+   through config indirection is exactly the shape it purges (the app-health colours it
+   already ate once — see tests/unit/test_control_alignment.py). Top-level rules are
+   emitted verbatim, which is why the @keyframes below survive --minify.
+
+   color-scheme is what makes the UA's own widgets follow along: the date picker on the
+   weekly view, scrollbars, and form accents are drawn by the browser and never see this
+   app's CSS. */
+:root {
+  --bm-background: #131313;
+  --bm-surface: #131313;
+  --bm-surface-container-lowest: #0e0e0e;
+  --bm-surface-container-low: #1c1b1b;
+  --bm-surface-container: #201f1f;
+  --bm-surface-container-high: #2a2a2a;
+  --bm-surface-container-highest: #353534;
+  --bm-on-background: #e5e2e1;
+  --bm-on-surface: #e5e2e1;
+  --bm-on-surface-variant: #c4c7c8;
+  --bm-primary: #ffffff;
+  --bm-outline: #8e9192;
+  --bm-outline-variant: #444748;
+  --bm-error: #ffb4ab;
+  --bm-slate-panel: #1e293b;
+  --bm-slate-border: #334155;
+  --bm-slate-muted: #64748b;
+  /* State colours. Tuned per theme rather than per palette step: green-400 reads at
+     10.7:1 on this background and 1.6:1 on the light one, so a shared value cannot
+     serve both. */
+  --bm-ok: #4ade80;
+  --bm-ok-strong: #22c55e;
+  --bm-ok-banner: #86efac;
+  --bm-ok-border: #16a34a;
+  --bm-danger: #f87171;
+  --bm-danger-strong: #ef4444;
+  --bm-danger-banner: #fca5a5;
+  --bm-danger-border: #dc2626;
+  /* Not an error and not fine — a match the run is unsure of. amber-400, which reads at
+     10.3:1 here and 1.4:1 on the light card, so it cannot be shared either. */
+  --bm-warn: #fbbf24;
+  /* A translucent scrim, not a solid fill: the rank sits over poster art and has to stay
+     readable without hiding it. Carried as one rgba token because a var() colour cannot
+     take Tailwind's bg-opacity utility — that utility only works on a colour Tailwind
+     emits as rgb(... / <alpha>), and a var() is passed through whole.
+
+     Written as 8-digit hex, not rgba(): the minifier rewrites rgba() to hsla() and the
+     round trip loses a step (14 -> 13), which a pixel diff against the previous build
+     catches and nothing else would. cc = 80% alpha. */
+  --bm-rank-chip: #0e0e0ecc;
+  /* The arrival flash on a linked poster — a keyframe cannot carry a Tailwind colour. */
+  --bm-flash: rgba(255, 255, 255, 0.85);
+  --bm-flash-fade: rgba(255, 255, 255, 0);
+  color-scheme: dark;
+}
+
+/* The light theme. Same key set as :root — a token defined there and missing here would
+   inherit the dark value and paint one component for the wrong ground, so a test pins the
+   two sets equal.
+
+   Not a mechanical inversion: the surface ramp is compressed (a light UI needs less
+   separation between steps to read as layered) and the state colours drop several palette
+   steps, because green-400 carries 10.7:1 on the dark background and 1.6:1 on this one.
+   Every text-on-ground pair here is contrast-checked by test. */
+html.light {
+  --bm-background: #f6f5f4;
+  --bm-surface: #f6f5f4;
+  --bm-surface-container-lowest: #ffffff;
+  --bm-surface-container-low: #eceae9;
+  --bm-surface-container: #e6e4e3;
+  --bm-surface-container-high: #dedcdb;
+  --bm-surface-container-highest: #d3d1d0;
+  --bm-on-background: #1a1c1c;
+  --bm-on-surface: #1a1c1c;
+  --bm-on-surface-variant: #444748;
+  --bm-primary: #131313;
+  --bm-outline: #5f6365;
+  --bm-outline-variant: #c4c7c8;
+  --bm-error: #b3261e;
+  --bm-slate-panel: #e2e8f0;
+  --bm-slate-border: #cbd5e1;
+  --bm-slate-muted: #64748b;
+  --bm-ok: #166534;
+  --bm-ok-strong: #15803d;
+  --bm-ok-banner: #166534;
+  --bm-ok-border: #16a34a;
+  --bm-danger: #b91c1c;
+  --bm-danger-strong: #dc2626;
+  --bm-danger-banner: #b91c1c;
+  --bm-danger-border: #dc2626;
+  /* amber-800. Still amber, four steps down: amber-700 is 4.2:1 on the card and misses
+     AA, and everything lighter fades into the paper. */
+  --bm-warn: #92400e;
+  /* A pale scrim over poster art rather than a dark one, so the rank stays readable
+     against the artwork instead of punching a hole in a light card. */
+  --bm-rank-chip: #ffffffcc;
+  /* A dark ring on a light page — the white one is invisible here. */
+  --bm-flash: rgba(19, 19, 19, 0.55);
+  --bm-flash-fade: rgba(19, 19, 19, 0);
+  color-scheme: light;
+}
+
+/* Download progress on a pending location chip, in ten-percent steps.
+   `.where-chip-p0` .. `.where-chip-p100`.
+
+   TOP LEVEL, not inside @layer, and deliberately so: the class name is composed in the
+   view (`where-chip-p{bucket}`), which Tailwind's template scan cannot see — the exact
+   shape that purged the app-health colours once already. Layered rules are tree-shaken;
+   top-level rules are emitted verbatim, which is why the token blocks and @keyframes live
+   out here too. A test pins this placement.
+
+   Ten steps rather than an exact width because a per-film percentage would have to be an
+   inline `style`, and the CSP is `style-src 'self'`. The exact figure is in the chip's
+   title attribute.
+
+   A BAND along the chip's bottom edge rather than a wash behind the label: at 40% the
+   label straddles the fill boundary, so no single text colour is readable on both halves.
+   This way the label keeps the contrast it already passes (outline on slate-panel, 4.6:1
+   dark / 4.9:1 light) and the fill only has to be visible against the chip — --bm-ok
+   gives 8.4:1 dark and 5.8:1 light, well past the 3:1 WCAG asks of a non-text indicator. */
+.where-chip-p0,
+.where-chip-p10,
+.where-chip-p20,
+.where-chip-p30,
+.where-chip-p40,
+.where-chip-p50,
+.where-chip-p60,
+.where-chip-p70,
+.where-chip-p80,
+.where-chip-p90,
+.where-chip-p100 {
+  background-repeat: no-repeat;
+  background-position: left bottom;
+  background-size: 100% 3px;
+}
+.where-chip-p0 { background-image: linear-gradient(to right, var(--bm-ok) 0%, transparent 0%); }
+.where-chip-p10 { background-image: linear-gradient(to right, var(--bm-ok) 10%, transparent 10%); }
+.where-chip-p20 { background-image: linear-gradient(to right, var(--bm-ok) 20%, transparent 20%); }
+.where-chip-p30 { background-image: linear-gradient(to right, var(--bm-ok) 30%, transparent 30%); }
+.where-chip-p40 { background-image: linear-gradient(to right, var(--bm-ok) 40%, transparent 40%); }
+.where-chip-p50 { background-image: linear-gradient(to right, var(--bm-ok) 50%, transparent 50%); }
+.where-chip-p60 { background-image: linear-gradient(to right, var(--bm-ok) 60%, transparent 60%); }
+.where-chip-p70 { background-image: linear-gradient(to right, var(--bm-ok) 70%, transparent 70%); }
+.where-chip-p80 { background-image: linear-gradient(to right, var(--bm-ok) 80%, transparent 80%); }
+.where-chip-p90 { background-image: linear-gradient(to right, var(--bm-ok) 90%, transparent 90%); }
+.where-chip-p100 { background-image: linear-gradient(to right, var(--bm-ok) 100%, transparent 100%); }
+
+/* Obsidian Archive component classes — sharp corners, flat, high-contrast. */
+@layer base {
+  body {
+    @apply bg-background text-on-background;
+    font-family: theme("fontFamily.sans");
+  }
+  a { @apply text-primary; }
+  input, textarea {
+    @apply bg-surface-container-low border border-slate-border text-primary px-3 py-2 w-full;
+  }
+  input:focus, textarea:focus { @apply outline-none border-primary; }
+  /* The rule above is written for text fields. These are the app's first radios
+     (Settings -> Appearance) and must not become full-width boxes; accent-color is what
+     paints the control itself, which the browser draws and this stylesheet cannot. */
+  input[type="radio"], input[type="checkbox"] {
+    @apply w-auto p-0 border-0 align-middle;
+    accent-color: var(--bm-primary);
+  }
+  input::placeholder, textarea::placeholder { color: theme("colors.slate-muted"); }
+  label { @apply block text-label-sm uppercase tracking-widest text-outline mb-1; }
+  select {
+    @apply bg-surface-container-low border border-slate-border text-primary px-3 py-2 w-full;
+  }
+  select:focus { @apply outline-none border-primary; }
+}
+
+@layer components {
+  .topnav {
+    @apply flex items-center justify-between h-16 px-margin border-b border-outline-variant
+           bg-surface sticky top-0 z-40;
+  }
+  .brand { @apply flex items-center gap-2 text-headline-sm font-semibold text-primary no-underline; }
+  .brand-mark { @apply w-8 h-8 shrink-0; }
+  .navlinks { @apply flex gap-6; }
+  .navlinks a { @apply text-body-md text-outline no-underline hover:text-primary; }
+  .navlinks a.active { @apply text-primary; }
+  .topnav-account { @apply flex items-center gap-4 min-w-0; }
+  .user-chip { @apply flex items-center gap-2 min-w-0; }
+  .avatar {
+    @apply grid place-items-center w-8 h-8 shrink-0 rounded-full select-none
+           bg-surface-container-high border border-outline-variant text-label-sm text-primary;
+  }
+  /* Truncates rather than pushes Logout off the bar when a display name is long or
+     a translation runs wide; the disc alone identifies the account below `sm`. */
+  .user-name { @apply hidden sm:block truncate max-w-[12rem] text-body-md text-outline; }
+  .logout button { @apply bg-transparent border border-outline-variant text-primary text-label-md px-4 py-2 hover:bg-surface-container-high; }
+
+  .content { @apply px-margin py-8 max-w-6xl mx-auto; }
+
+  /* Movie detail — used both inside the dialog and as a standalone page. */
+  .movie-dialog {
+    @apply w-[min(56rem,92vw)] max-h-[88vh] overflow-y-auto p-0 border border-outline-variant
+           bg-surface-container-low text-on-surface backdrop:bg-black/70;
+  }
+  .movie-dialog-close { @apply sticky top-0 flex justify-end z-10; }
+  .movie-dialog-close button {
+    @apply bg-surface-container-high border border-outline-variant text-primary
+           w-9 h-9 leading-none text-headline-sm hover:bg-surface-container-highest;
+  }
+  .movie-dialog .movie-detail { @apply p-6 pt-0; }
+
+  .movie-detail { @apply flex flex-col gap-4; }
+  .movie-head { @apply flex flex-col sm:flex-row gap-5; }
+  .movie-poster { @apply w-40 shrink-0 self-start; }
+  .movie-poster img { @apply w-full block; }
+  .movie-headline { @apply flex flex-col gap-3 min-w-0; }
+  .movie-year { @apply text-outline font-normal; }
+
+  .rating-row { @apply flex flex-wrap gap-x-4 gap-y-1; }
+  .rating { @apply text-body-md text-on-surface tabular-nums; }
+  .rating-source { @apply text-label-sm text-outline uppercase tracking-wider mr-1; }
+
+  .genre-row { @apply flex flex-wrap gap-2; }
+
+  /* Wraps rather than scrolls: a translated label is free to be twice as long. */
+  .fact-row { @apply flex flex-wrap gap-x-6 gap-y-2; }
+  .fact dt { @apply text-label-sm text-outline uppercase tracking-wider; }
+  .fact dd { @apply text-body-md text-on-surface; }
+
+  .movie-links { @apply flex flex-wrap gap-3; }
+  /* The Add control on the film's own record. Scoped exactly as .search-actions scopes
+     it: the form's full-width button and trailing rule are for a 208px card stacked over
+     an Ignore button, and neither belongs across a 640px modal. */
+  .movie-actions { @apply flex flex-wrap items-center gap-3; }
+  .movie-actions .add-form { @apply pb-0 border-b-0; }
+  .movie-actions .btn-add { @apply w-auto px-4; }
+  .movie-actions .split-add { @apply mt-0 w-auto; }
+  .movie-links a { @apply text-label-sm text-outline uppercase tracking-wider no-underline hover:text-primary; }
+  .movie-overview { @apply text-body-md text-on-surface; }
+
+  .credits { @apply flex flex-col gap-2; }
+  /* Horizontal scroll is contained here so the page/dialog never scrolls sideways. */
+  .credit-row { @apply flex gap-3 overflow-x-auto pb-2; }
+  .credit { @apply w-24 shrink-0; }
+  .credit img { @apply w-24 h-36 object-cover block bg-surface-container; }
+  .credit-empty {
+    @apply w-24 h-36 grid place-items-center bg-surface-container text-outline
+           text-headline-md select-none;
+  }
+  .credit figcaption { @apply flex flex-col mt-1; }
+  .credit-name { @apply text-label-sm text-on-surface leading-tight; }
+  .credit-role { @apply text-label-sm text-outline leading-tight; }
+
+  .page-header { @apply mb-8; }
+  .headline-lg { @apply text-headline-lg text-primary; }
+  .subtle { @apply text-body-md text-outline; }
+
+  .auth-card { @apply max-w-sm mx-auto mt-24 bg-surface-container-low border border-surface-container-highest p-8; }
+  .auth-mark { @apply w-16 h-16 mx-auto mb-3; }
+  .auth-title { @apply text-headline-md text-primary mb-1; }
+  .auth-subtitle { @apply text-body-md text-outline mb-6; }
+  .auth-form { @apply flex flex-col gap-2; }
+  .form-error { @apply text-error text-body-md mb-4; }
+  .first-run-hint { @apply text-body-md text-on-surface-variant bg-surface-container-low border border-slate-border p-4 mb-6 leading-relaxed; }
+  .first-run-hint code { @apply text-primary; }
+  .first-run-hint code.cmd { @apply block bg-surface-container-lowest px-3 py-2 my-2 overflow-x-auto; }
+  .field-note { @apply text-label-sm text-outline mt-1 normal-case tracking-normal; }
+
+  /* Appearance. Wraps rather than truncates so a longer translation of either option
+     name takes a second line instead of clipping. */
+  .theme-choice { @apply flex flex-wrap items-center gap-x-6 gap-y-2 border-0 p-0 m-0; }
+  .theme-choice legend { @apply text-label-sm uppercase tracking-widest text-outline mb-2; }
+  .theme-option { @apply flex items-center gap-2 cursor-pointer text-body-md text-on-surface
+                  normal-case tracking-normal mb-0; }
+
+  .btn-primary { @apply bg-primary text-background text-label-md uppercase tracking-widest px-6 py-3 mt-2 hover:bg-surface-container-highest hover:text-primary border border-primary; }
+  .btn-secondary { @apply bg-transparent border border-outline text-primary text-label-md uppercase tracking-widest px-6 py-3 mt-2 hover:bg-surface-container-high; }
+  .btn-ghost { @apply bg-transparent border-0 text-outline text-label-md uppercase tracking-widest px-3 py-2 hover:text-primary; }
+  .btn-danger { @apply bg-transparent border border-outline-variant text-error text-label-md uppercase tracking-widest px-3 py-2 hover:bg-error hover:text-background; }
+
+  .banner { @apply px-4 py-3 mb-6 border text-body-md; }
+  .banner-success { @apply border-ok-border text-ok-banner bg-surface-container-low; }
+  .banner-error { @apply border-danger-border text-danger-banner bg-surface-container-low; }
+  /* Work in progress is neither. The only banner variants were success and error, and
+     wearing the error one to say "7 of 12 fetched" claims something is wrong when nothing
+     is. Both tokens are already contrast-checked as a pair. */
+  .banner-progress { @apply border-outline text-on-surface bg-surface-container-low; }
+
+  /* Action confirmations pop as a bubble in the corner and fade themselves out, instead
+     of a banner at the top that survives until you navigate away. Fixed positioning keeps
+     the admin's place on the page; the fade is pure CSS so it still auto-dismisses with
+     JavaScript disabled. */
+  .toast-region {
+    @apply fixed z-50 bottom-6 right-6 left-6 sm:left-auto flex flex-col items-stretch
+           sm:items-end gap-2 pointer-events-none;
+  }
+  .toast {
+    @apply mb-0 w-full sm:max-w-md bg-surface-container-low pointer-events-auto;
+    animation: bm-toast-in 160ms ease-out, bm-toast-out 300ms ease 3s forwards;
+  }
+
+  /* Back to the top. 44px square at every breakpoint — the size a thumb can hit on a 5"
+     phone, which is also the smallest target WCAG 2.5.5 accepts; the app's ordinary
+     buttons are 38px tall and are not aimed at one-handed use.
+
+     z-40, deliberately UNDER the toast region's z-50: they share this corner, and on a
+     phone the toast spans the full width. When both are on screen the confirmation of
+     something the admin just did matters more than a scroll shortcut, and a toast is gone
+     in 3.4s. Sitting in the corner rather than centred also keeps it clear of the sticky
+     topnav at the other end of the viewport.
+
+     The offset carries env(safe-area-inset-*) so a notched phone's home indicator and a
+     landscape notch do not sit on top of it; env() resolves to 0 everywhere else, so this
+     is the same 1rem inset on a desktop. Raw CSS because Tailwind has no utility for it.
+
+     border-outline, not the outline-variant the app's panels use: this floats over the
+     page rather than sitting in it, so its own edge is what says a control is there. The
+     variant measures 1.98:1 against the dark background and 1.56:1 against the light one
+     — under the 3:1 WCAG 1.4.11 asks of a non-text indicator, which would have left a
+     bare arrow hanging in the corner. --bm-outline is 5.9:1 and 5.6:1 over the page, and
+     5.4:1 / 5.1:1 over a poster card, the other thing it can land on. */
+  .to-top {
+    @apply fixed z-40 w-11 h-11 grid place-items-center
+           bg-surface-container-high border border-outline text-primary
+           text-headline-sm leading-none hover:bg-surface-container-highest;
+    right: calc(1rem + env(safe-area-inset-right));
+    bottom: calc(1rem + env(safe-area-inset-bottom));
+  }
+  /* Preflight's `[hidden] { display: none }` sits in @layer base, which this layer beats —
+     without this the button would be visible on every page from the moment it renders,
+     including with the script blocked. */
+  .to-top[hidden] { @apply hidden; }
+}
+
+@keyframes bm-toast-in {
+  from { opacity: 0; transform: translateY(0.5rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes bm-toast-out {
+  to { opacity: 0; visibility: hidden; }
+}
+
+/* An expanding ring rather than a colour swap: it reads at a glance in a grid of ten
+   posters without hiding the artwork underneath. The colour comes from a token rather
+   than a literal — a keyframe cannot carry a Tailwind colour through @apply, and a white
+   ring is invisible on a light page. */
+@keyframes bm-poster-flash {
+  0%   { box-shadow: 0 0 0 0 var(--bm-flash); }
+  70%  { box-shadow: 0 0 0 12px var(--bm-flash-fade); }
+  100% { box-shadow: 0 0 0 0 var(--bm-flash-fade); }
+}
+
+/* Motion is the enhancement, not the feature: the border still marks the title. */
+@media (prefers-reduced-motion: reduce) {
+  .poster-card:target .poster-frame { animation: none; }
+}
+
+@layer components {
+
+  .settings-section { @apply mb-12; }
+  .section-title { @apply text-headline-sm text-primary border-b border-surface-container-highest pb-2 mb-6; }
+  .section-subtitle { @apply text-body-lg text-primary mb-4; }
+  .account-card { @apply grid md:grid-cols-2 gap-8 bg-surface-container-low border border-surface-container-highest p-6; }
+  .stack { @apply flex flex-col gap-2; }
+  /* User Management forms: even spacing between field groups, tight within a group,
+     and buttons pinned to the bottom so both columns line up (grid stretches heights). */
+  .account-form { @apply flex flex-col gap-4; }
+  .account-form button { @apply mt-auto; }
+  .field { @apply flex flex-col; }
+
+  .app-card { @apply bg-surface-container-low border border-surface-container-highest p-6 mb-4; }
+  .app-health { @apply flex items-center gap-2 text-label-sm uppercase tracking-widest text-outline mb-4; }
+  /* Marks the connection every Radarr action actually uses. */
+  .tag { @apply text-label-sm uppercase tracking-widest text-primary border border-outline px-2 py-0.5; }
+  .app-health-ok { @apply text-ok; }
+  .app-health-auth, .app-health-unreachable { @apply text-danger; }
+  .app-health .dot-connected { @apply bg-ok-strong w-2 h-2; box-shadow: 0 0 6px var(--bm-ok-strong); }
+  .app-health .dot-failed { @apply bg-danger-strong w-2 h-2; }
+  .app-grid { @apply grid grid-cols-1 md:grid-cols-2 gap-6; }
+  /* The Add card's buttons, with the test result beside them. It wraps to its own line
+     before the buttons do, so a long result — or a long translation of one — pushes
+     nothing off the card. */
+  .add-actions { @apply mt-0 flex-1 justify-end; }
+  .test-result { @apply mb-0 mr-auto normal-case tracking-normal; }
+  .app-grid-full { @apply md:col-span-2; }
+  .app-actions { @apply md:col-span-2 flex justify-end; }
+  .app-actions-row { @apply flex flex-wrap gap-3 justify-end items-center mt-3; }
+  /* Same 40px control height as .report-card-actions: btn-secondary carries py-3 + mt-2
+     while btn-ghost/btn-danger carry py-2 and no margin, so without this the row's
+     buttons differ in size and sit at different heights. The <details> confirm stays
+     expanding on purpose — the destructive restore/delete wording is a safety prompt. */
+  .app-actions-row a,
+  .app-actions-row summary,
+  .app-actions-row > form > button {
+    @apply h-10 px-4 py-0 mt-0 flex items-center justify-center text-center cursor-pointer;
+  }
+  .app-actions-row summary { @apply list-none; }
+  .app-actions-row summary::-webkit-details-marker { @apply hidden; }
+
+  /* Dashboard */
+  .toolbar { @apply flex flex-wrap items-end justify-between gap-4 mb-8; }
+  /* The month's leaderboard, above the run controls. Reuses .poster-frame and
+     .rank-chip so a card here is the same object as a card on the weekly view. */
+  .top-gross { @apply mb-8; }
+  .top-gross-head { @apply flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-3; }
+  .top-gross-title { @apply text-headline-sm text-primary; }
+  .top-gross-meta { @apply text-label-md text-outline; }
+  /* Same breakpoints as .poster-grid, so the strip and the grids below it break together. */
+  .gross-strip { @apply grid grid-cols-2 md:grid-cols-5 gap-4; }
+  .gross-card { @apply min-w-0; }
+  .gross-money {
+    @apply absolute inset-x-2 bottom-2 bg-slate-panel text-primary text-label-md
+           text-center tabular-nums px-2 py-1 truncate;
+  }
+  .gross-name { @apply text-body-md text-primary font-semibold truncate mt-2; }
+  .gross-weeks { @apply text-label-sm text-outline; }
+
+  .run-actions { @apply flex flex-wrap items-center gap-3 mb-8; }
+  .run-week { @apply flex items-center gap-3; }
+  /* One 40px row: every control shares a height and a minimum width so they read as a
+     matched set (btn-* carry py-3 + mt-2, which offset them otherwise).
+     `a` is in here because the weekly view's week nav renders a LINK when that week
+     already has a report and a BUTTON when it has to be fetched — so the two controls
+     sat 5px apart at different heights depending on which weeks happened to exist.
+     min-width, not width — longer translated labels still grow the control. */
+  .run-actions a,
+  .run-actions input,
+  .run-actions button { @apply h-10 py-0 mt-0 min-w-[11rem]; }
+  .run-actions a,
+  .run-actions button { @apply flex items-center justify-center; }
+  .run-week input { @apply w-auto; }
+  .run-week-label { @apply text-label-sm text-outline mb-0 whitespace-nowrap; }
+  /* Mirrors .run-week so the search shares the row's alignment and 40px control height;
+     ml-auto puts it at the right end, and .run-actions' flex-wrap drops it to its own
+     line on a narrow window rather than overflowing. */
+  .run-search { @apply flex items-center gap-3 ml-auto; }
+  .run-search input { @apply w-60; }
+
+  /* Search results — used inside the dialog and as a standalone page, like .movie-detail. */
+  .movie-dialog .search-results { @apply p-6 pt-0; }
+  .search-head { @apply text-headline-sm mb-1; }
+  .search-sub { @apply text-label-md text-outline mb-3; }
+  .search-empty { @apply text-body-md text-outline py-6 text-center; }
+  .search-result { @apply flex gap-4 py-3.5 border-b border-outline-variant last:border-b-0; }
+  /* `relative` because .poster-empty is absolute inset-0 — without a positioned
+     ancestor the placeholder escapes the box and lands on the dialog. */
+  .search-poster { @apply relative w-14 flex-none aspect-[2/3] overflow-hidden bg-surface-container-low; }
+  .search-poster img { @apply w-full h-full object-cover; }
+  /* The shared placeholder is sized for a full card; at 56px wide its tracking
+     overflows the thumbnail. */
+  .search-poster .poster-empty { @apply text-label-sm tracking-normal; }
+  .search-body { @apply flex-1 min-w-0 flex flex-col gap-1.5; }
+  .search-title { @apply text-body-lg font-semibold truncate; }
+  .search-title span { @apply text-outline font-normal; }
+  .week-chips { @apply flex flex-wrap gap-1.5; }
+  /* A link, so it must read as one: the border alone was quiet enough that the chips
+     were taken for labels. Colour moves with the border on hover. */
+  .week-chip { @apply text-label-sm px-1.5 py-1 border border-outline-variant text-on-surface
+               whitespace-nowrap cursor-pointer hover:border-primary hover:text-primary; }
+  .search-actions { @apply flex items-center gap-2; }
+  .search-actions .add-form { @apply mt-0; }
+  .search-actions .btn-add { @apply mt-0 w-auto px-4; }
+  .search-actions .split-add { @apply mt-0; }
+  .held { @apply text-label-md text-outline; }
+  /* A name that is now the way into that Radarr. Kept at the emphasis <b> gave it —
+     the link is the chip, and an underline would fight the label rows around it. */
+  .held-name { @apply text-on-surface font-semibold no-underline hover:text-primary; }
+  .search { @apply relative w-64; }
+  .search input { @apply w-full; }
+  /* Sits opposite the search box; wraps under it on narrow screens because .toolbar is
+     flex-wrap, so a long translated count never squeezes the input. */
+  .library-count { @apply text-label-md text-outline pb-2 whitespace-nowrap; }
+  .poster-grid { @apply grid grid-cols-2 md:grid-cols-5 gap-4; }
+  /* scroll-mt clears the 64px sticky topnav: without it the browser lands the card
+     exactly under the bar and the title the user searched for is the one thing hidden.
+     focus:outline-none because the flash below is the arrival cue — the tabindex is
+     there to move screen-reader focus, not to draw a second box. */
+  .poster-card { @apply flex flex-col gap-2 scroll-mt-24 focus:outline-none; }
+  /* Arriving from a week chip. The border persists for as long as the fragment matches,
+     so a user who lands after the pulse still sees which title they came for. */
+  .poster-card:target .poster-frame {
+    @apply border-primary;
+    animation: bm-poster-flash 900ms ease-out 3;
+  }
+  .poster-frame-plain { @apply cursor-default; }
+  .poster-frame { @apply block relative aspect-[2/3] bg-surface-container-low overflow-hidden border border-transparent hover:border-primary; }
+  .poster-frame img { @apply w-full h-full object-cover; }
+  .poster-empty { @apply absolute inset-0 flex items-center justify-center text-outline-variant text-label-md uppercase tracking-widest; }
+  .badge { @apply absolute top-2 right-2 bg-slate-panel px-2 py-1 flex items-center gap-1.5; }
+  .badge span { @apply text-label-sm text-primary tracking-wide uppercase; }
+  .dot { @apply w-1.5 h-1.5 rounded-full; }
+  .dot-in-library { @apply bg-primary; }
+  .dot-wanted { @apply border border-primary; }
+  .dot-missing { @apply bg-error; }
+  .dot-ignored { @apply bg-outline; }
+  /* Where a title lives, along the bottom of the poster. One chip per connection, so
+     two boxes read as two names rather than one run-on string. */
+  /* The chips sit over the artwork but outside the poster's own anchor, so the shell
+     is what they are positioned against — see the note in dashboard.html. */
+  .poster-shell { @apply relative; }
+  .where { @apply absolute inset-x-2 bottom-2 flex flex-wrap gap-1; }
+  .where-chip { @apply max-w-full truncate bg-slate-panel border border-primary px-1.5 py-0.5 text-label-sm text-primary tracking-wide uppercase no-underline hover:bg-slate-border; }
+  .where-chip-pending { @apply border-outline text-outline; }
+  .poster-ignored .poster-frame { @apply opacity-50; }
+  /* mt-auto, not mt-1: the trend line is optional, so without this a card that never
+     charted before sits its whole action block 22px higher than its neighbours. The grid
+     stretches every card to the same height, so pushing the actions to the bottom lines
+     the buttons up across the row whatever is above them. */
+  .poster-actions { @apply mt-auto pt-1 flex flex-col gap-2; }
+  .add-form { @apply flex flex-col gap-1.5 pb-2 border-b border-surface-container-highest; }
+  .add-label { @apply text-label-sm text-outline; }
+  .select-sm { @apply px-2 py-1.5 text-body-md; }
+  /* Split Add: primary action plus a caret listing the other Radarr connections. */
+  .split-add { @apply flex items-stretch mt-2; }
+  /* min-w-0 lets the label truncate instead of forcing the caret out of the card. */
+  .split-add .btn-add { @apply flex-1 min-w-0 mt-0 border-r border-outline-variant truncate; }
+  .split-more { @apply relative; }
+  .split-more summary {
+    @apply list-none h-full px-3 grid place-items-center cursor-pointer select-none
+           bg-primary text-surface text-label-md;
+  }
+  .split-more summary::-webkit-details-marker { display: none; }
+  /* Absolute so opening the menu never reflows the poster grid around it. */
+  .target-menu {
+    @apply absolute right-0 z-30 mt-1 w-56 border border-outline-variant
+           bg-surface-container-low;
+  }
+  .target-option {
+    @apply w-full flex flex-col items-start gap-0.5 px-3 py-2 text-left
+           border-b border-outline-variant bg-transparent
+           hover:bg-surface-container-high disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .target-option:last-child { @apply border-b-0; }
+  .target-name { @apply w-full text-body-md text-on-surface truncate; }
+  /* Wraps rather than truncates: a folder path or a translated hint can be long. */
+  .target-detail { @apply text-label-sm text-outline leading-tight; }
+
+  .btn-add { @apply w-full bg-primary text-background text-label-sm uppercase tracking-widest px-2 py-1.5 hover:bg-surface-container-highest hover:text-primary border border-primary; }
+  .btn-ignore { @apply w-full bg-transparent border border-outline-variant text-outline text-label-sm uppercase tracking-widest px-2 py-1 hover:text-primary hover:border-primary; }
+  .rank-chip { @apply absolute top-2 left-2 bg-rank-chip text-outline text-label-sm px-1.5 py-0.5 tracking-wide; }
+  .poster-note { @apply text-label-sm text-outline; }
+  .poster-title { @apply text-headline-sm text-primary truncate; }
+  .poster-meta { @apply flex justify-between items-center; }
+  .poster-meta .gross { @apply text-label-sm text-outline; }
+  .poster-meta .links { @apply flex gap-2; }
+  .trend { @apply block text-label-sm text-outline mt-1 tabular-nums; }
+  /* Rating and genres under a weekly card. Truncates rather than wraps: the cards sit in
+     a fixed grid, and a second line here would make one card taller than its row. */
+  .card-facts { @apply block text-label-sm text-outline mt-1 truncate; }
+  /* Screens and the week-over-week move, on the line below. Same treatment as the facts
+     above it — this is the same kind of fact about the same film, and giving it its own
+     weight would make the card two competing lists rather than one. */
+  .chart-facts { @apply block text-label-sm text-outline mt-1 truncate; }
+  /* The run admitting it guessed. Wraps rather than truncates — unlike the facts line
+     above it this is a sentence, and a longer translation of it has to stay readable. */
+  .guess-hint { @apply block text-label-sm text-warn mt-1; }
+  /* How far a copy on its way has got. The third card-body annotation line, after
+     .card-facts and .guess-hint, and for the same reason: the overlays above are fixed
+     boxes and this text has to be free to wrap. */
+  .dl-line { @apply block text-label-sm text-ok mt-1; }
+  /* The same fact inside the search results' and the modal's "where it lives" line. */
+  .held-progress { @apply text-label-md text-ok font-semibold; }
+  .poster-meta .links a { @apply text-label-sm text-outline uppercase tracking-wider no-underline hover:text-primary; }
+
+  /* The gaps in stored history, and the one button that closes them. Wraps at every
+     breakpoint: a dozen week labels and a longer translation of the sentence around them
+     both need to take a second line rather than push the button off the row. */
+  .backfill-offer { @apply flex flex-wrap items-center gap-3 mb-6; }
+  /* The prose scale, not a label one: this is a sentence that wraps to three lines at a
+     narrow width, and text-label-md carries line-height 1 — fine for a chip, and lines
+     that touch each other in a paragraph. Matches `.subtle`, the sentence directly above
+     it on this page. */
+  .backfill-line { @apply text-body-md text-outline mb-0 flex-1 min-w-[16rem]; }
+  .empty-state { @apply text-center py-24 text-outline; }
+  .banner-warn { @apply px-4 py-3 mb-6 border border-error text-error bg-surface-container-low text-body-md; }
+  .load-more { @apply mt-12 flex justify-center; }
+
+  /* Reports */
+  .reports-grid { @apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gutter; }
+  .report-card { @apply bg-surface-container-lowest border border-surface-container-highest p-6 flex flex-col gap-6; }
+  .stat-block { @apply bg-surface-container py-4 px-6 flex justify-between items-center; }
+  .stat { @apply flex flex-col items-center; }
+  .stat .k { @apply text-label-md text-outline uppercase tracking-wider mb-2; }
+  .stat .v { @apply text-headline-lg text-primary; }
+  .stat-divider { @apply w-px h-12 bg-surface-container-highest; }
+  .report-meta { @apply text-label-md text-outline mb-4; }
+  .report-actions { @apply flex gap-3; }
+  /* Weekly-report card: View / Re-run / Delete as three equal-size, aligned buttons. */
+  .report-card-actions { @apply grid grid-cols-3 gap-2; }
+  /* Every action is a fixed-height, centered button — an explicit height beats the
+     btn-* padding differences (primary/secondary py-3 vs danger py-2) and can't be
+     undone by the form/details wrapper, so all three line up exactly. */
+  .report-card-actions a,
+  .report-card-actions summary,
+  .report-card-actions button {
+    /* mt-0 is essential: btn-primary/btn-secondary carry mt-2 but btn-danger does not,
+       so without it View/Re-run drop 8px and Delete sits high. */
+    @apply w-full h-10 px-3 py-0 mt-0 flex items-center justify-center text-center cursor-pointer;
+  }
+  /* Delete confirms in place: the summary IS the Delete button; opening the details swaps
+     it for Confirm in the same cell — no disclosure marker, no row/card expansion. */
+  .report-card-actions summary { @apply list-none; }
+  .report-card-actions summary::-webkit-details-marker { @apply hidden; }
+  .report-card-actions details[open] summary { @apply hidden; }
+  .detail-table { @apply w-full text-body-md border-collapse; }
+  .detail-table th { @apply text-left text-label-sm uppercase tracking-widest text-outline border-b border-surface-container-highest py-2; }
+  .detail-table td { @apply border-b border-surface-container-high py-2 pr-4; }
+  /* A failed sign-in or lockout should be findable by scanning the column, not by reading. */
+  .row-alert td { @apply text-error; }
+  /* Audit details are arbitrary key=value text — wrap rather than stretch the table. */
+  .detail-cell { @apply text-label-sm text-outline break-words; }
+  /* Holds a 56px thumbnail in a table row: top-aligned so it does not drift against a
+     long overview, and never squeezed by the text columns beside it. */
+  .fix-poster-cell { @apply w-14 align-top; }
+}

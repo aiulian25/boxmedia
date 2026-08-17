@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Search past weeks{% endblock %}
+{% block content %}
+{# The no-JavaScript path: the same fragment as a normal page, the arrangement
+   movie_detail.html already uses. app.js loads it into the dialog instead. #}
+<section class="page-header">
+  <h2 class="headline-lg">Search past weeks</h2>
+  <p class="subtle">Every title across the weeks you have fetched.</p>
+</section>
+
+<div class="app-card">
+  {% include "_search_results.html" %}
+</div>
+
+<div class="report-actions mt-6">
+  <a class="btn-secondary" href="{{ url_base }}/reports">Back to reports</a>
+</div>
+{% endblock %}

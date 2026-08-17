@@ -1,0 +1,108 @@
+{# The record itself — rendered standalone into the modal, and inside movie_detail.html
+   as a page. One source so the two can never drift. #}
+{% if error %}
+<p class="banner-warn" role="alert">{{ error }}</p>
+{% elif movie %}
+<article class="movie-detail">
+  <header class="movie-head">
+    <div class="movie-poster">
+      {% if movie.poster_local %}
+      <img src="{{ movie.poster_local }}" alt="{{ movie.title }} poster">
+      {% else %}
+      <div class="poster-empty">Poster</div>
+      {% endif %}
+    </div>
+    <div class="movie-headline">
+      <h2 class="headline-md">{{ movie.title }}{% if movie.year %} <span class="movie-year">{{ movie.year }}</span>{% endif %}</h2>
+
+      {% if movie.ratings %}
+      <div class="rating-row">
+        {% for label, score in movie.ratings %}
+        <span class="rating"><span class="rating-source">{{ label }}</span> {{ score }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if movie.genres %}
+      <div class="genre-row">
+        {% for genre in movie.genres %}<span class="tag">{{ genre }}</span>{% endfor %}
+      </div>
+      {% endif %}
+
+      {% if movie.facts %}
+      <dl class="fact-row">
+        {% for fact in movie.facts %}
+        <div class="fact"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div>
+        {% endfor %}
+      </dl>
+      {% endif %}
+
+      <div class="movie-links">
+        {% if movie.imdb_url %}<a href="{{ movie.imdb_url }}" target="_blank" rel="noopener noreferrer">IMDb</a>{% endif %}
+        {% if movie.trailer_url %}<a href="{{ movie.trailer_url }}" target="_blank" rel="noopener noreferrer">Trailer</a>{% endif %}
+        {% if movie.website %}<a href="{{ movie.website }}" target="_blank" rel="noopener noreferrer">Official site</a>{% endif %}
+      </div>
+
+      {# Beside what the decision is made on, not below the cast: this is the page built
+         for deciding, and the modal opens at the top. Saying where a film already lives
+         uses the search results' wording and class, so the two never drift. #}
+      {% set can_add = movie.tmdb_id and not movie.in_library and targets %}
+      {% if movie.holders or can_add %}
+      <div class="movie-actions">
+        {% if movie.holders %}
+        {% with locations = movie.holders %}{% include "_held.html" %}{% endwith %}
+        {% else %}
+        {% with tmdb_id = movie.tmdb_id, title = movie.title, year = movie.year, report_id = "" %}
+          {% include "_add_control.html" %}
+        {% endwith %}
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+  </header>
+
+  {% if movie.overview %}
+  <p class="movie-overview">{{ movie.overview }}</p>
+  {% endif %}
+
+  {% if movie.cast %}
+  <section class="credits">
+    <h3 class="section-subtitle">Cast</h3>
+    <div class="credit-row">
+      {% for person in movie.cast %}
+      <figure class="credit">
+        {% if person.headshot %}
+        <img src="{{ person.headshot }}" alt="" loading="lazy">
+        {% else %}
+        <div class="credit-empty" aria-hidden="true">{{ person.name[:1] }}</div>
+        {% endif %}
+        <figcaption><span class="credit-name">{{ person.name }}</span>{% if person.role %}<span class="credit-role">{{ person.role }}</span>{% endif %}</figcaption>
+      </figure>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% if movie.crew %}
+  <section class="credits">
+    <h3 class="section-subtitle">Crew</h3>
+    <div class="credit-row">
+      {% for person in movie.crew %}
+      <figure class="credit">
+        {% if person.headshot %}
+        <img src="{{ person.headshot }}" alt="" loading="lazy">
+        {% else %}
+        <div class="credit-empty" aria-hidden="true">{{ person.name[:1] }}</div>
+        {% endif %}
+        <figcaption><span class="credit-name">{{ person.name }}</span>{% if person.role %}<span class="credit-role">{{ person.role }}</span>{% endif %}</figcaption>
+      </figure>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% if movie.no_cast_reason %}
+  <p class="field-note">{{ movie.no_cast_reason }}</p>
+  {% endif %}
+</article>
+{% endif %}

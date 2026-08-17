@@ -1,0 +1,474 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h2 class="headline-lg">Settings</h2>
+  <p class="subtle">Manage your archive configuration and integrations.</p>
+</section>
+
+{# Action confirmations render as a global toast in base.html — this page keeps only
+   persistent guidance below. #}
+{% if first_run %}
+<p class="banner banner-success" role="status">
+  Welcome to {{ brand }}. Add your Radarr connection under <strong>External Apps</strong> below and
+  hit <strong>Test Connection</strong> to finish setup — then run your first week from Weekly Reports.
+</p>
+{% endif %}
+
+<section class="settings-section">
+  <h3 class="section-title">User Management</h3>
+  <div class="account-card">
+    <form method="post" action="{{ url_base }}/account/profile" class="account-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field">
+        <label for="username">Login username</label>
+        <input id="username" name="username" type="text" value="{{ account.username }}" maxlength="{{ max_username_length }}" required>
+      </div>
+      <div class="field">
+        <label for="display_name">Display name</label>
+        <input id="display_name" name="display_name" type="text" value="{{ account.display_name }}" maxlength="{{ max_display_name_length }}" required>
+        <p class="field-note">Shown beside your avatar in the top bar.</p>
+      </div>
+      <div class="field">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" value="{{ account.email }}" maxlength="{{ max_email_length }}" required>
+      </div>
+      <button type="submit" class="btn-secondary">Update Profile</button>
+    </form>
+    <form method="post" action="{{ url_base }}/account/password" class="account-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field">
+        <label for="current_password">Current password</label>
+        <input id="current_password" name="current_password" type="password" autocomplete="current-password" required>
+      </div>
+      <div class="field">
+        <label for="new_password">New password</label>
+        <input id="new_password" name="new_password" type="password" autocomplete="new-password" required>
+      </div>
+      <div class="field">
+        <label for="confirm_password">Confirm new password</label>
+        <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required>
+      </div>
+      <button type="submit" class="btn-secondary">Change Password</button>
+    </form>
+  </div>
+  <div class="app-actions-row">
+    <a class="btn-secondary" href="{{ url_base }}/security">View security activity</a>
+    <details>
+      <summary class="btn-danger">Log out all sessions</summary>
+      <form method="post" action="{{ url_base }}/account/logout-all">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-danger">Confirm — this signs you out too</button>
+      </form>
+    </details>
+  </div>
+</section>
+
+<section class="settings-section">
+  <h3 class="section-title">Appearance</h3>
+  <div class="app-card">
+    {# Radios rather than a toggle: two named choices, and the one in effect is readable
+       without interpreting a switch position. Saves like every other action on this page
+       — POST, then back here with a banner. #}
+    <form method="post" action="{{ url_base }}/account/theme" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <fieldset class="theme-choice">
+        <legend>Theme</legend>
+        <label class="theme-option">
+          <input type="radio" name="theme" value="dark" {% if current_user.theme != 'light' %}checked{% endif %}>
+          <span>Dark (default)</span>
+        </label>
+        <label class="theme-option">
+          <input type="radio" name="theme" value="light" {% if current_user.theme == 'light' %}checked{% endif %}>
+          <span>Light</span>
+        </label>
+      </fieldset>
+      <p class="field-note">Applies to this account on every browser you sign in from.</p>
+      <div class="app-actions-row">
+        <button type="submit" class="btn-primary">Save Theme</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section class="settings-section">
+  <h3 class="section-title">External Apps</h3>
+  <p class="subtle">Radarr connections. API keys are encrypted at rest; leave the key blank to keep it unchanged. The <strong>primary</strong> connection is the one weekly runs and every Add to Radarr use.</p>
+
+  {% for app in apps %}
+  <div class="app-card">
+    {# Each branch writes its modifier class in full. Interpolating the state into the
+       class name reads better, but Tailwind scans templates for literal class names and
+       never sees it: all three modifiers were being purged from the built stylesheet,
+       leaving every state the same grey with the coloured dot as the only cue. #}
+    {% set state = health.get(app.id) %}
+    {% if state == 'ok' %}
+    <div class="app-health app-health-ok">
+      <span class="dot dot-connected animate-pulse"></span><span>Connected — Radarr is responding</span>
+    {% elif state == 'auth' %}
+    <div class="app-health app-health-auth">
+      <span class="dot dot-failed"></span><span>API key rejected — update the API Key below and Save</span>
+    {% else %}
+    <div class="app-health app-health-unreachable">
+      <span class="dot dot-failed"></span><span>Unreachable — check the address, that Radarr is running, and TLS</span>
+    {% endif %}
+      {% if app.primary %}<span class="tag">Primary</span>{% endif %}
+    </div>
+    <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}" class="app-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div>
+        <label for="name-{{ app.id }}">App Name</label>
+        <input id="name-{{ app.id }}" name="name" type="text" value="{{ app.name }}" maxlength="{{ max_app_name_length }}" required>
+      </div>
+      <div>
+        <label for="url-{{ app.id }}">Address</label>
+        <input id="url-{{ app.id }}" name="url" type="text" value="{{ app.url }}" required>
+      </div>
+      <div>
+        <label for="key-{{ app.id }}">API Key</label>
+        <input id="key-{{ app.id }}" name="api_key" type="password" placeholder="{{ app.api_key_mask }}">
+      </div>
+      {# Same form as the identity fields above: one card, one Save. Its own values,
+         because a profile id and a folder path mean nothing on another instance. #}
+      <div>
+        <label for="dq-{{ app.id }}">Adds as</label>
+        {% if app.options.profiles %}
+        <select id="dq-{{ app.id }}" name="quality_profile_id" class="select-field">
+          {% for profile in app.options.profiles %}
+          <option value="{{ profile.id }}" {% if profile.id == app.quality_profile_id %}selected{% endif %}>{{ profile.name }}</option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <input id="dq-{{ app.id }}" name="quality_profile_id" type="number" value="{{ app.quality_profile_id if app.quality_profile_id is not none }}" placeholder="Profile ID">
+        {% endif %}
+      </div>
+      <div>
+        <label for="df-{{ app.id }}">into</label>
+        {% if app.options.root_folders %}
+        <select id="df-{{ app.id }}" name="root_folder" class="select-field">
+          {% for folder in app.options.root_folders %}
+          <option value="{{ folder }}" {% if folder == app.root_folder %}selected{% endif %}>{{ folder }}</option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <input id="df-{{ app.id }}" name="root_folder" type="text" value="{{ app.root_folder or '' }}" placeholder="/movies">
+        {% endif %}
+      </div>
+      <div class="app-actions">
+        <button type="submit" class="btn-secondary">Save</button>
+      </div>
+    </form>
+
+    <div class="app-actions-row">
+      {% if not app.primary %}
+      <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}/primary">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-ghost">Make primary</button>
+      </form>
+      {% endif %}
+      <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}/test">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-ghost">Test Connection</button>
+      </form>
+      <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}/delete">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-danger">Remove</button>
+      </form>
+    </div>
+  </div>
+  {% endfor %}
+
+  <div class="app-card">
+    <h4 class="section-subtitle">Add New App</h4>
+    <form method="post" action="{{ url_base }}/settings/apps" class="app-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div>
+        <label for="new-name">App Name</label>
+        <input id="new-name" name="name" type="text" placeholder="Local, Remote 4K, Pizza…" maxlength="{{ max_app_name_length }}" required>
+        {# Only explain telling instances apart once there ARE instances to tell apart.
+           On the first connection the useful nudge is to pick something memorable now,
+           so a second one later is obvious at a glance. #}
+        {% if apps %}
+        <p class="field-note">How you’ll pick it when sending a title. Rename it any time.</p>
+        {% else %}
+        <p class="field-note">Have fun with it — you can rename it any time, and a memorable name is how you’ll tell them apart if you add another Radarr later.</p>
+        {% endif %}
+      </div>
+      <div>
+        <label for="new-url">Address</label>
+        <input id="new-url" name="url" type="text" placeholder="192.168.1.100:7878 or https://radarr.example" required>
+      </div>
+      <div>
+        <label for="new-key">API Key</label>
+        <input id="new-key" name="api_key" type="password" required>
+      </div>
+      <div class="app-actions">
+        <div class="app-actions-row add-actions">
+          {# The result lands here, replaced wholesale by a fragment the server renders.
+             Empty and unannounced until there is something to say. #}
+          <span data-test-result></span>
+          {# Hidden until app.js unhides it: testing without saving needs the fetch, and
+             a plain submit would have to re-render this form with the API key echoed
+             back into the HTML to avoid making you retype it. Without JavaScript the
+             answer still arrives — Add itself reports whether the connection answered. #}
+          <button type="submit" class="btn-secondary" formaction="{{ url_base }}{{ test_credentials_path }}"
+                  data-test-connection hidden>Test Connection</button>
+          <button type="submit" class="btn-primary">Add</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section class="settings-section">
+  <h3 class="section-title">Weekly Check</h3>
+  <div class="app-card">
+    <form method="post" action="{{ url_base }}/settings/filters" class="app-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      {# The same radio pattern as Appearance: two named choices, and the one in effect is
+         readable without interpreting a switch. Spans the grid so the interval field sits
+         under the choice that uses it, rather than beside a mode that ignores it. #}
+      <div class="app-grid-full">
+        <fieldset class="theme-choice">
+          <legend>When to check</legend>
+          <label class="theme-option">
+            <input type="radio" name="schedule_mode" value="mojo_cadence" {% if filters.schedule_mode != 'interval' %}checked{% endif %}>
+            <span>On Mojo’s rhythm (default)</span>
+          </label>
+          <label class="theme-option">
+            <input type="radio" name="schedule_mode" value="interval" {% if filters.schedule_mode == 'interval' %}checked{% endif %}>
+            <span>Every fixed number of hours</span>
+          </label>
+        </fieldset>
+        <p class="field-note">Mojo settles a week over the days after it ends, so the rhythm checks Sunday, Monday, Wednesday and Friday and keeps only what actually changed. A week already recorded is not re-saved, so the extra checks cost nothing but a page fetch.</p>
+      </div>
+      <div>
+        <label for="schedule_interval_hours">Check interval (hours)</label>
+        <input id="schedule_interval_hours" name="schedule_interval_hours" type="number" min="1" value="{{ filters.schedule_interval_hours }}">
+        <p class="field-note">Used by the fixed-interval mode only. 168 is once a week, matching how often the chart itself changes.</p>
+      </div>
+      <div>
+        <label for="chart_size">Chart depth (movies per week)</label>
+        <input id="chart_size" name="chart_size" type="number" min="{{ chart_size_bounds[0] }}" max="{{ chart_size_bounds[1] }}" value="{{ filters.chart_size }}">
+        <p class="field-note">How far down the weekly chart each run records — {{ chart_size_bounds[0] }} to {{ chart_size_bounds[1] }}. Deeper runs take longer and make more requests.</p>
+      </div>
+      <div>
+        <label for="report_keep">Keep the last (weeks)</label>
+        <input id="report_keep" name="report_keep" type="number" min="{{ report_keep_bounds[0] }}" max="{{ report_keep_bounds[1] }}" value="{{ filters.report_keep }}">
+        <p class="field-note">Older weekly reports are deleted at the end of the next run — {{ report_keep_bounds[0] }} to {{ report_keep_bounds[1] }}. Backups are separate; this history is what the leaderboard and trend lines read.</p>
+      </div>
+      <div class="app-actions">
+        <button type="submit" class="btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section class="settings-section">
+  <h3 class="section-title">Box Office Region</h3>
+  <div class="app-card">
+    <form method="post" action="{{ url_base }}/settings/region" class="app-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div>
+        <label for="boxoffice_region">Chart</label>
+        <select id="boxoffice_region" name="boxoffice_region" class="select-field">
+          {% for code, label in regions.items() %}
+          <option value="{{ code }}" {% if code == filters.boxoffice_region %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        {# Verified against the live site (GB, DE, JP, Aug 2026): Mojo prints every
+           regional chart in US dollars, and its currency=local parameter is inert. Said
+           plainly here because "I changed the region and it still shows $" reads as a
+           bug until the page says whose dollars they are. The symbol is still read off
+           the page per row, so if Mojo ever prints local money, the app follows by
+           itself — nothing here asserts a currency. #}
+        <p class="field-note">Box Office Mojo reports every region in US dollars, so the $ stays when you switch — that is the page’s own figure, not a conversion. If Mojo ever prints a chart in local currency, the symbol is read off the page and will follow automatically.</p>
+      </div>
+      <div>
+        <p class="field-note">Applies to future fetches. Weeks already fetched keep the chart and currency they were fetched with — use a week’s <strong>Re-run</strong> button to bring it over.</p>
+        <p class="field-note">Box Office Mojo publishes a weekly chart for Domestic only, so a region’s figures are its <strong>weekend</strong> takings — that is all it reports per region.</p>
+      </div>
+      <div class="app-actions">
+        <button type="submit" class="btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section class="settings-section">
+  <h3 class="section-title">Backups</h3>
+  <div class="app-card">
+    <h4 class="section-subtitle">Automatic backups</h4>
+    <form method="post" action="{{ url_base }}/settings/backups/schedule" class="app-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div>
+        <label for="backup_interval_days">Create one every (days)</label>
+        <input id="backup_interval_days" name="backup_interval_days" type="number" min="0" value="{{ filters.backup_interval_days }}">
+        <p class="field-note">{% if filters.backup_interval_days %}A snapshot is taken every {{ filters.backup_interval_days }} day(s).{% else %}Off — set a number of days to back up automatically.{% endif %}</p>
+      </div>
+      <div>
+        <label for="backup_keep">Keep the last (backups)</label>
+        <input id="backup_keep" name="backup_keep" type="number" min="1" value="{{ filters.backup_keep }}">
+        <p class="field-note">Older snapshots are deleted once this many exist.</p>
+      </div>
+      <div class="app-actions">
+        <button type="submit" class="btn-primary">Save Schedule</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="app-card">
+    <div class="app-actions-row">
+      <form method="post" action="{{ url_base }}/settings/backups/create">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-primary">Create Backup</button>
+      </form>
+    </div>
+    {% if backups %}
+    <table class="detail-table">
+      <thead><tr><th>Backup</th><th>Created</th><th>Size</th><th>Actions</th></tr></thead>
+      <tbody>
+        {% for backup in backups %}
+        <tr>
+          <td>{{ backup.name }}</td>
+          <td>{{ backup.created }}{% if loop.first %} · latest{% endif %}</td>
+          <td>{{ backup.size }}</td>
+          <td>
+            <div class="app-actions-row">
+              <a class="btn-ghost" href="{{ url_base }}/settings/backups/{{ backup.name }}/download">Download</a>
+              {# No confirm step, unlike its two neighbours: this one reads the archive
+                 into a staging directory it deletes again and changes nothing. Asking
+                 "are you sure?" before a dry run is how a confirm stops meaning anything
+                 on the buttons that do need one. #}
+              <form method="post" action="{{ url_base }}/settings/backups/{{ backup.name }}/verify">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="btn-secondary">Verify</button>
+              </form>
+              <details>
+                <summary class="btn-secondary">Restore</summary>
+                <form method="post" action="{{ url_base }}/settings/backups/{{ backup.name }}/restore">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit" class="btn-secondary">Confirm restore (replaces current data)</button>
+                </form>
+              </details>
+              <details>
+                <summary class="btn-danger">Delete</summary>
+                <form method="post" action="{{ url_base }}/settings/backups/{{ backup.name }}/delete">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit" class="btn-danger">Confirm delete</button>
+                </form>
+              </details>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="subtle">No backups yet.</p>
+    {% endif %}
+  </div>
+  <div class="app-card">
+    <h4 class="section-subtitle">Import a backup file</h4>
+    <form method="post" action="{{ url_base }}/settings/backups/import" enctype="multipart/form-data" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="file" name="backup_file" accept=".backup" required>
+      <details>
+        <summary class="btn-secondary">Import &amp; Restore</summary>
+        <p class="subtle">This replaces your current data with the uploaded backup.</p>
+        <button type="submit" class="btn-primary">Confirm import</button>
+      </details>
+    </form>
+  </div>
+
+  <div class="app-card">
+    <h4 class="section-subtitle">Storage</h4>
+    <table class="detail-table">
+      <thead><tr><th>Area</th><th>Size</th></tr></thead>
+      <tbody>
+        {% for area in storage %}
+        <tr><td>{{ area.label }}</td><td>{{ area.size }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {# The evidence a failed scrape leaves behind, beside the button that deletes it.
+       Written for diagnosis and unreadable until now: this runtime has no shell to open a
+       file with, so reading one meant copying it off the host. Each downloads as plain
+       text — it is a page from somewhere else, and must never render in this origin. #}
+    <h4 class="section-subtitle mt-8">Scrape failure snapshots</h4>
+    {% if snapshots %}
+    <table class="detail-table">
+      <thead><tr><th>File</th><th>Size</th><th>Recorded</th></tr></thead>
+      <tbody>
+        {% for snapshot in snapshots %}
+        <tr>
+          <td class="detail-cell"><a href="{{ url_base }}/settings/maintenance/snapshots/{{ snapshot.name }}" download>{{ snapshot.name }}</a></td>
+          <td>{{ snapshot.size }}</td>
+          <td>{{ snapshot.recorded }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="field-note">No scrape failures recorded.</p>
+    {% endif %}
+    <div class="app-actions-row">
+      <form method="post" action="{{ url_base }}/settings/maintenance/prune-posters">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-secondary">Prune poster cache</button>
+      </form>
+      <form method="post" action="{{ url_base }}/settings/maintenance/clear-snapshots">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-secondary">Clear scrape snapshots</button>
+      </form>
+    </div>
+  </div>
+</section>
+{# Last on the page and collapsed by default: a title you ignored is one you decided not
+   to think about again, so it should not sit between the settings you do change. The
+   count is on the summary, so the list can be judged without opening it. #}
+<section class="settings-section">
+  <h3 class="section-title">Ignored Titles</h3>
+  <div class="app-card">
+    {% if ignored %}
+    <details>
+      <summary class="btn-secondary">Show ignored titles ({{ ignored | length }})</summary>
+      <p class="subtle mt-4">These are never suggested for adding, on any week. Click a week to open that report. Un-ignore one here — useful once a title has stopped charting and no longer appears on a report.</p>
+      <table class="detail-table">
+        <thead><tr><th>Title</th><th>TMDB</th><th>Weeks</th><th>Action</th></tr></thead>
+        <tbody>
+          {% for movie in ignored %}
+          <tr>
+            <td>{{ movie.title }}</td>
+            <td>{{ movie.tmdb_id if movie.tmdb_id is not none else "—" }}</td>
+            {# The search results' chip, unchanged: a week opens its report from here too.
+               Empty when the reports it charted in have since been deleted or pruned. #}
+            <td>
+              {% if movie.weeks %}
+              {% with weeks = movie.weeks %}{% include "_week_chips.html" %}{% endwith %}
+              {% else %}
+              —
+              {% endif %}
+            </td>
+            <td>
+              <div class="app-actions-row">
+                <form method="post" action="{{ url_base }}/unignore">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="tmdb_id" value="{{ movie.tmdb_id if movie.tmdb_id is not none }}">
+                  <input type="hidden" name="normalized_title" value="{{ movie.normalized_title }}">
+                  <input type="hidden" name="next" value="settings">
+                  <button type="submit" class="btn-ghost">Un-ignore</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+    {% else %}
+    <p class="subtle">Nothing ignored. Titles you skip on a weekly report appear here.</p>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

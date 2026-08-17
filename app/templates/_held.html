@@ -1,0 +1,12 @@
+{# Where a film already lives, and the way to it. One copy, because the search results
+   and the movie modal both say this and must not word it differently — the same reason
+   `_add_control.html` exists. Expects `locations`: `radarr_locations` entries.
+
+   Each name opens that film on that Radarr, for the jobs BoxMedia deliberately leaves to
+   it — the queue, the files, the history. An instance that did not tell us its own route
+   for the film renders the name as the plain text it has always been, rather than a link
+   that would land on nothing.
+
+   A copy still on its way carries how far along it is, keyed so app.js can keep the
+   figure current without a reload. #}
+<span class="held">{% if locations | selectattr('has_file') | first %}In Library{% else %}Wanted{% endif %} · {% for entry in locations %}{% if not loop.first %} · {% endif %}<a class="held-name" {% if entry.radarr_url %}href="{{ entry.radarr_url }}" target="_blank" rel="noopener noreferrer" title="Open on {{ entry.name }}"{% endif %}>{{ entry.name }}</a>{% if entry.progress is not none %} <span class="held-progress"{% if entry.progress_key %} data-progress="{{ entry.progress_key }}"{% endif %}>↓ <span data-progress-percent>{{ entry.progress | round | int }}</span>%</span>{% endif %}{% endfor %}</span>

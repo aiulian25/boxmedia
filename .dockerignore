@@ -1,0 +1,28 @@
+# Keep the build context small and secret-free.
+.venv/
+venv/
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Never ship data, secrets, or local env into an image layer
+/data/
+/secrets/
+.env
+
+# Dev-only Tailwind CLI (the assets build stage fetches its own, checksum-verified)
+/tools/
+
+# Design sources and docs are not needed at runtime
+dashboard page/
+settings page/
+weekly view page/
+*.md
+build and push.txt
+
+# Tests are not needed in the runtime image
+tests/

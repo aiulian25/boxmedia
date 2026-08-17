@@ -1,0 +1,34 @@
+{# The result of testing a connection that has not been saved. Rendered server-side and
+   swapped in by app.js, so nothing here is built by string-concatenation in the browser
+   and Jinja's autoescaping still covers every value.
+
+   Deliberately the same dot-and-label component the saved cards use for health, so a
+   green line means the same thing before and after the connection exists. #}
+{% if result.state == 'ok' %}
+<span class="app-health app-health-ok test-result" role="status">
+  <span class="dot dot-connected animate-pulse"></span>
+  <span>{% if result.version %}Radarr {{ result.version }} responded{% else %}Radarr responded{% endif %}</span>
+</span>
+{% elif result.state == 'not_radarr' %}
+{# Something answered and spoke the API, but it is not Radarr — pointing at Sonarr or
+   Lidarr is an easy mistake and every later call would fail in a confusing way. #}
+<span class="app-health app-health-auth test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>That answered, but it is not a Radarr — check the address</span>
+</span>
+{% elif result.state == 'auth' %}
+<span class="app-health app-health-auth test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>Radarr rejected the API key</span>
+</span>
+{% elif result.state == 'bad_url' %}
+<span class="app-health app-health-unreachable test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>That address can’t be read — try 192.168.1.100:7878 or https://radarr.example</span>
+</span>
+{% else %}
+<span class="app-health app-health-unreachable test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>Could not reach it — check the address, that Radarr is running, and TLS</span>
+</span>
+{% endif %}

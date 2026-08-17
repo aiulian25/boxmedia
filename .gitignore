@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime data volume (config, history, logs, cache, backups) — never commit
+/data/
+
+# Secrets and local env
+.env
+/secrets/
+
+# Local stash of pre-release docs/mockups moved out of the repo root — kept on disk,
+# not tracked (the originals remain in git history).
+/backups/
+
+# Private release/deploy files — never push by mistake. The runbook the release is
+# driven from, the scratch note that asked for it, and the compose file carrying this
+# server's real paths and ports.
+docs/Push.md
+build and push.md
+build and push.txt
+docker-compose.prod.yml
+
+# Compiled Tailwind output (produced at build time)
+/app/static/css/app.css
+
+# Tailwind standalone CLI binary (dev only; Docker build fetches its own)
+/tools/
+
+# OS noise
+.DS_Store

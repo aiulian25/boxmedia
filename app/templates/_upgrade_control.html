@@ -1,0 +1,36 @@
+{# Change the quality of a copy already downloaded. One copy, for the same reason
+   `_add_control.html` is one: two forms posting to `/upgrade-movie` would be two places to
+   forget the CSRF token or the connection id.
+
+   Expects, bound by the caller:
+     `radarr_id`   — Radarr's OWN internal id for the film, on the box that issued it
+     `target`      — that connection's app id, or "" for the primary (what the primary
+                     form has always posted, so `_resolve_target` reads it as the primary)
+     `profiles`    — that connection's quality profiles; ids are per database
+     `current_profile_id`  — the profile the film targets there now, or none
+     `fallback_profile_id` — what to preselect when the film targets none
+     `file_quality`        — the downloaded file's quality name, or none
+     `on_name`             — the connection's name, when it is NOT the primary
+
+   The profile name in the summary is looked up from `profiles` rather than passed in, so
+   the label can never name a profile from a different instance's database than the select
+   below it offers. #}
+{% set current = profiles | selectattr('id', 'equalto', current_profile_id) | first %}
+<details>
+  <summary class="btn-ignore">Already have it{% if on_name %} on {{ on_name }}{% endif %}{% if file_quality %} ({{ file_quality }}){% endif %}{% if current %} · profile: {{ current.name }}{% endif %} — change quality</summary>
+  <form method="post" action="{{ url_base }}/upgrade-movie" class="add-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="report_id" value="{{ report.id }}">
+    <input type="hidden" name="radarr_id" value="{{ radarr_id }}">
+    <input type="hidden" name="target" value="{{ target }}">
+    <p class="poster-note">This will make Radarr search for and download a new version{% if on_name %} on {{ on_name }}{% endif %}.</p>
+    {# Preselect the movie's OWN profile, so the list starts from what it has today
+       and picking the same one is visibly a no-op. #}
+    <select name="quality_profile_id" class="select-field select-sm">
+      {% for profile in profiles %}
+      <option value="{{ profile.id }}" {% if profile.id == (current_profile_id or fallback_profile_id) %}selected{% endif %}>{{ profile.name }}{% if profile.id == current_profile_id %} · current{% endif %}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn-add">Fetch this quality</button>
+  </form>
+</details>

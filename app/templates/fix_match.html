@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Fix match{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h2 class="headline-lg">Fix match</h2>
+  <p class="subtle">Radarr's results for “{{ term }}”. Pick the correct title and the chart entry is re-pointed at it — then you can add it as usual.</p>
+</section>
+
+{% if candidates %}
+<div class="app-card">
+  <table class="detail-table">
+    {# The poster column is unlabelled on purpose: the artwork is the label. This page
+       exists because two films share a title, and a thumbnail settles that faster than
+       any amount of prose. #}
+    <thead><tr><th><span class="sr-only">Poster</span></th><th>Title</th><th>Year</th><th>Overview</th><th>Use</th></tr></thead>
+    <tbody>
+      {% for candidate in candidates %}
+      <tr>
+        {# The same component the search results use — one poster treatment in the app,
+           including the fallback for a film Radarr has no artwork for. #}
+        <td class="fix-poster-cell">
+          <div class="search-poster">
+            {% if candidate.poster_local %}
+            <img src="{{ candidate.poster_local }}" alt="{{ candidate.title }} poster">
+            {% else %}
+            <div class="poster-empty">Poster</div>
+            {% endif %}
+          </div>
+        </td>
+        <td>
+          {{ candidate.title }}
+          {# Beneath the title rather than in the Year column, whose header would then be
+             lying about half its contents. Same line the weekly cards use. #}
+          {% if candidate.rating %}<span class="card-facts">★ {{ "%.1f"|format(candidate.rating) }}</span>{% endif %}
+        </td>
+        <td>{{ candidate.year if candidate.year is not none }}</td>
+        <td class="detail-cell">{{ candidate.overview }}</td>
+        <td>
+          <form method="post" action="{{ url_base }}/fix-match">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="report_id" value="{{ report_id }}">
+            <input type="hidden" name="rank" value="{{ rank }}">
+            <input type="hidden" name="term" value="{{ term }}">
+            <input type="hidden" name="tmdb_id" value="{{ candidate.tmdb_id }}">
+            <button type="submit" class="btn-add">Use this</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="empty-state">No results from Radarr for that search. Go back and try a different wording.</div>
+{% endif %}
+
+<div class="report-actions mt-6">
+  <a class="btn-secondary" href="{{ url_base }}/reports/{{ report_id }}">Back to report</a>
+</div>
+{% endblock %}

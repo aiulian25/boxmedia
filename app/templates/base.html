@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+{# Both class names are written out in full rather than interpolated. Tailwind scans
+   templates for literal class names and never sees one built from a variable — the
+   mistake that once purged this app's connection-health colours. Branching also means no
+   value read back from user.yml is ever placed into the markup. #}
+{% if theme == "light" %}<html lang="en" class="light">{% else %}<html lang="en" class="dark">{% endif %}
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}{{ brand }}{% endblock %} — {{ brand }}</title>
+  <link rel="stylesheet" href="{{ url_base }}/static/css/app.css?v={{ asset_version }}">
+  <link rel="icon" href="/favicon.ico?v={{ asset_version }}" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="{{ url_base }}/static/logo.png?v={{ asset_version }}" type="image/png" sizes="256x256">
+  <link rel="apple-touch-icon" href="{{ url_base }}/static/logo.png?v={{ asset_version }}">
+</head>
+{# Where app.js asks what is downloading now. On the element rather than in the script
+   because that file never builds a URL — it has no idea what url_base is, and every other
+   address it uses comes off an element for exactly this reason. Only for a signed-in
+   page: the endpoint is behind the session gate, so offering it to a login screen would
+   only produce a redirect the poller cannot use. #}
+<body class="bg-background text-on-background min-h-screen font-body-md antialiased"{% if current_user %} data-progress-url="{{ url_base }}/progress"{% endif %}>
+{% if current_user %}
+<header class="topnav">
+  <a class="brand" href="{{ url_base }}/dashboard">
+    <img class="brand-mark" src="{{ url_base }}/static/logo.png?v={{ asset_version }}" alt="" width="32" height="32">
+    <span>{{ brand }}</span>
+  </a>
+  <nav class="navlinks">
+    <a href="{{ url_base }}/dashboard" class="{% if active_nav == 'dashboard' %}active{% endif %}">Box Office</a>
+    <a href="{{ url_base }}/reports" class="{% if active_nav == 'reports' %}active{% endif %}">Weekly Reports</a>
+    <a href="{{ url_base }}/settings" class="{% if active_nav == 'settings' %}active{% endif %}">Settings</a>
+  </nav>
+  {# One group so the bar keeps three flex children and justify-between spaces the
+     links exactly as it did before the chip existed. #}
+  <div class="topnav-account">
+    <div class="user-chip">
+      {# Initials disc, not a photo: no upload, no serving route, never a broken image.
+         aria-hidden because the name it abbreviates is read out right beside it. #}
+      <span class="avatar" aria-hidden="true">{{ user_initials }}</span>
+      <span class="user-name" title="{{ current_user.display_name }}">{{ current_user.display_name }}</span>
+    </div>
+    <form class="logout" method="post" action="{{ url_base }}/logout">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit">Logout</button>
+    </form>
+  </div>
+</header>
+{% endif %}
+<main class="content">
+  {% block content %}{% endblock %}
+</main>
+{# Every transient message in the app lands here, so they all share one size, one corner
+   and one dwell time. Anything that must survive being missed is a persistent element on
+   its own page instead — the sign-in notice below is safe here because the Security page
+   keeps the durable record. #}
+{% if banner_text or sign_in_notice or last_run_error %}
+<div class="toast-region" aria-live="polite">
+  {% if banner_text %}
+  <p class="banner banner-{{ banner_kind }} toast" role="status" data-toast>{{ banner_text }}</p>
+  {% endif %}
+  {% if sign_in_notice %}
+  <p class="banner {% if sign_in_notice.failed %}banner-error{% else %}banner-success{% endif %} toast" role="status" data-toast>
+    Last sign-in: {{ sign_in_notice.at }} from {{ sign_in_notice.ip }}.{% if sign_in_notice.failed %}
+    {{ sign_in_notice.failed }} failed sign-in attempt(s) since then — check <a href="{{ url_base }}/security">security activity</a>.{% endif %}
+  </p>
+  {% endif %}
+  {# Safe to fade because it is not the record: the failed run keeps its own card in the
+     grid, stamped with its status, for as long as the report is retained.
+     role="alert" rather than "status" — it reports a failure, not a confirmation. #}
+  {% if last_run_error %}
+  <p class="banner banner-error toast" role="alert" data-toast>Last run didn’t complete: {{ last_run_error }}</p>
+  {% endif %}
+</div>
+{% endif %}
+{# Back to the top of a long grid, without dragging a phone's thumb up four screenfuls.
+   Ships `hidden`, and app.js removes the attribute once there is a screenful to come back
+   from — so it never covers content on a page that does not scroll, and with the script
+   blocked it is simply absent. That is the right degradation for this one: scrolling up is
+   something every browser already does with Home, a trackpad or a swipe, so nothing is
+   lost but the shortcut. It is outside the signed-in guard because "all pages" includes
+   the login screen, where it stays inert.
+
+   A <button>, not an <a href="#top">: an anchor would push a hash into history on every
+   press, and this page already uses :target to mark a linked poster card. #}
+<button type="button" class="to-top" data-to-top aria-label="Scroll to top" title="Scroll to top" hidden>
+  <span aria-hidden="true">↑</span>
+</button>
+{% if current_user %}
+{# Native <dialog>: no library, no inline script, so script-src 'self' is untouched.
+   Empty until app.js fills it from /movies/<id>?fragment=1. #}
+<dialog id="movie-dialog" class="movie-dialog" aria-label="Movie details">
+  <form method="dialog" class="movie-dialog-close"><button type="submit" aria-label="Close">&times;</button></form>
+  <div data-movie-body></div>
+</dialog>
+{% endif %}
+<script src="{{ url_base }}/static/js/app.js?v={{ asset_version }}" defer></script>
+</body>
+</html>

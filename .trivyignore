@@ -1,0 +1,23 @@
+# Documented waivers for the Trivy image scan (Step 23).
+#
+# Every entry below is a HIGH-severity CVE in a Debian 12 OS package that ships
+# inside the pinned distroless base image (gcr.io/distroless/python3-debian12:
+# nonroot). They are NOT in BoxMedia's own code or Python dependencies (those are
+# audited clean by pip-audit). Re-pulling the base returns the same digest, so this
+# is the newest distroless build available — the Debian point-release fixes simply
+# have not landed in a distroless rebuild yet (base-image lag).
+#
+# Not reachable from BoxMedia's runtime, and mitigated by the container hardening
+# (read-only rootfs, cap_drop ALL, no-new-privileges, non-root UID 65532, no shell):
+#   - BoxMedia uses no Kerberos/GSSAPI (libkrb5 CVEs).
+#   - It parses no untrusted XML (cpython DTD stack overflow).
+#   - It does not use OpenSSL PKCS7_verify, nor http.client for inbound requests.
+# Action: drop these waivers once the distroless base is rebuilt with the fixes,
+# and re-pin its digest.
+
+CVE-2025-13836
+CVE-2026-40355
+CVE-2026-40356
+CVE-2026-4224
+CVE-2026-45447
+CVE-2026-6100

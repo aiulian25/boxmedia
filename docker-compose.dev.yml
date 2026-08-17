@@ -1,0 +1,35 @@
+# BoxMedia — DEV stack (docker-compose.dev.yml). Publishes on the LAN (0.0.0.0)
+# over plain HTTP for local testing. For production, front it with a reverse proxy
+# (nginx/Traefik/Caddy/Pangolin/Cloudflare) that terminates TLS and bind 127.0.0.1.
+services:
+  boxmedia:
+    build: .
+    image: boxmedia:0.1.0
+    container_name: boxmedia
+    env_file: .env
+    environment:
+      # uvicorn reads FORWARDED_ALLOW_IPS to trust the proxy's X-Forwarded-* headers,
+      # so login rate-limiting sees the real client IP (ruling: BM_FORWARDED_ALLOW_IPS).
+      FORWARDED_ALLOW_IPS: ${BM_FORWARDED_ALLOW_IPS:-127.0.0.1}
+    ports:
+      # Host port from .env (ruling #10); container-internal port is fixed at 8686.
+      # DEV: bound to 0.0.0.0 so other machines on the LAN can reach it directly.
+      - "0.0.0.0:${BM_HOST_PORT:-58546}:8686"
+    volumes:
+      - ./data:/data
+      # Encryption key mounted read-only from OUTSIDE ./data, so a backup of the
+      # data dir can never contain the key that decrypts it (ruling #9 / Step 4).
+      - ./secrets/boxmedia.key:/secrets/boxmedia.key:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+    restart: unless-stopped

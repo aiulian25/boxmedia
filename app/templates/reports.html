@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Weekly Reports{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h2 class="headline-lg">Weekly Box Office Reports</h2>
+  {% if schedule %}
+  {# The track record beside the promise. A schedule that has never fired says so here
+     rather than only showing a confident next date — which is precisely how one that had
+     never run once stayed invisible. Wraps as a paragraph, so a longer date format or a
+     translated label takes a second line instead of overflowing. #}
+  <p class="subtle">Last check: {{ schedule.last_run }} · Next automatic check: {{ schedule.next_run }} · {{ schedule.rhythm }}</p>
+  {% endif %}
+</section>
+
+{# The month is NAMED, not called "this month": the current calendar month often has no
+   fetched weeks yet, and a section promising one would routinely be an empty box. It
+   becomes the current month by itself as soon as a week from it is fetched. #}
+{% if month_top %}
+<section class="top-gross">
+  <div class="top-gross-head">
+    <h3 class="top-gross-title">{{ month_top.label }} — highest gross</h3>
+    <span class="top-gross-meta">{{ month_top.weeks_tracked }} week{% if month_top.weeks_tracked != 1 %}s{% endif %} tracked · {{ month_top.titles }} title{% if month_top.titles != 1 %}s{% endif %}{% if month_top.excluded_weeks %} · {{ month_top.excluded_weeks }} week{% if month_top.excluded_weeks != 1 %}s{% endif %} in another region excluded{% endif %}</span>
+  </div>
+  <div class="gross-strip">
+    {% for entry in month_top.entries %}
+    <div class="gross-card">
+      {# The same poster-frame and modal hook the weekly cards use, so a click here
+         behaves exactly as it does everywhere else. #}
+      <a class="poster-frame{% if not entry.tmdb_id %} poster-frame-plain{% endif %}"
+         {% if entry.tmdb_id %}href="{{ url_base }}/movies/{{ entry.tmdb_id }}" data-movie="{{ entry.tmdb_id }}"{% endif %}>
+        {% if entry.poster_local %}
+        <img src="{{ entry.poster_local }}" alt="{{ entry.title }} poster">
+        {% else %}
+        <div class="poster-empty">Poster</div>
+        {% endif %}
+        <div class="rank-chip">{{ entry.rank }}</div>
+        <div class="gross-money">{{ entry.gross_display }}</div>
+      </a>
+      <div class="gross-name">{{ entry.title }}</div>
+      {# The overlay is the month's take, which is what the ranking uses. The running
+         total sits here so a big film never looks small early in a month. #}
+      <div class="gross-weeks">{{ entry.weeks }} week{% if entry.weeks != 1 %}s{% endif %}{% if entry.total_gross_display %} · {{ entry.total_gross_display }} total{% endif %}</div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<div class="run-actions">
+  <form method="post" action="{{ url_base }}/run" class="run-week">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="week_date" class="run-week-label">Pick a week</label>
+    <input id="week_date" name="week_date" type="date" aria-label="Week to fetch">
+    <button type="submit" class="btn-secondary">Fetch that week</button>
+  </form>
+  <form method="post" action="{{ url_base }}/run">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn-primary">Run current week</button>
+  </form>
+  {# GET, so it carries no CSRF token and can be shared or bookmarked. `data-modal` is
+     what app.js upgrades into the dialog; without JavaScript it navigates to the same
+     URL as a page. No visible label, matching the library search box. #}
+  <form method="get" action="{{ url_base }}{{ search_path }}" class="run-search" data-modal>
+    <input type="search" name="q" value="{{ query }}" placeholder="Search past weeks…" aria-label="Search past weeks" maxlength="{{ max_query_length }}">
+    <button type="submit" class="btn-secondary">Search</button>
+  </form>
+</div>
+
+{# Holes in the stored history, and the one action that closes them. A gap is easy to
+   make — the container was down, the schedule was off — and closing one used to mean a
+   date pick and a POST per week. Weeks are named, not just counted, so the offer can be
+   judged before it is taken. The list wraps: a dozen labels and a longer translation of
+   the sentence around them both need the room. #}
+{% if backfill.running %}
+<p class="banner banner-progress" role="status">
+  Backfilling{% if backfill.current_week %} week {{ backfill.current_week }}{% endif %} — {{ backfill.done }} of {{ backfill.total }} fetched. Refresh to see new weeks.
+</p>
+{% elif missing %}
+<div class="backfill-offer">
+  <p class="backfill-line">{{ missing.count }} week{% if missing.count != 1 %}s{% endif %} missing between {{ missing.first }} and {{ missing.last }}: {{ missing.labels | join(", ") }}</p>
+  <form method="post" action="{{ url_base }}{{ backfill_path }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn-secondary">Fetch missing weeks</button>
+  </form>
+</div>
+{% endif %}
+
+{% if cards %}
+<div class="reports-grid">
+  {% for card in cards %}
+  <article class="report-card">
+    <div class="stat-block">
+      <div class="stat">
+        <span class="k">Movies</span>
+        <span class="v">{{ card.movies }}</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <span class="k">{% if card.ok %}Matched{% else %}Status{% endif %}</span>
+        <span class="v">{% if card.ok %}{{ card.matched }}{% else %}—{% endif %}</span>
+      </div>
+    </div>
+    <div>
+      <div class="report-meta">Week {{ card.week }}{% if card.week_date %} · {{ card.week_date }}{% endif %} · {{ card.trigger }}{% if not card.ok %} · {{ card.status }}{% endif %}</div>
+      <div class="report-card-actions">
+        <a class="btn-primary" href="{{ url_base }}/reports/{{ card.id }}">View</a>
+        <form method="post" action="{{ url_base }}/run">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="week" value="{{ card.week }}">
+          <button type="submit" class="btn-secondary">Re-run</button>
+        </form>
+        <details>
+          <summary class="btn-danger">Delete</summary>
+          <form method="post" action="{{ url_base }}/reports/{{ card.id }}/delete">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn-danger">Yes</button>
+          </form>
+        </details>
+      </div>
+    </div>
+  </article>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">No reports yet. Runs appear here after the weekly check or “Run Now”.</div>
+{% endif %}
+{% endblock %}

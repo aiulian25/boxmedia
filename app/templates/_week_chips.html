@@ -1,0 +1,14 @@
+{# One title's weeks, each opening that week's report. Shared by the search results and
+   the ignored list so a week chip is the same control wherever it is offered, and there
+   is one place to change what a chip says. Expects `weeks` — the {week, rank, report_id}
+   entries the two views both build.
+
+   The #movie-<rank> fragment lands on the title itself rather than the top of a chart of
+   ten: the browser scrolls to it and CSS :target marks it, so finding the film again is
+   the browser's job and needs no JavaScript. Rank is the anchor because it is what
+   identifies an entry within a report — the same key fix-match edits by. #}
+<div class="week-chips">
+  {% for entry in weeks %}
+  <a class="week-chip" href="{{ url_base }}/reports/{{ entry.report_id }}#movie-{{ entry.rank }}" title="Open week {{ entry.week }} at #{{ entry.rank }}">{{ entry.label }} · #{{ entry.rank }}</a>
+  {% endfor %}
+</div>

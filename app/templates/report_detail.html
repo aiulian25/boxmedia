@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}Report {{ display_time }}{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h2 class="headline-lg">Report — week {{ report.week }}</h2>
+  <p class="subtle">{{ display_time }} · Trigger: {{ report.trigger }} · Movies: {{ report.totals.movies }} · In library: {{ report.totals.matched }}</p>
+</section>
+
+{% if previous_week or next_week %}
+<div class="run-actions">
+  {% if previous_link %}
+  <a class="btn-secondary" href="{{ url_base }}/reports/{{ previous_link }}">← Week {{ previous_week }}</a>
+  {% elif previous_week %}
+  <form method="post" action="{{ url_base }}/run">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="week" value="{{ previous_week }}">
+    <button type="submit" class="btn-secondary">← Fetch {{ previous_week }}</button>
+  </form>
+  {% endif %}
+  {% if next_link %}
+  <a class="btn-secondary" href="{{ url_base }}/reports/{{ next_link }}">Week {{ next_week }} →</a>
+  {% elif next_week %}
+  <form method="post" action="{{ url_base }}/run">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="week" value="{{ next_week }}">
+    <button type="submit" class="btn-secondary">Fetch {{ next_week }} →</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
+{# Add/upgrade/ignore confirmations render as a global toast in base.html. #}
+{% if not ok %}
+<p class="banner-warn" role="alert">This run did not complete: {{ report.status }}{% if report.error %} — {{ report.error }}{% endif %}</p>
+{% endif %}
+
+{% if movies %}
+<div class="poster-grid">
+  {% for movie in movies %}
+  {# The landing point for a week chip's #movie-<rank> link. tabindex="-1" so following
+     the fragment moves real focus here, not just the scroll position — a screen reader
+     should arrive at the title too, not be left at the top of the page. #}
+  <div id="movie-{{ movie.rank }}" tabindex="-1"
+       class="poster-card{% if movie.ignored and not movie.in_radarr %} poster-ignored{% endif %}">
+    {# A real link, so the detail works with JS off and is linkable; app.js upgrades
+       the click to a modal. Untitled entries Radarr never matched have no id to open. #}
+    <a class="poster-frame{% if not movie.tmdb_id %} poster-frame-plain{% endif %}"
+       {% if movie.tmdb_id %}href="{{ url_base }}/movies/{{ movie.tmdb_id }}" data-movie="{{ movie.tmdb_id }}"{% endif %}>
+      {% if movie.poster_local %}
+      <img src="{{ movie.poster_local }}" alt="{{ movie.title }} poster">
+      {% else %}
+      <div class="poster-empty">Poster</div>
+      {% endif %}
+      <div class="badge">
+        <span class="dot dot-{{ movie.badge_dot }}"></span><span>{{ movie.badge_label }}</span>
+      </div>
+      <div class="rank-chip">#{{ movie.rank }}</div>
+    </a>
+    <div class="poster-title">{{ movie.title }}</div>
+    <div class="poster-meta">
+      <span class="gross">{{ movie.gross_display }} (Wk {{ movie.weeks_in_release }})</span>
+      <span class="links">
+        {% if movie.imdb_url %}<a href="{{ movie.imdb_url }}" target="_blank" rel="noopener noreferrer">IMDB</a>{% endif %}
+        {% if movie.wiki_url %}<a href="{{ movie.wiki_url }}" target="_blank" rel="noopener noreferrer">Wiki</a>{% endif %}
+      </span>
+    </div>
+    {# What the film IS, next to what it earned — the two facts an add-or-ignore decision
+       actually turns on, from data every run already fetched. Its own line rather than
+       squeezed into .poster-meta, whose two children are spaced apart; truncating so a
+       long genre name, or a longer translation of one, shortens the line instead of
+       widening the card. #}
+    {% if movie.rating or movie.genres %}
+    <span class="card-facts" title="{% if movie.rating %}Rated {{ "%.1f"|format(movie.rating) }}{% endif %}{% if movie.genres %} · {{ movie.genres | join(" · ") }}{% endif %}">
+      {%- if movie.rating %}★ {{ "%.1f"|format(movie.rating) }}{% endif -%}
+      {%- if movie.rating and movie.genres %} · {% endif -%}
+      {{- movie.genres | join(" · ") -}}
+    </span>
+    {% endif %}
+    {# What the week looked like for this film, beyond what it took: how many screens, and
+       which way the take moved. A collapse on four thousand screens and a hold on two
+       hundred are opposite propositions that the gross alone does not distinguish. Its own
+       line under the facts, truncating for the same reason that one does — the cards sit
+       in a fixed grid and a second line would make one card taller than its row. #}
+    {% if movie.theaters is not none or movie.gross_change_pct is not none %}
+    <span class="chart-facts" title="{% if movie.theaters is not none %}{{ "{:,}".format(movie.theaters) }} theaters{% endif %}{% if movie.theaters is not none and movie.gross_change_pct is not none %} · {% endif %}{% if movie.gross_change_pct is not none %}{{ movie.gross_change_pct }}% against last week{% endif %}">
+      {%- if movie.theaters is not none %}{{ "{:,}".format(movie.theaters) }} theaters{% endif -%}
+      {%- if movie.theaters is not none and movie.gross_change_pct is not none %} · {% endif -%}
+      {%- if movie.gross_change_pct is not none %}{% if movie.gross_change_pct < 0 %}▼{% else %}▲{% endif %} {{ movie.gross_change_pct | abs }}% vs LW{% endif -%}
+    </span>
+    {% endif %}
+    {% if movie.trend | length > 1 %}
+    {# Chart run: which weeks it placed, and where. Ranks only — the cards are narrow.
+       Labels are built in the view, so a run crossing New Year says so. #}
+    <span class="trend" title="Rank by week">{% for entry in movie.trend %}{% if not loop.first %} → {% endif %}{{ entry.label }} #{{ entry.rank }}{% endfor %}</span>
+    {% endif %}
+    {# Nothing Radarr returned actually matched this title, so the run took its first
+       suggestion. Said in the card body rather than over the poster: the badge shares
+       that row with the rank chip and its edge with the "where it lives" chips, and this
+       belongs beside the control that fixes it anyway — which opens itself below. #}
+    {% if movie.guessed and not movie.in_radarr %}
+    <span class="guess-hint" title="No candidate matched the chart title — this is Radarr's first suggestion">Best guess — verify</span>
+    {% endif %}
+    {# How far along, for a copy on its way. A body line rather than the badge: the badge
+       is a fixed overlay sharing its row with the rank chip, and the percent pushed it to
+       198px and two lines across that chip. This wraps for a longer connection name or a
+       longer translation instead. #}
+    {% if movie.downloading %}
+    <span class="dl-line">{% for entry in movie.downloading %}{% if not loop.first %} · {% endif %}<span{% if entry.progress_key %} data-progress="{{ entry.progress_key }}"{% endif %}>↓ <span data-progress-percent>{{ entry.progress | round | int }}</span>% on {{ entry.name }}</span>{% endfor %}</span>
+    {% endif %}
+
+    <div class="poster-actions">
+      {# Already downloaded — warn before fetching a different quality. The copy may be on
+         any connection, so the form carries WHICH one and that box's own profiles: a
+         Radarr id means nothing on an instance that did not issue it, and profile ids are
+         per database. Two branches rather than one because the primary's copy is read from
+         the library this page already loaded, while another box's comes from the holder
+         entry radarr_locations built. #}
+      {% if movie.in_radarr and movie.has_file and movie.radarr_id and profiles %}
+      {% with radarr_id = movie.radarr_id, target = "", profiles = profiles,
+              current_profile_id = movie.quality_profile_id,
+              fallback_profile_id = default_profile_id,
+              file_quality = movie.file_quality, on_name = none %}
+        {% include "_upgrade_control.html" %}
+      {% endwith %}
+
+      {% elif movie.upgrade_target and profiles_by_app.get(movie.upgrade_target.app_id) %}
+      {% with radarr_id = movie.upgrade_target.radarr_id,
+              target = movie.upgrade_target.app_id,
+              profiles = profiles_by_app[movie.upgrade_target.app_id],
+              current_profile_id = movie.upgrade_target.quality_profile_id,
+              fallback_profile_id = none,
+              file_quality = movie.upgrade_target.file_quality,
+              on_name = movie.upgrade_target.name %}
+        {% include "_upgrade_control.html" %}
+      {% endwith %}
+      {% endif %}
+
+      {# Adding is offered alongside, not instead: a film downloaded on the 4K box is still
+         missing from the primary, and that add has always been available here. #}
+      {% if not movie.in_radarr and not movie.ignored and movie.tmdb_id and targets %}
+      {% with tmdb_id = movie.tmdb_id, title = movie.title, year = movie.year,
+               report_id = report.id %}
+        {% include "_add_control.html" %}
+      {% endwith %}
+      {% endif %}
+
+      {% if not movie.in_radarr %}
+        {# Chart titles Radarr couldn't identify — or matched to the wrong film — are
+           fixable here instead of being a dead end. #}
+        <details{% if movie.guessed %} open{% endif %}>
+          <summary class="btn-ignore">{% if movie.tmdb_id %}Wrong match?{% else %}Find this film{% endif %}</summary>
+          <form method="get" action="{{ url_base }}/reports/{{ report.id }}/fix-match" class="add-form">
+            <input type="hidden" name="rank" value="{{ movie.rank }}">
+            <label class="add-label" for="term-{{ movie.rank }}">Search Radarr for</label>
+            <input id="term-{{ movie.rank }}" name="term" type="text" value="{{ movie.title }}">
+            <button type="submit" class="btn-add">Search</button>
+          </form>
+        </details>
+        {% if movie.ignored %}
+        <form method="post" action="{{ url_base }}/unignore">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="report_id" value="{{ report.id }}">
+          <input type="hidden" name="tmdb_id" value="{{ movie.tmdb_id if movie.tmdb_id is not none }}">
+          <input type="hidden" name="normalized_title" value="{{ movie.normalized_title }}">
+          <button type="submit" class="btn-ignore">Un-ignore</button>
+        </form>
+        {% else %}
+        <form method="post" action="{{ url_base }}/ignore">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="report_id" value="{{ report.id }}">
+          <input type="hidden" name="tmdb_id" value="{{ movie.tmdb_id if movie.tmdb_id is not none }}">
+          <input type="hidden" name="title" value="{{ movie.title }}">
+          <input type="hidden" name="normalized_title" value="{{ movie.normalized_title }}">
+          <button type="submit" class="btn-ignore">Ignore</button>
+        </form>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% elif ok %}
+<div class="empty-state">This run had no chart entries.</div>
+{% endif %}
+
+<div class="report-actions mt-6">
+  <a class="btn-secondary" href="{{ url_base }}/reports">Back to reports</a>
+</div>
+{% endblock %}

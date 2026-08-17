@@ -1,0 +1,38 @@
+# BoxMedia — pull-and-run. Copy .env.example to .env, fill it in, generate the
+# encryption key (README "First run"), then: docker compose up -d
+#
+# Binds 127.0.0.1 on purpose: front it with your reverse proxy (nginx / Traefik /
+# Caddy / Pangolin / Cloudflare) for TLS and outside access. For direct LAN access
+# without a proxy, change the bind to 0.0.0.0 and set BM_SECURE_COOKIES=false.
+services:
+  boxmedia:
+    image: ghcr.io/aiulian25/boxmedia:1.0.0
+    container_name: boxmedia
+    env_file: .env
+    environment:
+      # uvicorn trusts X-Forwarded-* from these proxy IPs, so login rate-limiting
+      # sees the real client address instead of the proxy's.
+      FORWARDED_ALLOW_IPS: ${BM_FORWARDED_ALLOW_IPS:-127.0.0.1}
+    ports:
+      - "127.0.0.1:${BM_HOST_PORT:-58546}:8686"
+    volumes:
+      # Everything the app stores: config, weekly history, logs, poster cache, backups.
+      - ./data:/data
+      # The encryption key lives OUTSIDE ./data, mounted read-only, so a backup of the
+      # data directory can never contain the key that decrypts it.
+      - ./secrets/boxmedia.key:/secrets/boxmedia.key:ro
+    # The container runs read-only, unprivileged, capability-free; /data is the only
+    # writable path. These lines are load-bearing — the app is built to run this way.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+    restart: unless-stopped

@@ -1,0 +1,44 @@
+{# Search results — rendered standalone into the modal, and inside search_results.html
+   as a page. One source so the two can never drift, exactly like _movie_detail.html. #}
+<div class="search-results">
+  {% if not query %}
+  <p class="search-empty">Type part of a title to search every week you have fetched.</p>
+  {% elif not matches %}
+  <p class="search-empty">
+    Nothing matching “{{ query }}” in the {{ weeks_searched }} week{% if weeks_searched != 1 %}s{% endif %} stored.
+    Only weeks you have fetched can be searched — run the week you are thinking of, then look again.
+  </p>
+  {% else %}
+  <h2 class="search-head">{{ matches | length }} title{% if matches | length != 1 %}s{% endif %} matching “{{ query }}”</h2>
+  <p class="search-sub">Across {{ weeks_searched }} stored week{% if weeks_searched != 1 %}s{% endif %} · click a week to open that report</p>
+
+  {% for match in matches %}
+  <div class="search-result">
+    <div class="search-poster">
+      {% if match.poster_local %}
+      <img src="{{ match.poster_local }}" alt="{{ match.title }} poster">
+      {% else %}
+      <div class="poster-empty">Poster</div>
+      {% endif %}
+    </div>
+    <div class="search-body">
+      <div class="search-title">{{ match.title }}{% if match.year %} <span>{{ match.year }}</span>{% endif %}</div>
+      {# The point of the whole feature: jump straight to the week instead of opening
+         each report to find out which one held it. #}
+      {% with weeks = match.weeks %}{% include "_week_chips.html" %}{% endwith %}
+      <div class="search-actions">
+        {% if match.locations %}
+        {# Already somewhere: say where rather than offering a duplicate add. #}
+        {% with locations = match.locations %}{% include "_held.html" %}{% endwith %}
+        {% elif match.tmdb_id and targets %}
+        {% with tmdb_id = match.tmdb_id, title = match.title, year = match.year,
+                 report_id = match.weeks[0].report_id %}
+          {% include "_add_control.html" %}
+        {% endwith %}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>

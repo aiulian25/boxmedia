@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Box Office{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h2 class="headline-lg">Box Office</h2>
+  <p class="subtle">Your library — titles in Radarr, added here or already there. Add new titles from <a href="{{ url_base }}/reports">Weekly Reports</a>.</p>
+</section>
+
+{# The sign-in notice renders in base.html's toast region — one transient-message
+   treatment for the whole app. The banner below is NOT transient: an unreachable Radarr
+   is a state that persists until it is fixed, so it stays on the page. #}
+{% if unreachable %}
+<p class="banner-warn" role="alert">Couldn’t reach {{ unreachable | join(', ') }} — showing the last known library status.</p>
+{% endif %}
+
+<div class="toolbar">
+  <form class="search" method="get" action="{{ url_base }}/dashboard">
+    <input type="text" name="q" value="{{ query }}" placeholder="Search library…" aria-label="Search library">
+  </form>
+  {# The count the grid can't show while it is paginated — the answer to "I have more
+     than this in Radarr, where are they?". #}
+  {% if total %}
+  <span class="library-count">{% if query %}{{ total }} match{% if total != 1 %}es{% endif %}{% else %}{{ total }} title{% if total != 1 %}s{% endif %}{% endif %}{% if has_more %} · showing {{ movies | length }}{% endif %}</span>
+  {% endif %}
+</div>
+
+{% if movies %}
+<div class="poster-grid">
+  {% for movie in movies %}
+  <div class="poster-card">
+    {# The chips are links out to Radarr, so they cannot sit inside the poster's own
+       anchor: the HTML parser splits an anchor at a nested one and ejects everything
+       after it, which would leave `.where` absolutely positioned against the page. The
+       shell gives it the positioning context `.poster-frame` used to provide. #}
+    <div class="poster-shell">
+      {# A real link, so the detail works with JS off and is linkable; app.js upgrades
+         the click to a modal. Untitled entries Radarr never matched have no id to open. #}
+      <a class="poster-frame{% if not movie.tmdb_id %} poster-frame-plain{% endif %}"
+         {% if movie.tmdb_id %}href="{{ url_base }}/movies/{{ movie.tmdb_id }}" data-movie="{{ movie.tmdb_id }}"{% endif %}>
+        {% if movie.poster_local %}
+        <img src="{{ movie.poster_local }}" alt="{{ movie.title }} poster">
+        {% else %}
+        <div class="poster-empty">Poster</div>
+        {% endif %}
+        <div class="badge">
+          {% if movie.status == 'in_library' %}
+          <span class="dot dot-in-library"></span><span>In Library{% if movie.file_quality %} · {{ movie.file_quality }}{% endif %}</span>
+          {% else %}
+          <span class="dot dot-wanted"></span><span>Wanted</span>
+          {% endif %}
+        </div>
+      </a>
+      {# Which box holds it, or is about to. Solid = the file is there; the ↓ chip is
+         still downloading, i.e. where the title is going to land. Each chip opens the
+         film on that Radarr — queue, files and history are its job, not ours. An
+         instance that did not name its own route for the film keeps the plain chip,
+         the same way the poster above omits its href without a tmdb id.
+
+         A pending chip carries how far along that box's download is, as a band along its
+         own bottom edge: per connection, costing no extra width, so a grid of a hundred
+         cards can be scanned for what is nearly here. Drawn in ten-percent steps because a
+         per-film width would have to be an inline style and the CSP forbids one; the exact
+         figure is in the tooltip. No answer from the queue renders exactly as before. #}
+      {% if movie.locations %}
+      <div class="where">
+        {% for entry in movie.locations %}
+        <a class="where-chip{% if not entry.has_file %} where-chip-pending{% endif %}{% if entry.progress_step is not none %} where-chip-p{{ entry.progress_step }}{% endif %}"
+           {% if not entry.has_file and entry.progress_key %}data-progress="{{ entry.progress_key }}" data-progress-title="Open {{ movie.title }} on {{ entry.name }}"{% endif %}
+           {% if entry.radarr_url %}href="{{ entry.radarr_url }}" target="_blank" rel="noopener noreferrer" title="Open {{ movie.title }} on {{ entry.name }}{% if entry.progress is not none %} — {{ entry.progress | round | int }}% downloaded{% endif %}"{% else %}title="{{ entry.name }}{% if entry.progress is not none %} — {{ entry.progress | round | int }}% downloaded{% endif %}"{% endif %}>{% if not entry.has_file %}↓ {% endif %}{{ entry.name }}</a>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    <div class="poster-title">{{ movie.title }}</div>
+    <div class="poster-meta">
+      {# Box-office figures exist only for titles a stored week actually charted. For
+         everything else Radarr holds, the release year is what we honestly know. #}
+      <span class="gross">{% if movie.gross_display %}{{ movie.gross_display }} (Wk {{ movie.weeks_in_release }}){% elif movie.year %}{{ movie.year }}{% endif %}</span>
+      <span class="links">
+        {% if movie.imdb_url %}<a href="{{ movie.imdb_url }}" target="_blank" rel="noopener noreferrer">IMDB</a>{% endif %}
+        {% if movie.wiki_url %}<a href="{{ movie.wiki_url }}" target="_blank" rel="noopener noreferrer">Wiki</a>{% endif %}
+      </span>
+    </div>
+    {# Two different measurements, so both are named. The tracked sum covers only the
+       weeks this install holds; lifetime is the film's whole run as Mojo reports it, and
+       appears only when a stored report actually carries one. #}
+    {% if movie.weeks_tracked > 1 %}
+    <span class="trend">{{ movie.weeks_tracked }} weeks tracked · {{ movie.gross_total_display }} tracked{% if movie.lifetime_display %} · {{ movie.lifetime_display }} lifetime{% endif %}</span>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+{% if has_more %}
+<div class="load-more">
+  {# Driven by PAGE_INCREMENT, not spelled out: a hardcoded number silently lies the
+     moment the increment changes. #}
+  <a class="btn-secondary" href="{{ url_base }}/dashboard?limit={{ next_limit }}{% if query %}&q={{ query }}{% endif %}">Show {{ page_increment }} More</a>
+</div>
+{% endif %}
+
+{% elif has_any_reports %}
+<div class="empty-state">Nothing in your library yet. Open <a href="{{ url_base }}/reports">Weekly Reports</a> and add the titles you want.</div>
+{% else %}
+<div class="empty-state">
+  No box-office runs yet. Configure a Radarr connection in Settings, then run a week under <a href="{{ url_base }}/reports">Weekly Reports</a>.
+</div>
+{% endif %}
+{% endblock %}
