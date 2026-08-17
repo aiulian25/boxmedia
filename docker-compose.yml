@@ -15,7 +15,7 @@
 
 # The one place the version is written. Both services take it from here, so they cannot
 # run different builds of the same app.
-x-image: &image ghcr.io/aiulian25/boxmedia:1.0.3
+x-image: &image ghcr.io/aiulian25/boxmedia:1.1.0
 
 x-data: &data ${BM_DATA_PATH:-./data}:/data
 
