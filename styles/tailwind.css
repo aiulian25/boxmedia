@@ -334,6 +334,12 @@ html.light {
     right: calc(5rem + env(safe-area-inset-right));
     bottom: calc(1rem + env(safe-area-inset-bottom));
   }
+  /* The same trap `.to-top` documents below: preflight's `[hidden] { display: none }`
+     sits in @layer base, which this layer beats — so `display: flex` above wins and the
+     bar paints on every page load, saying "you have unsaved changes" to someone who has
+     changed nothing, and refusing to leave when they press Discard. Both were reported.
+     Any element that ships `hidden` and sets its own display needs this line. */
+  .save-bar[hidden] { @apply hidden; }
   .save-bar-text { @apply text-body-md text-on-surface mr-auto; }
   /* The bar sits over the page, so the last card needs room to clear it — otherwise
      "Un-ignore" on the final row is permanently underneath the thing telling you to

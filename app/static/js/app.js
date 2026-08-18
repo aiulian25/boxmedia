@@ -234,6 +234,10 @@
   var saveBar = document.querySelector("[data-save-bar]");
 
   if (settingsForms.length && saveBar && window.fetch) {
+    // What each form held when the server rendered it. A field edited and then put back
+    // is not a change, and neither is anything a password manager fills in and out — the
+    // bar answers "does this differ from what is stored", not "did an event fire".
+    var initial = new WeakMap();
     var dirty = [];
     var saveButton = saveBar.querySelector("[data-save-all]");
     var discardButton = saveBar.querySelector("[data-discard-all]");
@@ -247,11 +251,24 @@
       document.body.classList.toggle("has-save-bar", visible);
     };
 
-    var markDirty = function (form) {
-      if (dirty.indexOf(form) === -1) {
+    var snapshot = function (form) {
+      // FormData preserves field order, which is stable for a form nobody reshapes.
+      var pairs = [];
+      new FormData(form).forEach(function (value, name) {
+        pairs.push(name + "=" + value);
+      });
+      return pairs.join("&");
+    };
+
+    var recheck = function (form) {
+      var changed = snapshot(form) !== initial.get(form);
+      var at = dirty.indexOf(form);
+      if (changed && at === -1) {
         dirty.push(form);
+      } else if (!changed && at !== -1) {
+        dirty.splice(at, 1);
       }
-      showBar(true);
+      showBar(dirty.length > 0);
     };
 
     Array.prototype.forEach.call(settingsForms, function (form) {
@@ -261,8 +278,9 @@
       if (ownSave) {
         ownSave.hidden = true;
       }
-      form.addEventListener("input", function () { markDirty(form); });
-      form.addEventListener("change", function () { markDirty(form); });
+      initial.set(form, snapshot(form));
+      form.addEventListener("input", function () { recheck(form); });
+      form.addEventListener("change", function () { recheck(form); });
     });
 
     discardButton.addEventListener("click", function () {
@@ -271,6 +289,8 @@
       Array.prototype.forEach.call(dirty, function (form) { form.reset(); });
       dirty = [];
       showBar(false);
+      // reset() fires no input event, so nothing above re-reads the forms; they now hold
+      // exactly what was rendered, which is what `initial` already remembers.
     });
 
     saveButton.addEventListener("click", function () {

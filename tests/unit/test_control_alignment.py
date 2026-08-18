@@ -397,3 +397,67 @@ def test_the_scroll_to_top_button_stays_hidden_without_the_script() -> None:
     """
     assert "grid" in _applied_to(".to-top")  # ...which is exactly what needs overriding
     assert "hidden" in _applied_to(".to-top[hidden]")
+
+
+# --- an element that ships `hidden` has to actually be hidden ---
+
+TEMPLATES = Path(__file__).resolve().parent.parent.parent / "app" / "templates"
+# Utilities that set `display`. Any of these on an element that also ships the `hidden`
+# attribute beats preflight's `[hidden] { display: none }`, because this stylesheet's
+# layer wins over base — so the element paints regardless of the attribute.
+_DISPLAY_UTILITIES = {
+    "flex", "grid", "block", "inline-block", "inline-flex", "inline", "table",
+    "flow-root", "contents", "list-item", "inline-grid",
+}
+_HIDDEN_TAG = re.compile(r"<[a-z]+[^>]*\bhidden\b[^>]*>")
+_CLASS_ATTR = re.compile(r'class="([^"]*)"')
+
+
+def _classes_shipped_hidden() -> set[str]:
+    """Every class on an element that renders with the `hidden` attribute.
+
+    Read from the templates rather than listed here, so a component added later is
+    covered without anyone remembering to add it.
+    """
+    found: set[str] = set()
+    for template in TEMPLATES.glob("*.html"):
+        for tag in _HIDDEN_TAG.findall(template.read_text(encoding="utf-8")):
+            if "aria-hidden" in tag and not re.search(r"(?<!aria-)\bhidden\b(?!=)", tag):
+                continue  # aria-hidden hides it from a screen reader, not from layout
+            attribute = _CLASS_ATTR.search(tag)
+            if attribute:
+                found.update(attribute.group(1).split())
+    return found
+
+
+def test_anything_that_ships_hidden_stays_hidden() -> None:
+    """The save bar shipped `hidden` AND `display: flex`, so it painted on every page
+    load — telling people they had unsaved changes before they touched anything, and
+    refusing to leave when they pressed Discard. `.to-top` had carried the fix and the
+    explanation for months; the second component to need it did not get one.
+
+    Stated over the templates so the third one cannot repeat it.
+    """
+    source = _COMMENTS.sub("", STYLESHEET.read_text(encoding="utf-8"))
+    for css_class in sorted(_classes_shipped_hidden()):
+        selector = f".{css_class}"
+        rules = [
+            rule.group(2)
+            for rule in _RULES.finditer(source)
+            if selector in [part.strip() for part in rule.group(1).split(",")]
+        ]
+        sets_display = any(
+            utility in _DISPLAY_UTILITIES
+            for body in rules
+            for utility in re.sub(r"@apply|;", " ", body).split()
+        )
+        if not sets_display:
+            continue  # preflight's rule is unopposed, so `hidden` works on its own
+        guard = f"{selector}[hidden]"
+        assert any(
+            guard in [part.strip() for part in rule.group(1).split(",")]
+            for rule in _RULES.finditer(source)
+        ), (
+            f"{selector} sets its own display and ships hidden, so it needs "
+            f"`{guard} {{ @apply hidden; }}` — without it the element paints anyway"
+        )
