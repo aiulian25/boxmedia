@@ -1,15 +1,34 @@
 # BoxMedia
 
 Self-hosted automation that surfaces **currently trending, commercially
-successful films** for your home library. Each week it scrapes the Box Office
-Mojo top‑10 and matches it against your Radarr library, then gives you a one‑click
+successful films** for your home library. It scrapes the Box Office Mojo weekly
+chart and matches it against your Radarr library, then gives you a one‑click
 review page to add the missing hits at the quality you choose — nothing is ever
 sent to Radarr without you. It complements request-based tools (Overseerr and
 friends): mainstream box-office hits are surfaced for review, while niche requests
 still go through the normal workflow.
 
-Single admin, dark "Obsidian" UI, runs behind a reverse proxy on a NAS or small
+Single admin, dark or light UI, runs behind a reverse proxy on a NAS or small
 home server. It never downloads anything itself — it tells Radarr what to fetch.
+
+**What it does beyond that:**
+
+- **Follows the source's rhythm.** Mojo posts an estimate and settles it over the
+  following days, so the unattended check runs four times a week (Sun · Mon · Wed ·
+  Fri) and keeps only what actually changed. A week already recorded is not
+  re-saved. A fixed interval is still selectable.
+- **Knows the film, not just the title.** When Radarr cannot recognise a chart
+  title, BoxMedia reads the IMDb id off Mojo's own release page and matches on
+  that. What it still cannot identify says **"Best guess — verify"** and offers a
+  one-click fix, which then applies to every week that title charted.
+- **Tells you what you already have.** Connect **Plex or Jellyfin** (read-only)
+  and a title already on your media server says so before you add a second copy.
+- **Several Radarrs, honestly.** Add to whichever instance you choose, see which
+  one holds each film, upgrade a copy in place, and watch real download progress
+  on every page it appears.
+- **Thirteen regions.** Domestic plus twelve regional charts, with grosses shown
+  in whatever currency the source actually prints — never converted, never mixed.
+- **Encrypted backups** you can verify, restore, or hand to your own 3‑2‑1.
 
 ## What it looks like
 
@@ -20,10 +39,14 @@ home server. It never downloads anything itself — it tells Radarr what to fetc
 | ![Weekly report — the chart matched against your library](docs/screenshots/weekly-report.png) | ![Library view](docs/screenshots/dashboard.png) |
 | ![Weekly reports and the month's leaderboard](docs/screenshots/reports.png) | ![Settings](docs/screenshots/settings.png) |
 
+![Media Server — connect Plex or Jellyfin, read-only](docs/screenshots/media-server.png)
+
 ## Requirements & resource use
 
-You need Docker with Compose and a reachable Radarr instance. The image is
-published for **amd64 and arm64** — see [Supported platforms](#supported-platforms).
+You need Docker with Compose and a reachable Radarr instance. A media server —
+**Plex or Jellyfin** — is optional and read-only; connect one and the cards tell
+you when a title is already on it. The image is published for **amd64 and
+arm64** — see [Supported platforms](#supported-platforms).
 
 ### Image
 
@@ -31,48 +54,52 @@ published for **amd64 and arm64** — see [Supported platforms](#supported-platf
 |---|---|
 | Image | `ghcr.io/aiulian25/boxmedia` |
 | On disk after pull | **165 MB** |
-| Transferred over the network (compressed layers) | **39 MB** |
+| Transferred over the network (compressed layers) | **37 MB** |
 | Base | `gcr.io/distroless/python3-debian12:nonroot` |
 
-The bulk is the Python runtime and dependencies (64 MB of site‑packages, 7 MB
-interpreter); the application itself is ~1 MB and the stylesheet 57 KB.
+The bulk is the Python runtime and dependencies (56 MB of site‑packages, plus the
+interpreter); the application itself is 1.1 MB and the stylesheet 35 KB.
 
 ### Runtime
 
-Measured on a running v0.1.0 container with two Radarr connections and 13 stored
-weeks. `docker compose` already caps the container at **1.0 CPU / 256 MB**.
+Measured on a running container with two Radarr connections and 20 stored weeks.
+`docker compose` already caps the container at **1.0 CPU / 256 MB**.
 
 | | measured | limit in compose |
 |---|---|---|
-| Memory, idle | **68 MiB** | 256 MiB |
-| Memory, peak | **122 MiB** (at startup) | 256 MiB |
-| CPU, idle | **0.8%** of one core | 1.0 core |
+| Memory, idle | **55–90 MiB** | 256 MiB |
+| Memory, peak | **~122 MiB** (at startup) | 256 MiB |
+| CPU, idle | **&lt;0.1%** of one core | 1.0 core |
 | Startup to serving | **1.6 s** | — |
-| Processes + threads | 12 | — |
+| Processes | 6 | — |
 
 Memory is dominated by the Python interpreter and imports, not by the workload:
-building a backup archive in memory — 7.2 MB of config, history, logs and cached
-posters — did not move the peak at all. The weekly run parses one HTML page and
-makes a handful of Radarr calls, so the busy path costs little more than idle.
+building a backup archive in memory did not move the peak at all. The spread
+above is a fresh install versus one holding twenty weeks and a warm poster cache.
 
-Network use is negligible and mostly LAN: one chart page a week, a poster or
+Network use is negligible and mostly LAN. Per week: four chart pages on the
+default cadence (the fetch that finds nothing new writes nothing), a poster or
 headshot on first sight of a title, and Radarr library calls on each page load.
+A connected media server is read at most once every 15 minutes, and only while
+someone is looking at a page.
 
 ### Disk
 
-`/data` after 13 weekly runs:
+`/data` after 20 weekly runs with a chart depth of 10 and two Radarr connections:
 
 | area | size | grows by |
 |---|---|---|
-| `config/` | < 1 MB | fixed — a few small YAML files |
-| `history/` | 74 KB | ~6 KB per weekly report, capped at 50 reports |
-| `logs/` | 0.6 MB | audit trail plus any saved scrape snapshots |
-| `cache/` | 7.1 MB | ~14 KB per poster/headshot, only for titles you have seen |
-| `backups/` | varies | one archive ≈ the four areas above (7 MB today) × how many you keep |
+| `config/` | < 1 MB | fixed — a few small YAML/JSON files |
+| `history/` | 0.3 MB | ~15 KB per weekly report, capped by your retention setting |
+| `logs/` | 20 KB | audit trail plus any saved scrape snapshots |
+| `cache/` | 13.4 MB | ~36 KB per poster/headshot, only for titles you have seen |
+| `backups/` | 75 MB | one archive ≈ everything above (25 MB here) × how many you keep |
 
-Backups dominate long‑term disk, and their retention setting bounds them: at the
-default of 10 kept archives, roughly 70 MB today. Reports prune themselves to the
-newest 50 at the end of every run, so `history/` plateaus on its own.
+Backups dominate long‑term disk, and their retention setting bounds them. Reports
+prune themselves to your retained count at the end of every run, so `history/`
+plateaus on its own. A connected media server adds one more cache file — the
+library snapshot, a few hundred KB for a large library, refreshed rather than
+accumulated.
 
 The poster cache is the one area with no automatic ceiling. Individual downloads
 are capped at 5 MB, but the directory grows with every distinct title and cast
@@ -147,15 +174,23 @@ Then point a reverse proxy (nginx/Traefik/Caddy/Pangolin/Cloudflare) at
    docker compose logs boxmedia | grep -A2 "temporary password"
    ```
 2. Log in as `admin` and set a new password (required before anything else).
-3. You'll land on **Settings** — add your Radarr connection (address + API key)
-   and click **Test Connection**, then set your Radarr **defaults** (at minimum a
-   quality profile and a default root folder) used when you add a title.
-4. The weekly sync runs on its own to build a review report; hit **Run Now** to
-   refresh it immediately. Titles are added to Radarr only when you click **Add**.
+3. You'll land on **Settings** — add your Radarr connection (address + API key),
+   press **Test Connection** to check it before saving, then choose what that
+   connection adds as (a quality profile and a root folder). Add as many Radarrs
+   as you run; one is the **primary** the weekly check reads.
+4. Optionally connect a **media server** under Media Server — pick Plex or
+   Jellyfin, paste the address and its token/API key, and Test it. BoxMedia only
+   ever reads it.
+5. The weekly check runs on its own to build a review report; hit **Run current
+   week** to build one immediately. Titles are added to Radarr only when you
+   click **Add**.
+
+Settings has one **Save Changes** bar for the whole page — edit any cards, then
+save them together (or discard).
 
 Configuration lives entirely in [`.env.example`](.env.example) (app-level
-secrets/infra). Radarr connections are managed in the UI and encrypted at rest —
-they never go in `.env`.
+secrets/infra). Radarr and media-server credentials are managed in the UI and
+encrypted at rest — they never go in `.env`.
 
 ## Backups & disaster recovery
 
@@ -251,15 +286,19 @@ Afterwards, verify with Settings → **Test Connection**.
 
 - Argon2id password hashing; forced first-run password change; login
   rate-limiting with lockout.
-- Radarr API keys AES‑256‑GCM encrypted at rest; backups encrypted with the key
-  stored apart from the data.
+- Radarr API keys and the media-server token/API key AES‑256‑GCM encrypted at
+  rest; backups encrypted with the key stored apart from the data.
 - Strict CSP (`default-src 'self'`, no inline scripts/styles), HSTS behind TLS,
   same-origin enforcement + SameSite=Strict cookies, structured audit logging.
 - Distroless runtime image: non-root (UID 65532), read-only root filesystem, all
   capabilities dropped, `no-new-privileges`, no shell or package manager, base
   images pinned by digest, dependencies hash-pinned.
-- TLS certificate validation on all outbound Radarr calls; point `BM_TLS_CA_FILE`
-  at a CA bundle for a self-signed home Radarr rather than disabling verification.
+- TLS certificate validation on all outbound calls; point `BM_TLS_CA_FILE` at a
+  CA bundle for a self-signed home Radarr or media server rather than disabling
+  verification.
+- The media server integration is **read-only**: two GET endpoints and no others,
+  and its credential travels as a header, never in a URL where proxy logs would
+  keep it.
 
 ## Development
 
