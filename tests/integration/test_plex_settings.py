@@ -329,3 +329,93 @@ def test_the_dashboard_hints_only_on_wanted_titles(harness: AppHarness) -> None:
 
     _dashboard_card(harness, MovieStatus.IN_LIBRARY)
     assert "in Plex" not in harness.client.get("/dashboard").text
+
+
+# --- testing before saving, the way the Radarr card always has ---
+
+
+@respx.mock
+def test_a_plex_connection_can_be_tested_before_it_is_saved(harness: AppHarness) -> None:
+    """The gap this closes: Plex shipped with only the after-saving test, which asked
+    you to commit a credential to disk before you could learn whether it works."""
+    harness.activate()
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=SECTIONS)
+    )
+
+    response = harness.client.post(
+        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
+    )
+
+    assert response.status_code == 200
+    assert "Plex responded" in response.text
+    assert harness.client.app.state.plex.load() is None, "a test must store nothing"
+
+
+@respx.mock
+def test_the_pre_save_test_reports_each_failure_in_its_own_words(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    route = respx.get(f"{PLEX_URL}/library/sections")
+
+    route.mock(return_value=httpx.Response(401))
+    assert "rejected the token" in harness.client.post(
+        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
+    ).text
+
+    route.mock(side_effect=httpx.ConnectError("down"))
+    assert "Could not reach it" in harness.client.post(
+        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
+    ).text
+
+    # Reachable and authenticated, but nothing to read: every later fetch would return
+    # nothing and the cards would silently never mention Plex. That is a failed test.
+    route.mock(return_value=httpx.Response(200, json={"MediaContainer": {"Directory": [
+        {"key": "2", "type": "show"},
+    ]}}))
+    assert "no movie library" in harness.client.post(
+        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
+    ).text
+
+
+def test_an_unreadable_address_is_named_as_such(harness: AppHarness) -> None:
+    harness.activate()
+
+    response = harness.client.post(
+        "/settings/plex/test-credentials", data={"url": "   ", "token": TOKEN}
+    )
+
+    assert "address can’t be read" in response.text
+
+
+@respx.mock
+def test_testing_an_address_change_may_reuse_the_stored_token(harness: AppHarness) -> None:
+    """The blank-token contract, applied to the test as well as the save: changing only
+    the address must not force re-pasting a secret just to check it."""
+    harness.activate()
+    _connect(harness)
+    seen: list[str] = []
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("X-Plex-Token", ""))
+        return httpx.Response(200, json=SECTIONS)
+
+    respx.get(f"{PLEX_URL}/library/sections").mock(side_effect=_capture)
+
+    response = harness.client.post(
+        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": ""}
+    )
+
+    assert "Plex responded" in response.text
+    assert seen == [TOKEN], "the stored token should have been used"
+
+
+def test_the_pre_save_test_needs_a_token_when_none_is_stored(harness: AppHarness) -> None:
+    harness.activate()
+
+    response = harness.client.post(
+        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": ""}
+    )
+
+    assert "rejected the token" in response.text

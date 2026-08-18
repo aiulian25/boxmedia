@@ -185,6 +185,29 @@ class PlexStore:
         )
 
 
+def client_for_credentials(
+    url: str,
+    token: str,
+    *,
+    tls_verify: bool,
+    ca_file: str | None,
+    timeout: float | None = None,
+) -> PlexClient:
+    """A Plex client for credentials, stored or not.
+
+    Mirrors `apps.client_for_credentials`, and for the same reason: testing a
+    connection before it is saved has to talk to exactly what saving it would talk to,
+    so the address goes through the same `normalize_url` that `save` applies. Raises
+    InvalidAppError for an address that cannot be parsed — the same answer `save` gives.
+    """
+    return PlexClient(
+        normalize_url(url),
+        token,
+        verify=build_verify(tls_verify=tls_verify, ca_file=ca_file),
+        timeout=timeout or REQUEST_TIMEOUT_SECONDS,
+    )
+
+
 class PlexClient:
     """Two GET endpoints and nothing else — sections, and a section's movies.
 

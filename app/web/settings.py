@@ -49,6 +49,9 @@ from app.services.filters import (
 from app.services.ignore import IgnoredMovie
 from app.services.pipeline import SCRAPE_FAILURE_SUBDIR
 from app.services.plex import PlexAuthError, PlexError
+from app.services.plex import (
+    client_for_credentials as plex_client_for_credentials,
+)
 from app.services.posters import POSTER_SUBDIR, POSTER_WIDTH, sized
 from app.services.radarr import RadarrAuthError, RadarrConnectionError, RadarrError
 from app.services.radarr_options import RadarrOptions
@@ -77,6 +80,7 @@ router = APIRouter()
 
 SETTINGS_PATH = "/settings"
 TEST_CREDENTIALS_PATH = "/settings/apps/test"
+PLEX_TEST_CREDENTIALS_PATH = "/settings/plex/test-credentials"
 # Radarr names itself in /system/status. Sonarr and Lidarr answer the same shape, so
 # without this an "it works" would be a lie about which app answered.
 RADARR_APP_NAME = "radarr"
@@ -133,6 +137,11 @@ class SettingsStatus:
     PLEX_TEST_AUTH = "plex_test_auth"
     PLEX_TEST_CONN = "plex_test_conn"
     PLEX_REFRESHED = "plex_refreshed"
+    # What the page reloads with after the one Save button has written every edited
+    # card. A rejected card names its own status instead — "Settings saved" over a
+    # value the server refused would be a lie.
+    SETTINGS_SAVED = "settings_saved"
+    SETTINGS_SAVE_FAILED = "settings_save_failed"
     PLEX_REFRESH_FAILED = "plex_refresh_failed"
 
 
@@ -184,6 +193,11 @@ STATUS_MESSAGES: dict[str, tuple[str, str]] = {
     SettingsStatus.PLEX_TEST_AUTH: (_ERROR, "Plex rejected the token."),
     SettingsStatus.PLEX_TEST_CONN: (_ERROR, "Could not reach Plex (check the address / TLS)."),
     SettingsStatus.PLEX_REFRESHED: (_SUCCESS, "Plex library refreshed."),
+    SettingsStatus.SETTINGS_SAVED: (_SUCCESS, "Settings saved."),
+    SettingsStatus.SETTINGS_SAVE_FAILED: (
+        _ERROR,
+        "Something did not save — check the values and try again.",
+    ),
     SettingsStatus.PLEX_REFRESH_FAILED: (
         _ERROR,
         "Could not read the Plex library — check the connection and try Test.",
@@ -320,6 +334,7 @@ async def settings_page(request: Request) -> object:
         storage=_storage_view(request),
         snapshots=_snapshot_views(request),
         test_credentials_path=TEST_CREDENTIALS_PATH,
+        plex_test_credentials_path=PLEX_TEST_CREDENTIALS_PATH,
         ignored=ignored,
         first_run=not apps,
         banner_kind=banner[0] if banner else None,
@@ -689,6 +704,55 @@ async def save_plex(
         AuditAction.PLEX_UPDATED, actor=user.username, source_ip=client_ip(request)
     )
     return _redirect(request, SettingsStatus.PLEX_SAVED)
+
+
+@router.post(PLEX_TEST_CREDENTIALS_PATH)
+async def test_plex_credentials(
+    request: Request, url: str = Form(...), token: str = Form("")
+) -> object:
+    """Probe a Plex address and token the user has typed but not saved. Stores nothing.
+
+    The Radarr side has had this since it existed; Plex shipped with only the
+    after-saving test, which asked people to commit a credential to disk before they
+    could learn whether it works. Same contract as `test_credentials`: authenticated,
+    CSRF-guarded, held for the length of this request, never written to disk or the
+    audit log, and every reply is our own copy rather than anything the remote said.
+
+    A blank token means the saved one — testing an address change without re-pasting a
+    secret is the whole reason the token field may be left empty.
+    """
+    current_user(request)
+    return render(
+        request, "_plex_test.html", result=await _test_plex_credentials(request, url, token)
+    )
+
+
+async def _test_plex_credentials(request: Request, url: str, token: str) -> dict[str, str]:
+    settings = request.app.state.settings
+    stored = request.app.state.plex.load()
+    if not token and stored is None:
+        return {"state": TestResult.AUTH}
+    try:
+        secret = token or request.app.state.plex.decrypt_token()
+        client = plex_client_for_credentials(
+            url,
+            secret,
+            tls_verify=settings.outbound_tls_verify,
+            ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+            timeout=HEALTH_TIMEOUT_SECONDS,
+        )
+        sections = await asyncio.wait_for(
+            client.movie_section_keys(), timeout=HEALTH_TIMEOUT_SECONDS
+        )
+    except InvalidAppError:
+        return {"state": TestResult.BAD_URL}
+    except PlexAuthError:
+        return {"state": TestResult.AUTH}
+    except (PlexError, TimeoutError):
+        return {"state": TestResult.UNREACHABLE}
+    # Reachable, authenticated, and no movie library: every later fetch would return
+    # nothing and the cards would silently never mention Plex. That is a failed test.
+    return {"state": TestResult.OK if sections else TestResult.NOT_RADARR}
 
 
 @router.post("/settings/plex/test")

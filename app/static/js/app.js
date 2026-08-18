@@ -14,6 +14,9 @@
   var STATUS_PARAM = "status";
   var TOAST_REMOVE_MS = 3400; // matches the CSS fade-out end (3s hold + 0.3s fade)
   var TESTING_LABEL = "Testing…";
+  var SAVING_LABEL = "Saving…";
+  var SAVED_ALL_STATUS = "settings_saved";
+  var SAVE_FAILED_STATUS = "settings_save_failed";
 
   function readStored(key) {
     try {
@@ -152,20 +155,25 @@
       dialogBody.textContent = "";
     });
   }
-  /* Test Connection in the Add form: probe what has been typed, without saving it.
+  /* Test Connection: probe what has been typed, without saving it.
    *
-   * The button ships hidden and is revealed here, because the no-JavaScript version of
-   * this would have to re-render the form with the typed API key echoed back into the
-   * HTML. Those users are not stranded: Add itself reports whether the connection
-   * answered.
+   * Every button carrying [data-test-connection] is wired, not just the first — this
+   * was a `querySelector` when the Radarr Add form was the only one, and the Plex card
+   * arriving second would have left one of the two dead depending on DOM order.
+   *
+   * The buttons ship hidden and are revealed here, because the no-JavaScript version
+   * would have to re-render the form with the typed secret echoed back into the HTML.
+   * Those users are not stranded: saving reports whether the connection answered.
    *
    * The reply is a server-rendered fragment swapped in whole — no markup is built here,
    * so escaping stays where the rest of the app does it. */
-  var testButton = document.querySelector("[data-test-connection]");
-  var testForm = testButton && testButton.closest("form");
-  var testSlot = testForm && testForm.querySelector("[data-test-result]");
-
-  if (testButton && testForm && testSlot && window.fetch) {
+  var testButtons = document.querySelectorAll("[data-test-connection]");
+  Array.prototype.forEach.call(testButtons, function (testButton) {
+    var testForm = testButton.closest("form");
+    var testSlot = testForm && testForm.querySelector("[data-test-result]");
+    if (!testForm || !testSlot || !window.fetch) {
+      return;
+    }
     testButton.hidden = false;
     testButton.addEventListener("click", function (event) {
       event.preventDefault();
@@ -203,6 +211,109 @@
           testButton.disabled = false;
           testButton.textContent = label;
         });
+    });
+  });
+
+  /* One Save for the whole Settings page.
+   *
+   * The page is built from separate forms because each posts to the route that owns its
+   * fields — that is what keeps saving the region from touching the backup cadence. But
+   * a Save button per card asks the reader to know that split, which is this app's
+   * problem and not theirs. So: the per-card buttons are hidden here, a bar appears the
+   * moment anything changes, and Save submits exactly the forms that were edited.
+   *
+   * Hidden HERE rather than in the template, so the page without JavaScript keeps every
+   * button it has always had. That is the same bargain the Test buttons make in the
+   * other direction.
+   *
+   * Only forms marked [data-settings-form] take part. The others on this page are
+   * ACTIONS, not settings — restore a backup, delete a connection, change a password,
+   * un-ignore a title. None of them is a field whose value could be "saved later", and
+   * a password in particular is a deliberate act that asks for the current one. */
+  var settingsForms = document.querySelectorAll("[data-settings-form]");
+  var saveBar = document.querySelector("[data-save-bar]");
+
+  if (settingsForms.length && saveBar && window.fetch) {
+    var dirty = [];
+    var saveButton = saveBar.querySelector("[data-save-all]");
+    var discardButton = saveBar.querySelector("[data-discard-all]");
+    // Where to reload once everything is written. Read off the element, never built
+    // here: this file has no idea what url_base is, which is why every address it uses
+    // comes from the markup.
+    var settingsUrl = saveBar.getAttribute("data-settings-url");
+
+    var showBar = function (visible) {
+      saveBar.hidden = !visible;
+      document.body.classList.toggle("has-save-bar", visible);
+    };
+
+    var markDirty = function (form) {
+      if (dirty.indexOf(form) === -1) {
+        dirty.push(form);
+      }
+      showBar(true);
+    };
+
+    Array.prototype.forEach.call(settingsForms, function (form) {
+      // The card's own Save still exists for a browser without this file; with it, the
+      // bar speaks for every card at once.
+      var ownSave = form.querySelector("[data-form-save]");
+      if (ownSave) {
+        ownSave.hidden = true;
+      }
+      form.addEventListener("input", function () { markDirty(form); });
+      form.addEventListener("change", function () { markDirty(form); });
+    });
+
+    discardButton.addEventListener("click", function () {
+      // Back to what the server rendered, which for every field on this page is what is
+      // stored. No request: discarding a change that was never sent is a local matter.
+      Array.prototype.forEach.call(dirty, function (form) { form.reset(); });
+      dirty = [];
+      showBar(false);
+    });
+
+    saveButton.addEventListener("click", function () {
+      if (saveButton.disabled || !dirty.length) {
+        return;
+      }
+      saveButton.disabled = true;
+      discardButton.disabled = true;
+      saveButton.textContent = SAVING_LABEL;
+
+      // One at a time, in page order: two of these write the same filters file, and
+      // firing them together would let the later read clobber the earlier write.
+      var pending = dirty.slice();
+      var problem = null;
+
+      var next = function () {
+        var form = pending.shift();
+        if (!form) {
+          // Reload so every card shows what is stored rather than what was typed, with
+          // one banner for the lot. A form that objected names ITS status instead, since
+          // "Settings saved" over a rejected value would be a lie.
+          window.location.href = settingsUrl + "?" + STATUS_PARAM + "=" +
+            encodeURIComponent(problem || SAVED_ALL_STATUS);
+          return;
+        }
+        fetch(form.getAttribute("action"), {
+          method: "POST",
+          body: new FormData(form),
+          credentials: "same-origin",
+          headers: { "X-Requested-With": "fetch" }
+        })
+          .then(function (response) {
+            var status = new URL(response.url).searchParams.get(STATUS_PARAM);
+            if (!problem && status && !/saved|_ok$|updated/.test(status)) {
+              problem = status;
+            }
+          })
+          .catch(function () {
+            problem = problem || SAVE_FAILED_STATUS;
+          })
+          .then(next);
+      };
+      next();
     });
   }
 

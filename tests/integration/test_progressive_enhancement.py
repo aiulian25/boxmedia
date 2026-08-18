@@ -169,3 +169,40 @@ def test_the_scroll_to_top_control_mutates_nothing(harness: AppHarness) -> None:
     assert 'type="button"' in tag  # never a submit, even inside a form
     assert "formaction" not in tag
     assert 'aria-label="Scroll to top"' in tag  # the glyph beside it is aria-hidden
+
+
+def test_the_settings_page_renders_more_than_one_testable_connection(
+    harness: AppHarness,
+) -> None:
+    """Radarr's Add form was the only Test button for a long time, and app.js selected it
+    with `querySelector`. The Plex card arriving second silently left one of the two dead,
+    depending on DOM order. Two facts keep that fixed: the page really does render more
+    than one, and the script really does select all of them."""
+    from pathlib import Path
+
+    harness.activate()
+
+    page = harness.client.get("/settings").text
+    assert page.count("data-test-connection") >= 2
+
+    # The one line of app.js pinned in source rather than behaviour — this file's
+    # opening paragraph explains why the rest is not, and the exception is here because
+    # the singular form of it shipped as a bug.
+    script = (Path(__file__).resolve().parents[2] / "app/static/js/app.js").read_text()
+    assert 'querySelectorAll("[data-test-connection]")' in script
+
+
+def test_every_settings_card_keeps_a_save_button_without_the_script(
+    harness: AppHarness,
+) -> None:
+    """The Save bar REPLACES the per-card buttons, and it does so from app.js — so with
+    the script blocked every card must still carry the button it always had."""
+    harness.activate()
+
+    page = harness.client.get("/settings").text
+
+    # Rendered plainly, never `hidden` in the markup: hiding them is the script's job,
+    # and doing it server-side would strand anyone without it.
+    assert "data-form-save" in page
+    for tag in re.findall(r"<button[^>]*data-form-save[^>]*>", page):
+        assert "hidden" not in tag

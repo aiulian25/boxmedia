@@ -18,7 +18,7 @@
 <section class="settings-section">
   <h3 class="section-title">User Management</h3>
   <div class="account-card">
-    <form method="post" action="{{ url_base }}/account/profile" class="account-form">
+    <form method="post" action="{{ url_base }}/account/profile" data-settings-form class="account-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div class="field">
         <label for="username">Login username</label>
@@ -33,7 +33,7 @@
         <label for="email">Email</label>
         <input id="email" name="email" type="email" value="{{ account.email }}" maxlength="{{ max_email_length }}" required>
       </div>
-      <button type="submit" class="btn-secondary">Update Profile</button>
+      <button type="submit" data-form-save class="btn-secondary">Update Profile</button>
     </form>
     <form method="post" action="{{ url_base }}/account/password" class="account-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -70,7 +70,7 @@
     {# Radios rather than a toggle: two named choices, and the one in effect is readable
        without interpreting a switch position. Saves like every other action on this page
        — POST, then back here with a banner. #}
-    <form method="post" action="{{ url_base }}/account/theme" class="stack">
+    <form method="post" action="{{ url_base }}/account/theme" data-settings-form class="stack">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <fieldset class="theme-choice">
         <legend>Theme</legend>
@@ -85,7 +85,7 @@
       </fieldset>
       <p class="field-note">Applies to this account on every browser you sign in from.</p>
       <div class="app-actions-row">
-        <button type="submit" class="btn-primary">Save Theme</button>
+        <button type="submit" data-form-save class="btn-primary">Save Theme</button>
       </div>
     </form>
   </div>
@@ -114,7 +114,7 @@
     {% endif %}
       {% if app.primary %}<span class="tag">Primary</span>{% endif %}
     </div>
-    <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}" class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}" data-settings-form class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="name-{{ app.id }}">App Name</label>
@@ -155,7 +155,7 @@
         {% endif %}
       </div>
       <div class="app-actions">
-        <button type="submit" class="btn-secondary">Save</button>
+        <button type="submit" data-form-save class="btn-secondary">Save</button>
       </div>
     </form>
 
@@ -226,7 +226,7 @@
   <div class="app-card">
     {# One connection, not a list: multiple Radarrs exist because quality profiles
        differ per instance, and Plex has no analogue of that. #}
-    <form method="post" action="{{ url_base }}/settings/plex" class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/plex" data-settings-form class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="plex-url">Address</label>
@@ -239,8 +239,17 @@
         <input id="plex-token" name="token" type="password" placeholder="{{ plex.token_mask if plex }}" {% if not plex %}required{% endif %}>
         <p class="field-note">Sent as a header, never in a URL. Encrypted at rest with the same key as your Radarr API keys.</p>
       </div>
-      <div class="app-actions">
-        <button type="submit" class="btn-primary">{% if plex %}Save{% else %}Connect{% endif %}</button>
+      <div class="app-actions app-actions-row">
+        {# Where the verdict lands, filled by app.js with a server-rendered fragment. #}
+        <span data-test-result></span>
+        {# Hidden until app.js reveals it. Without JavaScript this would have to
+           re-render the form with the typed token echoed back into the HTML; saving
+           still reports whether Plex answered, so only the preview is lost. Before
+           saving, like Radarr's — asking someone to commit a credential to disk in
+           order to find out whether it works is the wrong way round. #}
+        <button type="submit" class="btn-secondary" formaction="{{ url_base }}{{ plex_test_credentials_path }}"
+                data-test-connection hidden>Test Connection</button>
+        <button type="submit" data-form-save class="btn-primary">{% if plex %}Save{% else %}Connect{% endif %}</button>
       </div>
     </form>
     {% if plex %}
@@ -267,7 +276,7 @@
 <section class="settings-section">
   <h3 class="section-title">Weekly Check</h3>
   <div class="app-card">
-    <form method="post" action="{{ url_base }}/settings/filters" class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/filters" data-settings-form class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       {# The same radio pattern as Appearance: two named choices, and the one in effect is
          readable without interpreting a switch. Spans the grid so the interval field sits
@@ -302,7 +311,7 @@
         <p class="field-note">Older weekly reports are deleted at the end of the next run — {{ report_keep_bounds[0] }} to {{ report_keep_bounds[1] }}. Backups are separate; this history is what the leaderboard and trend lines read.</p>
       </div>
       <div class="app-actions">
-        <button type="submit" class="btn-primary">Save</button>
+        <button type="submit" data-form-save class="btn-primary">Save</button>
       </div>
     </form>
   </div>
@@ -311,7 +320,7 @@
 <section class="settings-section">
   <h3 class="section-title">Box Office Region</h3>
   <div class="app-card">
-    <form method="post" action="{{ url_base }}/settings/region" class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/region" data-settings-form class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="boxoffice_region">Chart</label>
@@ -333,7 +342,7 @@
         <p class="field-note">Box Office Mojo publishes a weekly chart for Domestic only, so a region’s figures are its <strong>weekend</strong> takings — that is all it reports per region.</p>
       </div>
       <div class="app-actions">
-        <button type="submit" class="btn-primary">Save</button>
+        <button type="submit" data-form-save class="btn-primary">Save</button>
       </div>
     </form>
   </div>
@@ -343,7 +352,7 @@
   <h3 class="section-title">Backups</h3>
   <div class="app-card">
     <h4 class="section-subtitle">Automatic backups</h4>
-    <form method="post" action="{{ url_base }}/settings/backups/schedule" class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/backups/schedule" data-settings-form class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="backup_interval_days">Create one every (days)</label>
@@ -356,7 +365,7 @@
         <p class="field-note">Older snapshots are deleted once this many exist.</p>
       </div>
       <div class="app-actions">
-        <button type="submit" class="btn-primary">Save Schedule</button>
+        <button type="submit" data-form-save class="btn-primary">Save Schedule</button>
       </div>
     </form>
   </div>
@@ -515,4 +524,18 @@
     {% endif %}
   </div>
 </section>
+
+{# One Save for the page. Ships hidden and stays hidden without JavaScript, where every
+   card keeps the button it has always had — this bar REPLACES those, it does not add to
+   them. It appears the moment a field changes and names both choices, because a bar that
+   only offered Save would leave "I did not mean that" with nowhere to go.
+
+   Deliberately not covering the password form or any action button: a password change
+   asks for the current one and is not a field left pending, and "restore this backup" is
+   not something a Save button should ever have been holding. #}
+<div class="save-bar" data-save-bar data-settings-url="{{ url_base }}/settings" role="region" aria-label="Unsaved changes" hidden>
+  <span class="save-bar-text">You have unsaved changes.</span>
+  <button type="button" class="btn-ghost" data-discard-all>Discard</button>
+  <button type="button" class="btn-primary" data-save-all>Save Changes</button>
+</div>
 {% endblock %}

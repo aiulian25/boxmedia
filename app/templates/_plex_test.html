@@ -1,0 +1,38 @@
+{# The result of testing a Plex connection that has not been saved. Server-rendered and
+   swapped in by app.js, exactly as `_connection_test.html` is — nothing here is built by
+   string-concatenation in the browser, so Jinja's autoescaping still covers every value.
+
+   The same dot-and-label component the Radarr cards use, so a green line means the same
+   thing on either connection. Its own file rather than a branch inside the Radarr one:
+   every sentence below names Plex and its token, and a shared template that said
+   "Radarr" for half its states would be worse than two short files. #}
+{% if result.state == 'ok' %}
+<span class="app-health app-health-ok test-result" role="status">
+  <span class="dot dot-connected animate-pulse"></span>
+  <span>Plex responded</span>
+</span>
+{% elif result.state == 'not_radarr' %}
+{# Reachable and authenticated, but no movie library — every later fetch would return
+   nothing and the cards would silently never mention Plex. Named for the state it
+   shares with the Radarr test rather than given its own, because it means the same
+   thing there: something answered, but not the thing we need. #}
+<span class="app-health app-health-auth test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>Plex answered, but has no movie library to read</span>
+</span>
+{% elif result.state == 'auth' %}
+<span class="app-health app-health-auth test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>Plex rejected the token</span>
+</span>
+{% elif result.state == 'bad_url' %}
+<span class="app-health app-health-unreachable test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>That address can’t be read — try 192.168.1.100:32400 or https://plex.example</span>
+</span>
+{% else %}
+<span class="app-health app-health-unreachable test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>Could not reach it — check the address, that Plex is running, and TLS</span>
+</span>
+{% endif %}
