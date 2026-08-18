@@ -75,9 +75,9 @@
     {# A Wanted title Plex can already play: you are waiting on a download of something
        your media server has. In-library cards say nothing — Radarr holding the file is
        the stronger statement. #}
-    {% if movie.plex_state == "yes" %}
-    <span class="plex-hint" title="Your Plex server holds this film (matched by id)">Already in Plex</span>
-    {% elif movie.plex_state == "probably" %}
+    {% if movie.server_state == "yes" %}
+    <span class="server-hint" title="Your Plex server holds this film (matched by id)">Already in Plex</span>
+    {% elif movie.server_state == "probably" %}
     <span class="guess-hint" title="A Plex title of the same name and year — nothing verified it is the same film">Probably in Plex — verify</span>
     {% endif %}
     <div class="poster-meta">

@@ -29,8 +29,8 @@ from app.services.backup import BackupService
 from app.services.corrections import CorrectionStore
 from app.services.filters import FiltersStore
 from app.services.ignore import IgnoreStore
+from app.services.mediaserver import MediaServerLibraryCache, MediaServerStore
 from app.services.pipeline import Pipeline
-from app.services.plex import PlexLibraryCache, PlexStore
 from app.services.posters import PosterCache
 from app.services.radarr_options import RadarrOptionsCache
 from app.services.release_ids import ReleaseIdCache
@@ -143,9 +143,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The Plex trio: connection (token encrypted with the same key as the Radarr
     # ones), the on-disk library snapshot, and its own backoff so a down media server
     # cannot cost every render a timeout.
-    app.state.plex = PlexStore(settings.config_dir, key=encryption_key, audit=audit)
-    app.state.plex_cache = PlexLibraryCache(settings.cache_dir)
-    app.state.plex_backoff = deps.RadarrBackoff()
+    app.state.media_server = MediaServerStore(settings.config_dir, key=encryption_key, audit=audit)
+    app.state.media_server_cache = MediaServerLibraryCache(settings.cache_dir)
+    app.state.media_server_backoff = deps.RadarrBackoff()
     app.state.backups = BackupService(
         settings.data_dir, settings.backups_dir, key=encryption_key, audit=audit
     )

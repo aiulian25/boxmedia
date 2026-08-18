@@ -26,7 +26,7 @@ from app.web.deps import (
     format_timestamp,
     load_all_radarr_libraries,
     load_all_radarr_queues,
-    load_plex_snapshot,
+    load_media_server_snapshot,
     parse_timestamp,
     radarr_locations,
     render,
@@ -237,12 +237,12 @@ async def dashboard(request: Request, q: str = "", limit: int = DEFAULT_LIMIT) -
     # A WANTED title Plex already holds is worth a chip here: you are waiting on a
     # download of something your media server can already play. In-library titles get
     # nothing — Radarr holding the file is the stronger, more specific statement.
-    plex_snapshot = await load_plex_snapshot(request)
-    if plex_snapshot is not None:
+    server_snapshot = await load_media_server_snapshot(request)
+    if server_snapshot is not None:
         for movie in movies:
             if movie["status"] != MovieStatus.WANTED:
                 continue
-            movie["plex_state"] = plex_snapshot.holds(
+            movie["server_state"] = server_snapshot.holds(
                 movie["tmdb_id"], None, movie["title"], movie.get("year")
             )
 

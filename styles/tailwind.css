@@ -586,7 +586,7 @@ html.light {
      amber one: it is a verified fact, and painting it as a warning would read as a
      problem when it is the exact opposite. Wraps like .guess-hint, and for the same
      reason — it is a sentence, and translations grow. */
-  .plex-hint { @apply block text-label-sm text-ok mt-1; }
+  .server-hint { @apply block text-label-sm text-ok mt-1; }
   /* How far a copy on its way has got. The third card-body annotation line, after
      .card-facts and .guess-hint, and for the same reason: the overlays above are fixed
      boxes and this text has to be free to wrap. */

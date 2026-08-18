@@ -32,7 +32,7 @@ from app.services.corrections import Correction
 from app.services.filters import SCHEDULE_MODE_CADENCE
 from app.services.ignore import IgnoreSnapshot
 from app.services.matcher import normalize_title
-from app.services.plex import PlexSnapshot
+from app.services.mediaserver import MediaServerSnapshot
 from app.services.radarr import RadarrClient, RadarrError, RadarrLookupResult, RadarrMovie
 from app.services.radarr_options import RadarrOptions
 from app.services.reports import MATCHED_BY_GUESS, Report, RunStatus, RunTrigger, imdb_url
@@ -47,7 +47,7 @@ from app.web.deps import (
     load_all_radarr_libraries,
     load_all_radarr_options,
     load_all_radarr_queues,
-    load_plex_snapshot,
+    load_media_server_snapshot,
     load_radarr_library,
     load_radarr_options,
     optional_int,
@@ -449,8 +449,8 @@ def _upgrade_target(holders_with_file: list[dict[str, object]]) -> dict[str, obj
     return None
 
 
-def _plex_state(
-    plex: PlexSnapshot | None,
+def _server_state(
+    plex: MediaServerSnapshot | None,
     movie: object,
     *,
     in_radarr: bool,
@@ -488,7 +488,7 @@ def _movie_view(
     ignored: IgnoreSnapshot,
     history: list[tuple[str, int, int]] | None = None,
     holders: list[dict[str, object]] | None = None,
-    plex: PlexSnapshot | None = None,
+    plex: MediaServerSnapshot | None = None,
 ) -> dict:
     tmdb = movie.tmdb_id
     radarr_movie = library.get(tmdb) if (library is not None and tmdb is not None) else None
@@ -570,7 +570,7 @@ def _movie_view(
         "badge_dot": badge_dot,
         # HOLDS_YES, HOLDS_PROBABLY, or None — only ever set on a title missing from
         # every Radarr, because that is the only card where it changes a decision.
-        "plex_state": _plex_state(plex, movie, in_radarr=in_radarr, holders=holders or []),
+        "server_state": _server_state(plex, movie, in_radarr=in_radarr, holders=holders or []),
     }
 
 
@@ -731,7 +731,7 @@ async def report_detail(request: Request, report_id: str) -> object:
     histories = request.app.state.reports.histories(all_reports)
     # One read for the whole grid, so every card is judged against the same list.
     ignored = request.app.state.ignore.snapshot()
-    plex_snapshot = await load_plex_snapshot(request)
+    server_snapshot = await load_media_server_snapshot(request)
     movies = [
         _movie_view(
             movie,
@@ -739,7 +739,7 @@ async def report_detail(request: Request, report_id: str) -> object:
             ignored,
             histories.get(movie.normalized_title),
             radarr_locations(movie.tmdb_id, libraries, apps_by_id, queues),
-            plex_snapshot,
+            server_snapshot,
         )
         for movie in report.movies
     ]

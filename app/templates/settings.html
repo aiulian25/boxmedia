@@ -247,7 +247,7 @@
            still reports whether Plex answered, so only the preview is lost. Before
            saving, like Radarr's — asking someone to commit a credential to disk in
            order to find out whether it works is the wrong way round. #}
-        <button type="submit" class="btn-secondary" formaction="{{ url_base }}{{ plex_test_credentials_path }}"
+        <button type="submit" class="btn-secondary" formaction="{{ url_base }}{{ server_test_credentials_path }}"
                 data-test-connection hidden>Test Connection</button>
         <button type="submit" data-form-save class="btn-primary">{% if plex %}Save{% else %}Connect{% endif %}</button>
       </div>

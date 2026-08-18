@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import respx
 
-from app.services.plex import PLEX_CACHE_TTL_SECONDS, PlexFetch, PlexMovie
+from app.services.mediaserver import LIBRARY_CACHE_TTL_SECONDS, MediaServerFetch, MediaServerMovie
 from app.services.reports import (
     MovieAction,
     MovieResult,
@@ -96,21 +96,21 @@ def test_a_bad_url_is_refused(harness: AppHarness) -> None:
     )
 
     assert "plex_invalid" in response.headers["location"]
-    assert harness.client.app.state.plex.load() is None
+    assert harness.client.app.state.media_server.load() is None
 
 
 def test_remove_forgets_the_connection_and_the_snapshot(harness: AppHarness) -> None:
     harness.activate()
     _connect(harness)
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
 
     harness.client.post("/settings/plex/remove", follow_redirects=False)
 
-    assert harness.client.app.state.plex.load() is None
+    assert harness.client.app.state.media_server.load() is None
     # A library nobody is connected to must not keep decorating cards.
-    assert harness.client.app.state.plex_cache.load() is None
+    assert harness.client.app.state.media_server_cache.load() is None
 
 
 @respx.mock
@@ -148,7 +148,7 @@ def test_refresh_fetches_now_and_caches(harness: AppHarness) -> None:
     response = harness.client.post("/settings/plex/refresh", follow_redirects=False)
 
     assert "plex_refreshed" in response.headers["location"]
-    cached = harness.client.app.state.plex_cache.load()
+    cached = harness.client.app.state.media_server_cache.load()
     assert cached is not None
     assert cached[0].holds(52001, None, "x", None) == "yes"
 
@@ -163,13 +163,14 @@ def test_a_missing_title_plex_holds_says_so_confidently(harness: AppHarness) -> 
 
     before = _actions_block(harness.client.get(f"/reports/{report_id}").text)
 
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(
-        PlexMovie(title="Different Spelling Entirely", year=2026, tmdb_id=52001, imdb_id=None),
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(
+            title="Different Spelling Entirely", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
     page = harness.client.get(f"/reports/{report_id}").text
 
     assert "Already in Plex" in page
-    assert "plex-hint" in page
+    assert "server-hint" in page
     # The id matched even though the spellings differ — that is what makes it confident.
     # And the hint informs without removing anything: the card offers exactly the same
     # actions it offered before Plex had an opinion.
@@ -189,8 +190,8 @@ def test_a_title_match_renders_as_the_educated_guess(harness: AppHarness) -> Non
     harness.activate()
     _connect(harness)
     report_id = _report_with_missing_title(harness, tmdb=52001, year=2026)
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=None, imdb_id=None),
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=None, imdb_id=None),
     ), truncated=False))
 
     page = harness.client.get(f"/reports/{report_id}").text
@@ -203,7 +204,7 @@ def test_a_title_plex_does_not_hold_gets_no_hint(harness: AppHarness) -> None:
     harness.activate()
     _connect(harness)
     report_id = _report_with_missing_title(harness, tmdb=52001, year=2026)
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(), truncated=False))
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(), truncated=False))
 
     page = harness.client.get(f"/reports/{report_id}").text
 
@@ -228,8 +229,8 @@ def test_renders_inside_the_ttl_never_touch_plex(harness: AppHarness) -> None:
     harness.activate()
     _connect(harness)
     report_id = _report_with_missing_title(harness, tmdb=52001, year=2026)
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
     route = respx.get(url__regex=r"http://plex\.local.*").mock(
         return_value=httpx.Response(200, json=SECTIONS)
@@ -239,7 +240,7 @@ def test_renders_inside_the_ttl_never_touch_plex(harness: AppHarness) -> None:
     harness.client.get(f"/reports/{report_id}")
 
     assert route.call_count == 0
-    assert PLEX_CACHE_TTL_SECONDS >= 300, "a TTL this short would defeat the cache"
+    assert LIBRARY_CACHE_TTL_SECONDS >= 300, "a TTL this short would defeat the cache"
 
 
 @respx.mock
@@ -249,8 +250,8 @@ def test_a_down_plex_renders_the_stale_snapshot_not_an_error(
     harness.activate()
     _connect(harness)
     report_id = _report_with_missing_title(harness, tmdb=52001, year=2026)
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
     # Age the cache past the TTL so the render tries to refresh, against a dead host.
     import app.web.deps as deps
@@ -268,8 +269,8 @@ def test_the_report_file_is_untouched_by_annotation(harness: AppHarness) -> None
     harness.activate()
     _connect(harness)
     report_id = _report_with_missing_title(harness, tmdb=52001, year=2026)
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
     path = harness.settings.history_dir / f"{report_id}.json"
     before = path.read_bytes()
@@ -294,8 +295,8 @@ def test_a_title_radarr_already_tracks_gets_no_hint(harness: AppHarness) -> None
             status=MovieStatus.WANTED, action=MovieAction.NONE,
             tmdb_id=52001, year=2026)],
     ))
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
 
     page = harness.client.get(f"/reports/{report_id}").text
@@ -313,8 +314,8 @@ def _dashboard_card(harness: AppHarness, status: str) -> None:
             gross_amount=5_000_000, gross_display="$5.0M", weeks_in_release=1,
             status=status, action=MovieAction.NONE, tmdb_id=52001, year=2026)],
     ))
-    harness.client.app.state.plex_cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
 
 
@@ -344,12 +345,12 @@ def test_a_plex_connection_can_be_tested_before_it_is_saved(harness: AppHarness)
     )
 
     response = harness.client.post(
-        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
+        "/settings/media-server/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
     )
 
     assert response.status_code == 200
     assert "Plex responded" in response.text
-    assert harness.client.app.state.plex.load() is None, "a test must store nothing"
+    assert harness.client.app.state.media_server.load() is None, "a test must store nothing"
 
 
 @respx.mock
@@ -361,12 +362,12 @@ def test_the_pre_save_test_reports_each_failure_in_its_own_words(
 
     route.mock(return_value=httpx.Response(401))
     assert "rejected the token" in harness.client.post(
-        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
+        "/settings/media-server/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
     ).text
 
     route.mock(side_effect=httpx.ConnectError("down"))
     assert "Could not reach it" in harness.client.post(
-        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
+        "/settings/media-server/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
     ).text
 
     # Reachable and authenticated, but nothing to read: every later fetch would return
@@ -375,7 +376,7 @@ def test_the_pre_save_test_reports_each_failure_in_its_own_words(
         {"key": "2", "type": "show"},
     ]}}))
     assert "no movie library" in harness.client.post(
-        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
+        "/settings/media-server/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
     ).text
 
 
@@ -383,7 +384,7 @@ def test_an_unreadable_address_is_named_as_such(harness: AppHarness) -> None:
     harness.activate()
 
     response = harness.client.post(
-        "/settings/plex/test-credentials", data={"url": "   ", "token": TOKEN}
+        "/settings/media-server/test-credentials", data={"url": "   ", "token": TOKEN}
     )
 
     assert "address can’t be read" in response.text
@@ -404,7 +405,7 @@ def test_testing_an_address_change_may_reuse_the_stored_token(harness: AppHarnes
     respx.get(f"{PLEX_URL}/library/sections").mock(side_effect=_capture)
 
     response = harness.client.post(
-        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": ""}
+        "/settings/media-server/test-credentials", data={"url": PLEX_URL, "token": ""}
     )
 
     assert "Plex responded" in response.text
@@ -415,7 +416,7 @@ def test_the_pre_save_test_needs_a_token_when_none_is_stored(harness: AppHarness
     harness.activate()
 
     response = harness.client.post(
-        "/settings/plex/test-credentials", data={"url": PLEX_URL, "token": ""}
+        "/settings/media-server/test-credentials", data={"url": PLEX_URL, "token": ""}
     )
 
     assert "rejected the token" in response.text

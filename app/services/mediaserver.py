@@ -35,12 +35,12 @@ from app.services.apps import API_KEY_MASK, InvalidAppError, normalize_url
 from app.services.matcher import normalize_title
 from app.services.radarr import build_verify
 
-PLEX_SCHEMA_VERSION = 1
-PLEX_FILENAME = "plex.yml"
+MEDIA_SERVER_SCHEMA_VERSION = 1
+MEDIA_SERVER_FILENAME = "plex.yml"
 SERVER_KEY = "server"
 
-PLEX_CACHE_SCHEMA_VERSION = 1
-PLEX_CACHE_FILENAME = "plex-library.json"
+LIBRARY_CACHE_SCHEMA_VERSION = 1
+LIBRARY_CACHE_FILENAME = "plex-library.json"
 MOVIES_KEY = "movies"
 FETCHED_AT_KEY = "fetched_at"
 TRUNCATED_KEY = "truncated"
@@ -51,14 +51,14 @@ REQUEST_TIMEOUT_SECONDS = 10.0
 RENDER_FETCH_TIMEOUT_SECONDS = 6.0
 # Refreshed at most this often by page renders; inside the window every render costs
 # zero Plex requests. The Settings button bypasses it for "I just added a film".
-PLEX_CACHE_TTL_SECONDS = 900.0
+LIBRARY_CACHE_TTL_SECONDS = 900.0
 # 500 items per request is Plex's own web client's neighbourhood; 40 pages bounds the
 # fetch at 20k movies. A bigger library is trimmed AND SAYS SO (`truncated`) — silent
 # truncation would read as "covered everything" on exactly the library where it wasn't.
 PLEX_PAGE_SIZE = 500
-MAX_PLEX_PAGES = 40
+MAX_LIBRARY_PAGES = 40
 
-# The two answers `PlexSnapshot.holds` can give, named so no caller matches on a bare
+# The two answers `MediaServerSnapshot.holds` can give, named so no caller matches on a bare
 # string it happens to know. YES is an id match — Plex's own guid against the id the
 # card carries. PROBABLY is a normalized-title-and-year match: the educated guess.
 HOLDS_YES = "yes"
@@ -80,7 +80,7 @@ class PlexAuthError(PlexError):
 
 
 @dataclass(frozen=True)
-class PlexServer:
+class MediaServerConnection:
     url: str
     token_encrypted: str
 
@@ -90,7 +90,7 @@ class PlexServer:
 
 
 @dataclass(frozen=True)
-class PlexMovie:
+class MediaServerMovie:
     """One library item, reduced to exactly what presence-checking needs."""
 
     title: str
@@ -100,14 +100,14 @@ class PlexMovie:
 
 
 @dataclass(frozen=True)
-class PlexFetch:
+class MediaServerFetch:
     """A library listing, honest about whether the page cap trimmed it."""
 
-    movies: tuple[PlexMovie, ...]
+    movies: tuple[MediaServerMovie, ...]
     truncated: bool
 
 
-class PlexStore:
+class MediaServerStore:
     """The single optional Plex connection, token encrypted at rest.
 
     One record, `user.yml`-style. The token goes through the same AES-GCM field
@@ -116,23 +116,23 @@ class PlexStore:
     """
 
     def __init__(self, config_dir: Path, *, key: bytes, audit: AuditLog | None = None) -> None:
-        self._path = config_dir / PLEX_FILENAME
+        self._path = config_dir / MEDIA_SERVER_FILENAME
         self._key = key
         self._audit = audit
 
-    def load(self) -> PlexServer | None:
+    def load(self) -> MediaServerConnection | None:
         if not self._path.exists():
             return None
-        document = filestore.read_yaml(self._path, expected_version=PLEX_SCHEMA_VERSION)
+        document = filestore.read_yaml(self._path, expected_version=MEDIA_SERVER_SCHEMA_VERSION)
         stored = document.get(SERVER_KEY)
         if not isinstance(stored, dict):
             return None
-        return PlexServer(
+        return MediaServerConnection(
             url=str(stored.get("url", "")),
             token_encrypted=str(stored.get("token_encrypted", "")),
         )
 
-    def save(self, *, url: str, token: str | None) -> PlexServer:
+    def save(self, *, url: str, token: str | None) -> MediaServerConnection:
         """Create or update the connection.
 
         A blank token on an existing record keeps the stored one — the same "leave the
@@ -147,11 +147,11 @@ class PlexStore:
             token_encrypted = existing.token_encrypted
         else:
             raise InvalidAppError("a Plex token is required")
-        server = PlexServer(url=normalized, token_encrypted=token_encrypted)
+        server = MediaServerConnection(url=normalized, token_encrypted=token_encrypted)
         filestore.write_yaml(
             self._path,
             {SERVER_KEY: {"url": server.url, "token_encrypted": server.token_encrypted}},
-            schema_version=PLEX_SCHEMA_VERSION,
+            schema_version=MEDIA_SERVER_SCHEMA_VERSION,
         )
         if self._audit:
             self._audit.record(AuditAction.PLEX_UPDATED, url=server.url)
@@ -262,9 +262,9 @@ class PlexClient:
             if isinstance(entry, dict) and entry.get("type") == "movie" and "key" in entry
         ]
 
-    async def list_movies(self) -> PlexFetch:
+    async def list_movies(self) -> MediaServerFetch:
         """Everything the movie sections hold, paginated, capped, and honest about it."""
-        movies: list[PlexMovie] = []
+        movies: list[MediaServerMovie] = []
         truncated = False
         section_keys = await self.movie_section_keys()
         async with self._client() as client:
@@ -272,7 +272,7 @@ class PlexClient:
                 pages = 0
                 start = 0
                 while True:
-                    if pages >= MAX_PLEX_PAGES:
+                    if pages >= MAX_LIBRARY_PAGES:
                         truncated = True
                         break
                     document = await self._get_json(
@@ -293,10 +293,10 @@ class PlexClient:
                     total = container.get("totalSize", container.get("size", 0))
                     if not items or start >= int(total or 0):
                         break
-        return PlexFetch(movies=tuple(movies), truncated=truncated)
+        return MediaServerFetch(movies=tuple(movies), truncated=truncated)
 
 
-def _movie_from_item(item: dict[str, Any]) -> PlexMovie:
+def _movie_from_item(item: dict[str, Any]) -> MediaServerMovie:
     """One Plex item reduced to ids and identity, whichever agent catalogued it."""
     guid_texts = [str(item.get("guid", ""))]
     guid_texts += [
@@ -306,7 +306,7 @@ def _movie_from_item(item: dict[str, Any]) -> PlexMovie:
     tmdb_match = _TMDB_GUID_RE.search(joined)
     imdb_match = _IMDB_GUID_RE.search(joined)
     year = item.get("year")
-    return PlexMovie(
+    return MediaServerMovie(
         title=str(item.get("title", "")),
         year=int(year) if isinstance(year, int) else None,
         tmdb_id=int(tmdb_match.group(1)) if tmdb_match else None,
@@ -315,7 +315,7 @@ def _movie_from_item(item: dict[str, Any]) -> PlexMovie:
 
 
 @dataclass(frozen=True)
-class PlexSnapshot:
+class MediaServerSnapshot:
     """The library resolved once, for answering many titles without re-asking Plex.
 
     The `IgnoreSnapshot` shape, for the `IgnoreSnapshot` reason: every card on a page
@@ -358,12 +358,14 @@ class PlexSnapshot:
         return None
 
 
-def snapshot_from_movies(movies: tuple[PlexMovie, ...], *, truncated: bool = False) -> PlexSnapshot:
+def snapshot_from_movies(
+    movies: tuple[MediaServerMovie, ...], *, truncated: bool = False
+) -> MediaServerSnapshot:
     title_years: dict[str, set[int | None]] = {}
     for movie in movies:
         if movie.title:
             title_years.setdefault(normalize_title(movie.title), set()).add(movie.year)
-    return PlexSnapshot(
+    return MediaServerSnapshot(
         tmdb_ids=frozenset(m.tmdb_id for m in movies if m.tmdb_id is not None),
         imdb_ids=frozenset(m.imdb_id for m in movies if m.imdb_id is not None),
         title_years={title: frozenset(years) for title, years in title_years.items()},
@@ -371,7 +373,7 @@ def snapshot_from_movies(movies: tuple[PlexMovie, ...], *, truncated: bool = Fal
     )
 
 
-class PlexLibraryCache:
+class MediaServerLibraryCache:
     """The last fetched library on disk, so renders inside the TTL cost Plex nothing.
 
     A cache, not a record: unreadable, hand-edited or written by a newer build all read
@@ -379,9 +381,9 @@ class PlexLibraryCache:
     """
 
     def __init__(self, cache_dir: Path) -> None:
-        self._path = cache_dir / PLEX_CACHE_FILENAME
+        self._path = cache_dir / LIBRARY_CACHE_FILENAME
 
-    def save(self, fetch: PlexFetch) -> None:
+    def save(self, fetch: MediaServerFetch) -> None:
         filestore.write_json(
             self._path,
             {
@@ -392,10 +394,10 @@ class PlexLibraryCache:
                     for m in fetch.movies
                 ],
             },
-            schema_version=PLEX_CACHE_SCHEMA_VERSION,
+            schema_version=LIBRARY_CACHE_SCHEMA_VERSION,
         )
 
-    def load(self) -> tuple[PlexSnapshot, float] | None:
+    def load(self) -> tuple[MediaServerSnapshot, float] | None:
         """The cached snapshot and when it was fetched, or None when there is none.
 
         Age is the CALLER's decision: the render path wants a fresh one but will take
@@ -405,7 +407,7 @@ class PlexLibraryCache:
             return None
         try:
             document = filestore.read_json(
-                self._path, expected_version=PLEX_CACHE_SCHEMA_VERSION
+                self._path, expected_version=LIBRARY_CACHE_SCHEMA_VERSION
             )
         except (ValueError, OSError):
             return None
@@ -413,7 +415,7 @@ class PlexLibraryCache:
         if not isinstance(stored, list):
             return None
         movies = tuple(
-            PlexMovie(
+            MediaServerMovie(
                 title=str(entry.get("title", "")),
                 year=entry.get("year") if isinstance(entry.get("year"), int) else None,
                 tmdb_id=entry.get("tmdb_id") if isinstance(entry.get("tmdb_id"), int) else None,

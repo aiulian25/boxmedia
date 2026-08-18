@@ -11,19 +11,19 @@ import respx
 
 from app.core import crypto, filestore
 from app.services.apps import API_KEY_MASK, InvalidAppError
-from app.services.plex import (
+from app.services.mediaserver import (
     HOLDS_PROBABLY,
     HOLDS_YES,
-    MAX_PLEX_PAGES,
-    PLEX_CACHE_FILENAME,
+    LIBRARY_CACHE_FILENAME,
+    MAX_LIBRARY_PAGES,
     PLEX_PAGE_SIZE,
+    MediaServerFetch,
+    MediaServerLibraryCache,
+    MediaServerMovie,
+    MediaServerStore,
     PlexAuthError,
     PlexClient,
     PlexError,
-    PlexFetch,
-    PlexLibraryCache,
-    PlexMovie,
-    PlexStore,
     _movie_from_item,
     snapshot_from_movies,
 )
@@ -94,11 +94,11 @@ def test_an_overlong_id_is_no_id_rather_than_a_truncated_one() -> None:
 
 def _snapshot() -> object:
     return snapshot_from_movies((
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id="tt5200001"),
-        PlexMovie(title="Old Rip", year=1998, tmdb_id=None, imdb_id="tt0120338"),
-        PlexMovie(title="Home Video", year=2020, tmdb_id=None, imdb_id=None),
-        PlexMovie(title="Nosferatu", year=1922, tmdb_id=None, imdb_id=None),
-        PlexMovie(title="Undated Thing", year=None, tmdb_id=None, imdb_id=None),
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id="tt5200001"),
+        MediaServerMovie(title="Old Rip", year=1998, tmdb_id=None, imdb_id="tt0120338"),
+        MediaServerMovie(title="Home Video", year=2020, tmdb_id=None, imdb_id=None),
+        MediaServerMovie(title="Nosferatu", year=1922, tmdb_id=None, imdb_id=None),
+        MediaServerMovie(title="Undated Thing", year=None, tmdb_id=None, imdb_id=None),
     ))
 
 
@@ -194,14 +194,14 @@ async def test_the_page_cap_trims_and_says_so() -> None:
         200, json={"MediaContainer": {"Directory": [{"key": "1", "type": "movie"}]}}
     ))
     route = respx.get(f"{PLEX_URL}/library/sections/1/all").mock(
-        return_value=_page(endless, PLEX_PAGE_SIZE * (MAX_PLEX_PAGES + 5))
+        return_value=_page(endless, PLEX_PAGE_SIZE * (MAX_LIBRARY_PAGES + 5))
     )
 
     fetch = await _client().list_movies()
 
     assert fetch.truncated is True
-    assert route.call_count == MAX_PLEX_PAGES
-    assert len(fetch.movies) == PLEX_PAGE_SIZE * MAX_PLEX_PAGES
+    assert route.call_count == MAX_LIBRARY_PAGES
+    assert len(fetch.movies) == PLEX_PAGE_SIZE * MAX_LIBRARY_PAGES
 
 
 @respx.mock
@@ -242,11 +242,11 @@ async def test_an_unreachable_server_raises_plex_error() -> None:
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> PlexStore:
-    return PlexStore(tmp_path, key=crypto.generate_key())
+def store(tmp_path: Path) -> MediaServerStore:
+    return MediaServerStore(tmp_path, key=crypto.generate_key())
 
 
-def test_the_token_never_touches_disk_in_plaintext(store: PlexStore, tmp_path: Path) -> None:
+def test_the_token_never_touches_disk_in_plaintext(store: MediaServerStore, tmp_path: Path) -> None:
     store.save(url="http://plex.local:32400", token=TOKEN)
 
     raw = (tmp_path / "plex.yml").read_text(encoding="utf-8")
@@ -254,14 +254,14 @@ def test_the_token_never_touches_disk_in_plaintext(store: PlexStore, tmp_path: P
     assert store.decrypt_token() == TOKEN
 
 
-def test_the_public_view_masks_the_token(store: PlexStore) -> None:
+def test_the_public_view_masks_the_token(store: MediaServerStore) -> None:
     store.save(url="http://plex.local:32400", token=TOKEN)
 
     view = store.load().public()
     assert view == {"url": "http://plex.local:32400", "token_mask": API_KEY_MASK}
 
 
-def test_a_blank_token_keeps_the_stored_one(store: PlexStore) -> None:
+def test_a_blank_token_keeps_the_stored_one(store: MediaServerStore) -> None:
     """The Radarr cards' contract: editing the URL never forces re-pasting the secret."""
     store.save(url="http://plex.local:32400", token=TOKEN)
 
@@ -271,18 +271,18 @@ def test_a_blank_token_keeps_the_stored_one(store: PlexStore) -> None:
     assert store.decrypt_token() == TOKEN
 
 
-def test_a_first_save_without_a_token_is_refused(store: PlexStore) -> None:
+def test_a_first_save_without_a_token_is_refused(store: MediaServerStore) -> None:
     with pytest.raises(InvalidAppError):
         store.save(url="http://plex.local:32400", token=None)
 
 
-def test_a_scheme_less_url_is_normalized_like_a_radarr_one(store: PlexStore) -> None:
+def test_a_scheme_less_url_is_normalized_like_a_radarr_one(store: MediaServerStore) -> None:
     store.save(url="plex.local:32400", token=TOKEN)
 
     assert store.load().url.startswith("http://")
 
 
-def test_remove_deletes_the_record(store: PlexStore) -> None:
+def test_remove_deletes_the_record(store: MediaServerStore) -> None:
     store.save(url="http://plex.local:32400", token=TOKEN)
 
     assert store.remove() is True
@@ -294,9 +294,9 @@ def test_remove_deletes_the_record(store: PlexStore) -> None:
 
 
 def test_the_cache_round_trips_and_reports_its_age(tmp_path: Path) -> None:
-    cache = PlexLibraryCache(tmp_path)
-    cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id="tt5200001"),
+    cache = MediaServerLibraryCache(tmp_path)
+    cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id="tt5200001"),
     ), truncated=True))
 
     loaded = cache.load()
@@ -308,24 +308,24 @@ def test_the_cache_round_trips_and_reports_its_age(tmp_path: Path) -> None:
 
 
 def test_an_unreadable_cache_reads_as_empty(tmp_path: Path) -> None:
-    (tmp_path / PLEX_CACHE_FILENAME).write_text("{broken", encoding="utf-8")
+    (tmp_path / LIBRARY_CACHE_FILENAME).write_text("{broken", encoding="utf-8")
 
-    assert PlexLibraryCache(tmp_path).load() is None
+    assert MediaServerLibraryCache(tmp_path).load() is None
 
 
 def test_a_cache_from_a_newer_build_reads_as_empty(tmp_path: Path) -> None:
     filestore.write_json(
-        tmp_path / PLEX_CACHE_FILENAME, {"movies": []},
+        tmp_path / LIBRARY_CACHE_FILENAME, {"movies": []},
         schema_version=99,
     )
 
-    assert PlexLibraryCache(tmp_path).load() is None
+    assert MediaServerLibraryCache(tmp_path).load() is None
 
 
 def test_forget_drops_the_snapshot(tmp_path: Path) -> None:
     """A library nobody is connected to must not keep decorating cards."""
-    cache = PlexLibraryCache(tmp_path)
-    cache.save(PlexFetch(movies=(), truncated=False))
+    cache = MediaServerLibraryCache(tmp_path)
+    cache.save(MediaServerFetch(movies=(), truncated=False))
 
     cache.forget()
 
@@ -334,10 +334,10 @@ def test_forget_drops_the_snapshot(tmp_path: Path) -> None:
 
 
 def test_the_cache_file_is_json_a_human_can_check(tmp_path: Path) -> None:
-    cache = PlexLibraryCache(tmp_path)
-    cache.save(PlexFetch(movies=(
-        PlexMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
+    cache = MediaServerLibraryCache(tmp_path)
+    cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
 
-    document = json.loads((tmp_path / PLEX_CACHE_FILENAME).read_text(encoding="utf-8"))
+    document = json.loads((tmp_path / LIBRARY_CACHE_FILENAME).read_text(encoding="utf-8"))
     assert document["movies"][0]["title"] == "Neon Rain"

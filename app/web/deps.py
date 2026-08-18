@@ -22,11 +22,11 @@ from fastapi.templating import Jinja2Templates
 from app.core import security
 from app.core.sessions import COOKIE_NAME
 from app.services.apps import ExternalApp, client_for_credentials
-from app.services.plex import (
-    PLEX_CACHE_TTL_SECONDS,
+from app.services.mediaserver import (
+    LIBRARY_CACHE_TTL_SECONDS,
     RENDER_FETCH_TIMEOUT_SECONDS,
+    MediaServerSnapshot,
     PlexError,
-    PlexSnapshot,
     snapshot_from_movies,
 )
 from app.services.posters import POSTER_WIDTH, sized
@@ -310,10 +310,10 @@ async def load_radarr_library(
     return {movie.tmdb_id: movie for movie in library}
 
 
-PLEX_BACKOFF_KEY = "plex"
+MEDIA_SERVER_BACKOFF_KEY = "plex"
 
 
-async def load_plex_snapshot(request: Request) -> PlexSnapshot | None:
+async def load_media_server_snapshot(request: Request) -> MediaServerSnapshot | None:
     """What Plex holds, for annotating one page. None when unconfigured or unknowable.
 
     Reads the disk cache first: inside the TTL a render costs Plex nothing at all.
@@ -322,18 +322,18 @@ async def load_plex_snapshot(request: Request) -> PlexSnapshot | None:
     truth about a library decorates a card better than silence — and the same backoff
     the Radarr reads use stops a dead server costing every render a timeout.
     """
-    store = request.app.state.plex
+    store = request.app.state.media_server
     if store.load() is None:
         return None
-    cache = request.app.state.plex_cache
+    cache = request.app.state.media_server_cache
     cached = cache.load()
     if cached is not None:
         snapshot, fetched_at = cached
-        if time.time() - fetched_at < PLEX_CACHE_TTL_SECONDS:
+        if time.time() - fetched_at < LIBRARY_CACHE_TTL_SECONDS:
             return snapshot
     stale = cached[0] if cached is not None else None
-    backoff = request.app.state.plex_backoff
-    if backoff.should_skip(PLEX_BACKOFF_KEY):
+    backoff = request.app.state.media_server_backoff
+    if backoff.should_skip(MEDIA_SERVER_BACKOFF_KEY):
         return stale
     settings = request.app.state.settings
     try:
@@ -346,9 +346,9 @@ async def load_plex_snapshot(request: Request) -> PlexSnapshot | None:
             client.list_movies(), timeout=RENDER_FETCH_TIMEOUT_SECONDS
         )
     except (PlexError, TimeoutError):
-        backoff.note_failure(PLEX_BACKOFF_KEY)
+        backoff.note_failure(MEDIA_SERVER_BACKOFF_KEY)
         return stale
-    backoff.note_success(PLEX_BACKOFF_KEY)
+    backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)
     cache.save(fetch)
     return snapshot_from_movies(fetch.movies, truncated=fetch.truncated)
 

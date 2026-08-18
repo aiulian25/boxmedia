@@ -47,17 +47,17 @@ from app.services.filters import (
     FiltersConfig,
 )
 from app.services.ignore import IgnoredMovie
-from app.services.pipeline import SCRAPE_FAILURE_SUBDIR
-from app.services.plex import PlexAuthError, PlexError
-from app.services.plex import (
-    client_for_credentials as plex_client_for_credentials,
+from app.services.mediaserver import PlexAuthError, PlexError
+from app.services.mediaserver import (
+    client_for_credentials as server_client_for_credentials,
 )
+from app.services.pipeline import SCRAPE_FAILURE_SUBDIR
 from app.services.posters import POSTER_SUBDIR, POSTER_WIDTH, sized
 from app.services.radarr import RadarrAuthError, RadarrConnectionError, RadarrError
 from app.services.radarr_options import RadarrOptions
 from app.services.reports import Report
 from app.web.deps import (
-    PLEX_BACKOFF_KEY,
+    MEDIA_SERVER_BACKOFF_KEY,
     client_ip,
     current_user,
     format_timestamp,
@@ -80,7 +80,7 @@ router = APIRouter()
 
 SETTINGS_PATH = "/settings"
 TEST_CREDENTIALS_PATH = "/settings/apps/test"
-PLEX_TEST_CREDENTIALS_PATH = "/settings/plex/test-credentials"
+SERVER_TEST_CREDENTIALS_PATH = "/settings/media-server/test-credentials"
 # Radarr names itself in /system/status. Sonarr and Lidarr answer the same shape, so
 # without this an "it works" would be a lie about which app answered.
 RADARR_APP_NAME = "radarr"
@@ -326,7 +326,7 @@ async def settings_page(request: Request) -> object:
         chart_size_bounds=(MIN_CHART_SIZE, MAX_CHART_SIZE),
         regions=REGIONS,
         plex=(lambda server: server.public() if server else None)(
-            request.app.state.plex.load()
+            request.app.state.media_server.load()
         ),
         report_keep_bounds=(MIN_REPORT_KEEP, MAX_REPORT_KEEP),
         options=options,
@@ -334,7 +334,7 @@ async def settings_page(request: Request) -> object:
         storage=_storage_view(request),
         snapshots=_snapshot_views(request),
         test_credentials_path=TEST_CREDENTIALS_PATH,
-        plex_test_credentials_path=PLEX_TEST_CREDENTIALS_PATH,
+        server_test_credentials_path=SERVER_TEST_CREDENTIALS_PATH,
         ignored=ignored,
         first_run=not apps,
         banner_kind=banner[0] if banner else None,
@@ -675,9 +675,9 @@ def _validated_mode(mode: str) -> str:
     return mode
 
 
-def _plex_client(request: Request, *, timeout: float | None = None):  # noqa: ANN202
+def _server_client(request: Request, *, timeout: float | None = None):  # noqa: ANN202
     settings = request.app.state.settings
-    return request.app.state.plex.build_client(
+    return request.app.state.media_server.build_client(
         tls_verify=settings.outbound_tls_verify,
         ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
         timeout=timeout,
@@ -696,17 +696,17 @@ async def save_plex(
     """
     user = current_user(request)
     try:
-        request.app.state.plex.save(url=url, token=token.strip() or None)
+        request.app.state.media_server.save(url=url, token=token.strip() or None)
     except InvalidAppError:
         return _redirect(request, SettingsStatus.PLEX_INVALID)
-    request.app.state.plex_cache.forget()
+    request.app.state.media_server_cache.forget()
     request.app.state.audit.record(
         AuditAction.PLEX_UPDATED, actor=user.username, source_ip=client_ip(request)
     )
     return _redirect(request, SettingsStatus.PLEX_SAVED)
 
 
-@router.post(PLEX_TEST_CREDENTIALS_PATH)
+@router.post(SERVER_TEST_CREDENTIALS_PATH)
 async def test_plex_credentials(
     request: Request, url: str = Form(...), token: str = Form("")
 ) -> object:
@@ -723,18 +723,18 @@ async def test_plex_credentials(
     """
     current_user(request)
     return render(
-        request, "_plex_test.html", result=await _test_plex_credentials(request, url, token)
+        request, "_server_test.html", result=await _test_server_credentials(request, url, token)
     )
 
 
-async def _test_plex_credentials(request: Request, url: str, token: str) -> dict[str, str]:
+async def _test_server_credentials(request: Request, url: str, token: str) -> dict[str, str]:
     settings = request.app.state.settings
-    stored = request.app.state.plex.load()
+    stored = request.app.state.media_server.load()
     if not token and stored is None:
         return {"state": TestResult.AUTH}
     try:
-        secret = token or request.app.state.plex.decrypt_token()
-        client = plex_client_for_credentials(
+        secret = token or request.app.state.media_server.decrypt_token()
+        client = server_client_for_credentials(
             url,
             secret,
             tls_verify=settings.outbound_tls_verify,
@@ -759,10 +759,10 @@ async def _test_plex_credentials(request: Request, url: str, token: str) -> dict
 async def test_plex(request: Request) -> RedirectResponse:
     """Really try, every time — the backoff is for decorating pages, not for this."""
     user = current_user(request)
-    if request.app.state.plex.load() is None:
+    if request.app.state.media_server.load() is None:
         return _redirect(request, SettingsStatus.PLEX_TEST_CONN)
     try:
-        sections = await _plex_client(request).movie_section_keys()
+        sections = await _server_client(request).movie_section_keys()
     except PlexAuthError:
         outcome = SettingsStatus.PLEX_TEST_AUTH
     except PlexError:
@@ -780,22 +780,22 @@ async def test_plex(request: Request) -> RedirectResponse:
 async def refresh_plex(request: Request) -> RedirectResponse:
     """Fetch the library now, TTL be damned — the "I just added a film" button."""
     current_user(request)
-    if request.app.state.plex.load() is None:
+    if request.app.state.media_server.load() is None:
         return _redirect(request, SettingsStatus.PLEX_REFRESH_FAILED)
     try:
-        fetch = await _plex_client(request).list_movies()
+        fetch = await _server_client(request).list_movies()
     except PlexError:
         return _redirect(request, SettingsStatus.PLEX_REFRESH_FAILED)
-    request.app.state.plex_cache.save(fetch)
-    request.app.state.plex_backoff.note_success(PLEX_BACKOFF_KEY)
+    request.app.state.media_server_cache.save(fetch)
+    request.app.state.media_server_backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)
     return _redirect(request, SettingsStatus.PLEX_REFRESHED)
 
 
 @router.post("/settings/plex/remove")
 async def remove_plex(request: Request) -> RedirectResponse:
     user = current_user(request)
-    removed = request.app.state.plex.remove()
-    request.app.state.plex_cache.forget()
+    removed = request.app.state.media_server.remove()
+    request.app.state.media_server_cache.forget()
     if removed:
         request.app.state.audit.record(
             AuditAction.PLEX_REMOVED, actor=user.username, source_ip=client_ip(request)
