@@ -18,7 +18,7 @@ from tests.conftest import AppHarness
 SETTINGS_ACTIONS = {
     "/account/profile",
     "/account/theme",
-    "/settings/plex",
+    "/settings/media-server",
     "/settings/filters",
     "/settings/region",
     "/settings/backups/schedule",
@@ -29,9 +29,9 @@ NEVER_BATCHED = {
     "/account/password",
     "/account/logout-all",
     "/settings/apps",
-    "/settings/plex/remove",
-    "/settings/plex/refresh",
-    "/settings/plex/test",
+    "/settings/media-server/remove",
+    "/settings/media-server/refresh",
+    "/settings/media-server/test",
     "/settings/backups/create",
     "/settings/backups/import",
     "/settings/maintenance/prune-posters",
@@ -56,7 +56,7 @@ def _fully_configured(harness: AppHarness) -> dict[str, str]:
     harness.activate()
     harness.client.app.state.apps.add(name="Main", url=FIX_RADARR_URL, api_key=RADARR_KEY)
     harness.client.post(
-        "/settings/plex",
+        "/settings/media-server",
         data={"url": "http://plex.local:32400", "token": "t" * 20},
         follow_redirects=False,
     )
@@ -147,10 +147,10 @@ def test_a_rejected_status_is_not_mistaken_for_a_saved_one() -> None:
     settings form can redirect with has to fall on the right side of that."""
     good = re.compile(r"saved|_ok$|updated")
     for status in (SettingsStatus.FILTERS_SAVED, SettingsStatus.REGION_SAVED,
-                   SettingsStatus.PLEX_SAVED, SettingsStatus.BACKUP_SCHEDULE_SAVED,
+                   SettingsStatus.SERVER_SAVED, SettingsStatus.BACKUP_SCHEDULE_SAVED,
                    SettingsStatus.APP_UPDATED):
         assert good.search(status), f"{status} would be reported as a failure"
     for status in (SettingsStatus.FILTERS_INVALID, SettingsStatus.REGION_INVALID,
-                   SettingsStatus.PLEX_INVALID, SettingsStatus.BACKUP_SCHEDULE_INVALID,
+                   SettingsStatus.SERVER_INVALID, SettingsStatus.BACKUP_SCHEDULE_INVALID,
                    SettingsStatus.APP_INVALID):
         assert not good.search(status), f"{status} would pass as a success"

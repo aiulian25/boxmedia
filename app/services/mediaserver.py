@@ -36,11 +36,28 @@ from app.services.matcher import normalize_title
 from app.services.radarr import build_verify
 
 MEDIA_SERVER_SCHEMA_VERSION = 1
-MEDIA_SERVER_FILENAME = "plex.yml"
+MEDIA_SERVER_FILENAME = "mediaserver.yml"
+# What 1.1.0 wrote, when Plex was the only kind. Read on load so an existing install
+# keeps working with no action; the next save writes the new name and removes this one.
+LEGACY_PLEX_FILENAME = "plex.yml"
 SERVER_KEY = "server"
 
+# Which server this connection is. The store owns its vocabulary the way users.py owns
+# THEMES: read-tolerant on load (an unknown kind is a Plex install from before kinds
+# existed), write-strict in the form.
+KIND_PLEX = "plex"
+KIND_JELLYFIN = "jellyfin"
+MEDIA_SERVER_KINDS = frozenset({KIND_PLEX, KIND_JELLYFIN})
+# What the cards, verdicts and labels call each one. One place, so a chip and a test
+# result can never disagree about the name of the thing they are describing.
+SERVER_NAMES = {KIND_PLEX: "Plex", KIND_JELLYFIN: "Jellyfin"}
+# What each kind calls the secret. Plex issues a token; Jellyfin issues an API key from
+# Dashboard -> API Keys, and calling it a token there sends people looking for the wrong
+# screen.
+SECRET_LABELS = {KIND_PLEX: "Plex token", KIND_JELLYFIN: "API key"}
+
 LIBRARY_CACHE_SCHEMA_VERSION = 1
-LIBRARY_CACHE_FILENAME = "plex-library.json"
+LIBRARY_CACHE_FILENAME = "media-server-library.json"
 MOVIES_KEY = "movies"
 FETCHED_AT_KEY = "fetched_at"
 TRUNCATED_KEY = "truncated"
@@ -56,6 +73,8 @@ LIBRARY_CACHE_TTL_SECONDS = 900.0
 # fetch at 20k movies. A bigger library is trimmed AND SAYS SO (`truncated`) — silent
 # truncation would read as "covered everything" on exactly the library where it wasn't.
 PLEX_PAGE_SIZE = 500
+# Jellyfin pages the same way through StartIndex/Limit against TotalRecordCount.
+JELLYFIN_PAGE_SIZE = 500
 MAX_LIBRARY_PAGES = 40
 
 # The two answers `MediaServerSnapshot.holds` can give, named so no caller matches on a bare
@@ -69,24 +88,65 @@ HOLDS_PROBABLY = "probably"
 # Both shapes are read; anything else contributes title+year only.
 _TMDB_GUID_RE = re.compile(r"tmdb://(\d+)")
 _IMDB_GUID_RE = re.compile(r"imdb(?:://|.{0,40}?//)(tt\d{7,9})(?!\d)")
+# The shape of an IMDb title id, for a source that hands one over whole rather than
+# inside a URI. Same bound as the guid pattern above.
+_IMDB_ID_RE = re.compile(r"tt\d{7,9}")
 
 
-class PlexError(Exception):
+def validated_kind(value: object) -> str:
+    """A stored kind, or Plex for anything this build does not ship.
+
+    Read-tolerant, write-strict — the `users._validated_theme` pattern. A file written
+    before kinds existed has no kind at all and must load as what it is: a Plex
+    connection. The Settings form refuses an unknown value outright.
+    """
+    return value if isinstance(value, str) and value in MEDIA_SERVER_KINDS else KIND_PLEX
+
+
+class MediaServerError(Exception):
+    """The media server could not be reached, or refused the credential."""
+
+
+class MediaServerAuthError(MediaServerError):
+    """The credential was rejected — reachable server, wrong secret."""
+
+
+class PlexError(MediaServerError):
     """The Plex server could not be reached, or refused the token."""
 
 
-class PlexAuthError(PlexError):
+class PlexAuthError(PlexError, MediaServerAuthError):
     """The token was rejected — reachable server, wrong credential."""
+
+
+class JellyfinError(MediaServerError):
+    """The Jellyfin server could not be reached, or refused the API key."""
+
+
+class JellyfinAuthError(JellyfinError, MediaServerAuthError):
+    """The API key was rejected — reachable server, wrong credential."""
 
 
 @dataclass(frozen=True)
 class MediaServerConnection:
     url: str
     token_encrypted: str
+    kind: str = KIND_PLEX
+
+    @property
+    def name(self) -> str:
+        """What to call this server on a card, a verdict or a label."""
+        return SERVER_NAMES.get(self.kind, SERVER_NAMES[KIND_PLEX])
 
     def public(self) -> dict[str, object]:
-        """View for templates — the token is masked, never revealed."""
-        return {"url": self.url, "token_mask": API_KEY_MASK}
+        """View for templates — the secret is masked, never revealed."""
+        return {
+            "url": self.url,
+            "token_mask": API_KEY_MASK,
+            "kind": self.kind,
+            "name": self.name,
+            "secret_label": SECRET_LABELS.get(self.kind, SECRET_LABELS[KIND_PLEX]),
+        }
 
 
 @dataclass(frozen=True)
@@ -117,22 +177,32 @@ class MediaServerStore:
 
     def __init__(self, config_dir: Path, *, key: bytes, audit: AuditLog | None = None) -> None:
         self._path = config_dir / MEDIA_SERVER_FILENAME
+        self._legacy_path = config_dir / LEGACY_PLEX_FILENAME
         self._key = key
         self._audit = audit
 
     def load(self) -> MediaServerConnection | None:
-        if not self._path.exists():
+        """The stored connection, reading the pre-kinds file when that is all there is.
+
+        A 1.1.0 install has `plex.yml` and no kind. It loads as Plex and keeps working
+        with no action from anyone; `save` is what migrates the file.
+        """
+        path = self._path if self._path.exists() else self._legacy_path
+        if not path.exists():
             return None
-        document = filestore.read_yaml(self._path, expected_version=MEDIA_SERVER_SCHEMA_VERSION)
+        document = filestore.read_yaml(path, expected_version=MEDIA_SERVER_SCHEMA_VERSION)
         stored = document.get(SERVER_KEY)
         if not isinstance(stored, dict):
             return None
         return MediaServerConnection(
             url=str(stored.get("url", "")),
             token_encrypted=str(stored.get("token_encrypted", "")),
+            kind=validated_kind(stored.get("kind")),
         )
 
-    def save(self, *, url: str, token: str | None) -> MediaServerConnection:
+    def save(
+        self, *, url: str, token: str | None, kind: str = KIND_PLEX
+    ) -> MediaServerConnection:
         """Create or update the connection.
 
         A blank token on an existing record keeps the stored one — the same "leave the
@@ -141,28 +211,44 @@ class MediaServerStore:
         """
         normalized = normalize_url(url)
         existing = self.load()
+        if kind not in MEDIA_SERVER_KINDS:
+            raise InvalidAppError(f"unknown media server: {kind!r}")
         if token:
             token_encrypted = crypto.encrypt_field(token, self._key)
-        elif existing is not None:
+        elif existing is not None and existing.kind == kind:
             token_encrypted = existing.token_encrypted
         else:
-            raise InvalidAppError("a Plex token is required")
-        server = MediaServerConnection(url=normalized, token_encrypted=token_encrypted)
+            # A blank secret keeps the stored one only for the SAME server. Switching
+            # kind and reusing the old secret would send a Plex token to Jellyfin.
+            raise InvalidAppError(f"a {SECRET_LABELS.get(kind, 'credential')} is required")
+        server = MediaServerConnection(
+            url=normalized, token_encrypted=token_encrypted, kind=kind
+        )
         filestore.write_yaml(
             self._path,
-            {SERVER_KEY: {"url": server.url, "token_encrypted": server.token_encrypted}},
+            {SERVER_KEY: {
+                "url": server.url,
+                "token_encrypted": server.token_encrypted,
+                "kind": server.kind,
+            }},
             schema_version=MEDIA_SERVER_SCHEMA_VERSION,
         )
+        # The pre-kinds file has been superseded; leaving it would make the next load
+        # depend on which of two files it happened to read.
+        self._legacy_path.unlink(missing_ok=True)
         if self._audit:
-            self._audit.record(AuditAction.PLEX_UPDATED, url=server.url)
+            self._audit.record(
+                AuditAction.MEDIA_SERVER_UPDATED, url=server.url, kind=server.kind
+            )
         return server
 
     def remove(self) -> bool:
-        if not self._path.exists():
+        if not (self._path.exists() or self._legacy_path.exists()):
             return False
-        self._path.unlink()
+        self._path.unlink(missing_ok=True)
+        self._legacy_path.unlink(missing_ok=True)
         if self._audit:
-            self._audit.record(AuditAction.PLEX_REMOVED)
+            self._audit.record(AuditAction.MEDIA_SERVER_REMOVED)
         return True
 
     def decrypt_token(self) -> str:
@@ -173,15 +259,17 @@ class MediaServerStore:
 
     def build_client(
         self, *, tls_verify: bool, ca_file: str | None, timeout: float | None = None
-    ) -> PlexClient:
+    ):  # noqa: ANN201 — PlexClient | JellyfinClient, both structurally identical
         server = self.load()
         if server is None:
-            raise PlexError("no Plex connection is configured")
-        return PlexClient(
+            raise MediaServerError("no media server is configured")
+        return client_for_credentials(
             server.url,
             self.decrypt_token(),
-            verify=build_verify(tls_verify=tls_verify, ca_file=ca_file),
-            timeout=timeout or REQUEST_TIMEOUT_SECONDS,
+            kind=server.kind,
+            tls_verify=tls_verify,
+            ca_file=ca_file,
+            timeout=timeout,
         )
 
 
@@ -189,18 +277,20 @@ def client_for_credentials(
     url: str,
     token: str,
     *,
+    kind: str = KIND_PLEX,
     tls_verify: bool,
     ca_file: str | None,
     timeout: float | None = None,
-) -> PlexClient:
-    """A Plex client for credentials, stored or not.
+):  # noqa: ANN201 — PlexClient | JellyfinClient
+    """A client for credentials, stored or not, for whichever server this is.
 
     Mirrors `apps.client_for_credentials`, and for the same reason: testing a
     connection before it is saved has to talk to exactly what saving it would talk to,
     so the address goes through the same `normalize_url` that `save` applies. Raises
     InvalidAppError for an address that cannot be parsed — the same answer `save` gives.
     """
-    return PlexClient(
+    client_class = JellyfinClient if kind == KIND_JELLYFIN else PlexClient
+    return client_class(
         normalize_url(url),
         token,
         verify=build_verify(tls_verify=tls_verify, ca_file=ca_file),
@@ -294,6 +384,130 @@ class PlexClient:
                     if not items or start >= int(total or 0):
                         break
         return MediaServerFetch(movies=tuple(movies), truncated=truncated)
+
+
+class JellyfinClient:
+    """One GET endpoint and nothing else — the movie list, optionally counted only.
+
+    The API key travels as the `X-Emby-Token` HEADER. Jellyfin also accepts `?api_key=`
+    in the query string and we never use it, for the reason the Plex client does not:
+    a credential in a URL is a credential in every access log on the path.
+    """
+
+    ITEMS_PATH = "/Items"
+    # Everything the presence check needs and nothing it does not. Images and user data
+    # are the bulk of an unfiltered response and neither is ever read here.
+    FIELDS = "ProviderIds,ProductionYear"
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        verify: bool | str = True,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._token = token
+        self._verify = verify
+        self._timeout = timeout
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self._base_url,
+            headers={"X-Emby-Token": self._token, "Accept": "application/json"},
+            verify=self._verify,
+            timeout=self._timeout,
+        )
+
+    async def _items(
+        self, client: httpx.AsyncClient, *, start: int, limit: int
+    ) -> dict:
+        try:
+            response = await client.get(
+                self.ITEMS_PATH,
+                params={
+                    "IncludeItemTypes": "Movie",
+                    "Recursive": "true",
+                    "Fields": self.FIELDS,
+                    "EnableImages": "false",
+                    "EnableUserData": "false",
+                    "StartIndex": start,
+                    "Limit": limit,
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise JellyfinError(f"could not reach Jellyfin: {exc}") from exc
+        if response.status_code == httpx.codes.UNAUTHORIZED:
+            raise JellyfinAuthError("Jellyfin rejected the API key")
+        if response.is_error:
+            raise JellyfinError(f"Jellyfin answered HTTP {response.status_code}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise JellyfinError("Jellyfin answered something that is not JSON") from exc
+
+    async def movie_section_keys(self) -> list[str]:
+        """Whether there is a movie library to read, in the shape the Plex client
+        answers it — one call, `Limit=0`, so the Test probe costs a count and no items.
+
+        A list rather than a bool because the caller is shared: "reachable and
+        authenticated but nothing to read" is a failed test on either server.
+        """
+        async with self._client() as client:
+            document = await self._items(client, start=0, limit=0)
+        return ["movies"] if int(document.get("TotalRecordCount") or 0) > 0 else []
+
+    async def list_movies(self) -> MediaServerFetch:
+        """Every movie, paginated, capped, and honest about it."""
+        movies: list[MediaServerMovie] = []
+        truncated = False
+        async with self._client() as client:
+            start = 0
+            pages = 0
+            while True:
+                if pages >= MAX_LIBRARY_PAGES:
+                    truncated = True
+                    break
+                document = await self._items(
+                    client, start=start, limit=JELLYFIN_PAGE_SIZE
+                )
+                items = document.get("Items") or []
+                movies.extend(_movie_from_jellyfin_item(item) for item in items)
+                pages += 1
+                start += len(items)
+                total = int(document.get("TotalRecordCount") or 0)
+                if not items or start >= total:
+                    break
+        return MediaServerFetch(movies=tuple(movies), truncated=truncated)
+
+
+def _movie_from_jellyfin_item(item: dict[str, Any]) -> MediaServerMovie:
+    """One Jellyfin item reduced to ids and identity.
+
+    Ids are read by KEY EQUALITY, never by searching the text. A live library answers
+    with `{"Imdb": ..., "Tmdb": ..., "TmdbCollection": ...}`, and the Plex client's
+    approach — regex over the joined guid text — would match the COLLECTION id and
+    stamp it on the film. That is the wrong-poster failure M5 exists to prevent,
+    arriving from a new direction, so it is closed here before it can happen.
+    """
+    provider_ids = item.get("ProviderIds")
+    by_key = {
+        str(key).strip().casefold(): str(value)
+        for key, value in (provider_ids or {}).items()
+        if isinstance(key, str)
+    }
+    tmdb_raw = by_key.get("tmdb", "")
+    imdb_raw = by_key.get("imdb", "")
+    year = item.get("ProductionYear")
+    return MediaServerMovie(
+        title=str(item.get("Name", "")),
+        year=int(year) if isinstance(year, int) else None,
+        tmdb_id=int(tmdb_raw) if tmdb_raw.isdigit() else None,
+        # Bounded exactly as the Plex side is: an id outside the range IMDb issues is
+        # no id, never a truncated one.
+        imdb_id=imdb_raw if _IMDB_ID_RE.fullmatch(imdb_raw) else None,
+    )
 
 
 def _movie_from_item(item: dict[str, Any]) -> MediaServerMovie:

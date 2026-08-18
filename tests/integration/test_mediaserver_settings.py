@@ -1,11 +1,18 @@
-"""Plex P1: the Settings card, the routes, and the cards' annotation end to end."""
+"""Media server (P1/J1): the Settings card, the routes, and the cards' annotation."""
 
 from __future__ import annotations
 
 import httpx
 import respx
 
-from app.services.mediaserver import LIBRARY_CACHE_TTL_SECONDS, MediaServerFetch, MediaServerMovie
+from app.services.mediaserver import (
+    KIND_JELLYFIN,
+    KIND_PLEX,
+    LIBRARY_CACHE_TTL_SECONDS,
+    MEDIA_SERVER_FILENAME,
+    MediaServerFetch,
+    MediaServerMovie,
+)
 from app.services.reports import (
     MovieAction,
     MovieResult,
@@ -35,9 +42,11 @@ def _plex_item(title: str, year: int, tmdb: int | None) -> dict:
     return item
 
 
-def _connect(harness: AppHarness) -> None:
+def _connect(harness: AppHarness, *, kind: str = KIND_PLEX, url: str = PLEX_URL) -> None:
     harness.client.post(
-        "/settings/plex", data={"url": PLEX_URL, "token": TOKEN}, follow_redirects=False
+        "/settings/media-server",
+        data={"url": url, "token": TOKEN, "kind": kind},
+        follow_redirects=False,
     )
 
 
@@ -65,7 +74,7 @@ def test_the_card_offers_connect_until_a_server_is_saved(harness: AppHarness) ->
 
     assert "Media Server" in page
     assert "Connect" in page
-    assert "only ever <strong>reads</strong> Plex" in page
+    assert "only ever <strong>reads</strong> it" in page
 
 
 def test_saving_masks_the_token_and_never_echoes_it(harness: AppHarness) -> None:
@@ -84,7 +93,7 @@ def test_the_token_is_encrypted_on_disk(harness: AppHarness) -> None:
 
     _connect(harness)
 
-    raw = (harness.settings.config_dir / "plex.yml").read_text(encoding="utf-8")
+    raw = (harness.settings.config_dir / MEDIA_SERVER_FILENAME).read_text(encoding="utf-8")
     assert TOKEN not in raw
 
 
@@ -92,10 +101,10 @@ def test_a_bad_url_is_refused(harness: AppHarness) -> None:
     harness.activate()
 
     response = harness.client.post(
-        "/settings/plex", data={"url": "   ", "token": TOKEN}, follow_redirects=False
+        "/settings/media-server", data={"url": "   ", "token": TOKEN}, follow_redirects=False
     )
 
-    assert "plex_invalid" in response.headers["location"]
+    assert "server_invalid" in response.headers["location"]
     assert harness.client.app.state.media_server.load() is None
 
 
@@ -106,7 +115,7 @@ def test_remove_forgets_the_connection_and_the_snapshot(harness: AppHarness) -> 
         MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
     ), truncated=False))
 
-    harness.client.post("/settings/plex/remove", follow_redirects=False)
+    harness.client.post("/settings/media-server/remove", follow_redirects=False)
 
     assert harness.client.app.state.media_server.load() is None
     # A library nobody is connected to must not keep decorating cards.
@@ -120,16 +129,16 @@ def test_test_connection_reports_each_of_its_three_answers(harness: AppHarness) 
     route = respx.get(f"{PLEX_URL}/library/sections")
 
     route.mock(return_value=httpx.Response(200, json=SECTIONS))
-    ok = harness.client.post("/settings/plex/test", follow_redirects=False)
-    assert "plex_test_ok" in ok.headers["location"]
+    ok = harness.client.post("/settings/media-server/test", follow_redirects=False)
+    assert "server_test_ok" in ok.headers["location"]
 
     route.mock(return_value=httpx.Response(401))
-    auth = harness.client.post("/settings/plex/test", follow_redirects=False)
-    assert "plex_test_auth" in auth.headers["location"]
+    auth = harness.client.post("/settings/media-server/test", follow_redirects=False)
+    assert "server_test_auth" in auth.headers["location"]
 
     route.mock(side_effect=httpx.ConnectError("down"))
-    conn = harness.client.post("/settings/plex/test", follow_redirects=False)
-    assert "plex_test_conn" in conn.headers["location"]
+    conn = harness.client.post("/settings/media-server/test", follow_redirects=False)
+    assert "server_test_conn" in conn.headers["location"]
 
 
 @respx.mock
@@ -145,9 +154,9 @@ def test_refresh_fetches_now_and_caches(harness: AppHarness) -> None:
         ))
     )
 
-    response = harness.client.post("/settings/plex/refresh", follow_redirects=False)
+    response = harness.client.post("/settings/media-server/refresh", follow_redirects=False)
 
-    assert "plex_refreshed" in response.headers["location"]
+    assert "server_refreshed" in response.headers["location"]
     cached = harness.client.app.state.media_server_cache.load()
     assert cached is not None
     assert cached[0].holds(52001, None, "x", None) == "yes"
@@ -361,7 +370,7 @@ def test_the_pre_save_test_reports_each_failure_in_its_own_words(
     route = respx.get(f"{PLEX_URL}/library/sections")
 
     route.mock(return_value=httpx.Response(401))
-    assert "rejected the token" in harness.client.post(
+    assert "rejected the credential" in harness.client.post(
         "/settings/media-server/test-credentials", data={"url": PLEX_URL, "token": TOKEN}
     ).text
 
@@ -387,7 +396,7 @@ def test_an_unreadable_address_is_named_as_such(harness: AppHarness) -> None:
         "/settings/media-server/test-credentials", data={"url": "   ", "token": TOKEN}
     )
 
-    assert "address can’t be read" in response.text
+    assert "check the address" in response.text
 
 
 @respx.mock
@@ -419,4 +428,131 @@ def test_the_pre_save_test_needs_a_token_when_none_is_stored(harness: AppHarness
         "/settings/media-server/test-credentials", data={"url": PLEX_URL, "token": ""}
     )
 
-    assert "rejected the token" in response.text
+    assert "rejected the credential" in response.text
+
+
+# --- Jellyfin through the same card and the same cards (J1) ---
+
+JELLYFIN_URL = "http://jellyfin.local:8096"
+
+
+def _jellyfin_items(items: list[dict]) -> httpx.Response:
+    return httpx.Response(200, json={"Items": items, "TotalRecordCount": len(items)})
+
+
+def test_the_card_names_both_servers_before_one_is_chosen(harness: AppHarness) -> None:
+    """Which server it is has to be answerable from the card itself, not guessed from
+    the port someone happens to type."""
+    harness.activate()
+
+    page = harness.client.get("/settings").text
+
+    assert 'value="plex"' in page and 'value="jellyfin"' in page
+    assert "Which server" in page
+    # Both defaults are named while nothing is chosen, so neither user is left guessing.
+    assert "32400" in page and "8096" in page
+
+
+def test_a_jellyfin_connection_says_jellyfin_everywhere(harness: AppHarness) -> None:
+    harness.activate()
+
+    _connect(harness, kind=KIND_JELLYFIN, url=JELLYFIN_URL)
+    page = harness.client.get("/settings").text
+
+    assert "Connected to Jellyfin" in page
+    assert "Test Jellyfin" in page
+    assert "Jellyfin API key" in page or "API key" in page
+    assert harness.client.app.state.media_server.load().kind == KIND_JELLYFIN
+
+
+@respx.mock
+def test_a_jellyfin_connection_is_tested_before_saving(harness: AppHarness) -> None:
+    harness.activate()
+    respx.get(f"{JELLYFIN_URL}/Items").mock(
+        return_value=httpx.Response(200, json={"Items": [], "TotalRecordCount": 3})
+    )
+
+    response = harness.client.post(
+        "/settings/media-server/test-credentials",
+        data={"url": JELLYFIN_URL, "token": "key", "kind": KIND_JELLYFIN},
+    )
+
+    assert "Jellyfin responded" in response.text
+    assert harness.client.app.state.media_server.load() is None, "a test must store nothing"
+
+
+@respx.mock
+def test_a_rejected_jellyfin_key_names_jellyfin(harness: AppHarness) -> None:
+    harness.activate()
+    respx.get(f"{JELLYFIN_URL}/Items").mock(return_value=httpx.Response(401))
+
+    response = harness.client.post(
+        "/settings/media-server/test-credentials",
+        data={"url": JELLYFIN_URL, "token": "wrong", "kind": KIND_JELLYFIN},
+    )
+
+    assert "Jellyfin rejected the credential" in response.text
+
+
+def test_a_kind_this_build_does_not_ship_is_refused_by_the_form(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+
+    response = harness.client.post(
+        "/settings/media-server",
+        data={"url": JELLYFIN_URL, "token": "key", "kind": "emby"},
+        follow_redirects=False,
+    )
+
+    assert "server_invalid" in response.headers["location"]
+    assert harness.client.app.state.media_server.load() is None
+
+
+def test_the_cards_say_jellyfin_when_that_is_what_is_connected(
+    harness: AppHarness,
+) -> None:
+    """The whole feature, on the other server: the snapshot path is server-neutral, so
+    only the name on the chip should differ."""
+    harness.activate()
+    _connect(harness, kind=KIND_JELLYFIN, url=JELLYFIN_URL)
+    report_id = _report_with_missing_title(harness, tmdb=52001, year=2026)
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Different Spelling", year=2026, tmdb_id=52001, imdb_id=None),
+    ), truncated=False))
+
+    page = harness.client.get(f"/reports/{report_id}").text
+
+    assert "Already in Jellyfin" in page
+    assert "Already in Plex" not in page
+
+
+def test_switching_server_drops_the_previous_library(harness: AppHarness) -> None:
+    """Another server's films must not keep decorating cards for up to a TTL."""
+    harness.activate()
+    _connect(harness)
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(movies=(
+        MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id=None),
+    ), truncated=False))
+
+    _connect(harness, kind=KIND_JELLYFIN, url=JELLYFIN_URL)
+
+    assert harness.client.app.state.media_server_cache.load() is None
+
+
+@respx.mock
+def test_a_jellyfin_library_refreshes_through_the_same_button(harness: AppHarness) -> None:
+    harness.activate()
+    _connect(harness, kind=KIND_JELLYFIN, url=JELLYFIN_URL)
+    respx.get(f"{JELLYFIN_URL}/Items").mock(return_value=_jellyfin_items([
+        {"Name": "Neon Rain", "ProductionYear": 2026,
+         "ProviderIds": {"Tmdb": "52001", "TmdbCollection": "9999"}},
+    ]))
+
+    response = harness.client.post("/settings/media-server/refresh", follow_redirects=False)
+
+    assert "server_refreshed" in response.headers["location"]
+    cached = harness.client.app.state.media_server_cache.load()
+    assert cached[0].holds(52001, None, "x", None) == "yes"
+    # And the collection id did not become a film, end to end.
+    assert cached[0].holds(9999, None, "x", None) is None

@@ -47,7 +47,13 @@ from app.services.filters import (
     FiltersConfig,
 )
 from app.services.ignore import IgnoredMovie
-from app.services.mediaserver import PlexAuthError, PlexError
+from app.services.mediaserver import (
+    KIND_PLEX,
+    MEDIA_SERVER_KINDS,
+    SERVER_NAMES,
+    MediaServerAuthError,
+    MediaServerError,
+)
 from app.services.mediaserver import (
     client_for_credentials as server_client_for_credentials,
 )
@@ -130,19 +136,19 @@ class SettingsStatus:
     BACKUP_SCHEDULE_INVALID = "backup_schedule_invalid"
     UNIGNORED = "unignored"
     CLEANED = "cleaned"
-    PLEX_SAVED = "plex_saved"
-    PLEX_INVALID = "plex_invalid"
-    PLEX_REMOVED = "plex_removed"
-    PLEX_TEST_OK = "plex_test_ok"
-    PLEX_TEST_AUTH = "plex_test_auth"
-    PLEX_TEST_CONN = "plex_test_conn"
-    PLEX_REFRESHED = "plex_refreshed"
+    SERVER_SAVED = "server_saved"
+    SERVER_INVALID = "server_invalid"
+    SERVER_REMOVED = "server_removed"
+    SERVER_TEST_OK = "server_test_ok"
+    SERVER_TEST_AUTH = "server_test_auth"
+    SERVER_TEST_CONN = "server_test_conn"
+    SERVER_REFRESHED = "server_refreshed"
     # What the page reloads with after the one Save button has written every edited
     # card. A rejected card names its own status instead — "Settings saved" over a
     # value the server refused would be a lie.
     SETTINGS_SAVED = "settings_saved"
     SETTINGS_SAVE_FAILED = "settings_save_failed"
-    PLEX_REFRESH_FAILED = "plex_refresh_failed"
+    SERVER_REFRESH_FAILED = "server_refresh_failed"
 
 
 _SUCCESS = "success"
@@ -186,21 +192,25 @@ STATUS_MESSAGES: dict[str, tuple[str, str]] = {
         _SUCCESS,
         "Box office region saved — it applies to the next fetch.",
     ),
-    SettingsStatus.PLEX_SAVED: (_SUCCESS, "Plex connection saved."),
-    SettingsStatus.PLEX_INVALID: (_ERROR, "Please check the Plex address and token."),
-    SettingsStatus.PLEX_REMOVED: (_SUCCESS, "Plex connection removed."),
-    SettingsStatus.PLEX_TEST_OK: (_SUCCESS, "Connection succeeded — Plex responded."),
-    SettingsStatus.PLEX_TEST_AUTH: (_ERROR, "Plex rejected the token."),
-    SettingsStatus.PLEX_TEST_CONN: (_ERROR, "Could not reach Plex (check the address / TLS)."),
-    SettingsStatus.PLEX_REFRESHED: (_SUCCESS, "Plex library refreshed."),
+    SettingsStatus.SERVER_SAVED: (_SUCCESS, "Media server saved."),
+    SettingsStatus.SERVER_INVALID: (_ERROR, "Please check the address and credential."),
+    SettingsStatus.SERVER_REMOVED: (_SUCCESS, "Media server removed."),
+    SettingsStatus.SERVER_TEST_OK: (
+        _SUCCESS, "Connection succeeded — the server responded.",
+    ),
+    SettingsStatus.SERVER_TEST_AUTH: (_ERROR, "The server rejected the credential."),
+    SettingsStatus.SERVER_TEST_CONN: (
+        _ERROR, "Could not reach the media server (check the address / TLS).",
+    ),
+    SettingsStatus.SERVER_REFRESHED: (_SUCCESS, "Media server library refreshed."),
+    SettingsStatus.SERVER_REFRESH_FAILED: (
+        _ERROR,
+        "Could not read the library — check the connection and try Test.",
+    ),
     SettingsStatus.SETTINGS_SAVED: (_SUCCESS, "Settings saved."),
     SettingsStatus.SETTINGS_SAVE_FAILED: (
         _ERROR,
         "Something did not save — check the values and try again.",
-    ),
-    SettingsStatus.PLEX_REFRESH_FAILED: (
-        _ERROR,
-        "Could not read the Plex library — check the connection and try Test.",
     ),
     SettingsStatus.REGION_INVALID: (
         _ERROR,
@@ -325,7 +335,7 @@ async def settings_page(request: Request) -> object:
         filters=filters,
         chart_size_bounds=(MIN_CHART_SIZE, MAX_CHART_SIZE),
         regions=REGIONS,
-        plex=(lambda server: server.public() if server else None)(
+        server=(lambda stored: stored.public() if stored else None)(
             request.app.state.media_server.load()
         ),
         report_keep_bounds=(MIN_REPORT_KEEP, MAX_REPORT_KEEP),
@@ -684,59 +694,86 @@ def _server_client(request: Request, *, timeout: float | None = None):  # noqa: 
     )
 
 
-@router.post("/settings/plex")
-async def save_plex(
-    request: Request, url: str = Form(""), token: str = Form("")
+@router.post("/settings/media-server")
+async def save_media_server(
+    request: Request,
+    url: str = Form(""),
+    token: str = Form(""),
+    kind: str = Form(KIND_PLEX),
 ) -> RedirectResponse:
-    """Create or update the one Plex connection.
+    """Create or update the one media server connection.
 
-    A blank token keeps the stored one, the Radarr cards' contract. The stale library
-    snapshot is dropped on save: pointing at a different server must not leave the old
-    server's films decorating cards for up to a TTL.
+    A blank secret keeps the stored one, the Radarr cards' contract — but only for the
+    same server; the store refuses to carry a Plex token over to Jellyfin. The stale
+    library snapshot is dropped on save: pointing at a different address, or a
+    different KIND of server, must not leave the old one's films decorating cards for
+    up to a TTL.
+
+    Write-strict on the kind, unlike the read-tolerant loader: a form is a deliberate
+    act, and a server this build does not ship is a rejected submission.
     """
     user = current_user(request)
     try:
-        request.app.state.media_server.save(url=url, token=token.strip() or None)
+        # The store is write-strict about the kind, so an unknown one arrives here as
+        # the same InvalidAppError a bad address does. Guarding it again in the route
+        # would be a line no test could tell the absence of.
+        request.app.state.media_server.save(
+            url=url, token=token.strip() or None, kind=kind
+        )
     except InvalidAppError:
-        return _redirect(request, SettingsStatus.PLEX_INVALID)
+        return _redirect(request, SettingsStatus.SERVER_INVALID)
     request.app.state.media_server_cache.forget()
     request.app.state.audit.record(
-        AuditAction.PLEX_UPDATED, actor=user.username, source_ip=client_ip(request)
+        AuditAction.MEDIA_SERVER_UPDATED, actor=user.username, source_ip=client_ip(request)
     )
-    return _redirect(request, SettingsStatus.PLEX_SAVED)
+    return _redirect(request, SettingsStatus.SERVER_SAVED)
 
 
 @router.post(SERVER_TEST_CREDENTIALS_PATH)
-async def test_plex_credentials(
-    request: Request, url: str = Form(...), token: str = Form("")
+async def test_server_credentials_route(
+    request: Request,
+    url: str = Form(...),
+    token: str = Form(""),
+    kind: str = Form(KIND_PLEX),
 ) -> object:
-    """Probe a Plex address and token the user has typed but not saved. Stores nothing.
+    """Probe an address and secret the user has typed but not saved. Stores nothing.
 
-    The Radarr side has had this since it existed; Plex shipped with only the
-    after-saving test, which asked people to commit a credential to disk before they
-    could learn whether it works. Same contract as `test_credentials`: authenticated,
-    CSRF-guarded, held for the length of this request, never written to disk or the
-    audit log, and every reply is our own copy rather than anything the remote said.
+    The Radarr side has had this since it existed; the media server shipped with only
+    the after-saving test, which asked people to commit a credential to disk before
+    they could learn whether it works. Same contract as `test_credentials`:
+    authenticated, CSRF-guarded, held for the length of this request, never written to
+    disk or the audit log, and every reply is our own copy rather than anything the
+    remote said.
 
-    A blank token means the saved one — testing an address change without re-pasting a
-    secret is the whole reason the token field may be left empty.
+    A blank secret means the saved one — testing an address change without re-pasting
+    it is the whole reason the field may be left empty — but only for the SAME kind of
+    server, or the probe would send a Plex token to Jellyfin.
     """
     current_user(request)
     return render(
-        request, "_server_test.html", result=await _test_server_credentials(request, url, token)
+        request,
+        "_server_test.html",
+        result=await _test_server_credentials(request, url, token, kind),
+        server_name=SERVER_NAMES.get(kind, SERVER_NAMES[KIND_PLEX]),
     )
 
 
-async def _test_server_credentials(request: Request, url: str, token: str) -> dict[str, str]:
+async def _test_server_credentials(
+    request: Request, url: str, token: str, kind: str
+) -> dict[str, str]:
     settings = request.app.state.settings
     stored = request.app.state.media_server.load()
-    if not token and stored is None:
+    reusable = stored is not None and stored.kind == kind
+    if kind not in MEDIA_SERVER_KINDS:
+        return {"state": TestResult.BAD_URL}
+    if not token and not reusable:
         return {"state": TestResult.AUTH}
     try:
         secret = token or request.app.state.media_server.decrypt_token()
         client = server_client_for_credentials(
             url,
             secret,
+            kind=kind,
             tls_verify=settings.outbound_tls_verify,
             ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
             timeout=HEALTH_TIMEOUT_SECONDS,
@@ -746,61 +783,61 @@ async def _test_server_credentials(request: Request, url: str, token: str) -> di
         )
     except InvalidAppError:
         return {"state": TestResult.BAD_URL}
-    except PlexAuthError:
+    except MediaServerAuthError:
         return {"state": TestResult.AUTH}
-    except (PlexError, TimeoutError):
+    except (MediaServerError, TimeoutError):
         return {"state": TestResult.UNREACHABLE}
     # Reachable, authenticated, and no movie library: every later fetch would return
     # nothing and the cards would silently never mention Plex. That is a failed test.
     return {"state": TestResult.OK if sections else TestResult.NOT_RADARR}
 
 
-@router.post("/settings/plex/test")
-async def test_plex(request: Request) -> RedirectResponse:
+@router.post("/settings/media-server/test")
+async def test_media_server(request: Request) -> RedirectResponse:
     """Really try, every time — the backoff is for decorating pages, not for this."""
     user = current_user(request)
     if request.app.state.media_server.load() is None:
-        return _redirect(request, SettingsStatus.PLEX_TEST_CONN)
+        return _redirect(request, SettingsStatus.SERVER_TEST_CONN)
     try:
         sections = await _server_client(request).movie_section_keys()
-    except PlexAuthError:
-        outcome = SettingsStatus.PLEX_TEST_AUTH
-    except PlexError:
-        outcome = SettingsStatus.PLEX_TEST_CONN
+    except MediaServerAuthError:
+        outcome = SettingsStatus.SERVER_TEST_AUTH
+    except MediaServerError:
+        outcome = SettingsStatus.SERVER_TEST_CONN
     else:
-        outcome = SettingsStatus.PLEX_TEST_OK if sections else SettingsStatus.PLEX_TEST_CONN
+        outcome = SettingsStatus.SERVER_TEST_OK if sections else SettingsStatus.SERVER_TEST_CONN
     request.app.state.audit.record(
-        AuditAction.PLEX_TESTED, actor=user.username, source_ip=client_ip(request),
+        AuditAction.MEDIA_SERVER_TESTED, actor=user.username, source_ip=client_ip(request),
         outcome=outcome,
     )
     return _redirect(request, outcome)
 
 
-@router.post("/settings/plex/refresh")
-async def refresh_plex(request: Request) -> RedirectResponse:
+@router.post("/settings/media-server/refresh")
+async def refresh_media_server(request: Request) -> RedirectResponse:
     """Fetch the library now, TTL be damned — the "I just added a film" button."""
     current_user(request)
     if request.app.state.media_server.load() is None:
-        return _redirect(request, SettingsStatus.PLEX_REFRESH_FAILED)
+        return _redirect(request, SettingsStatus.SERVER_REFRESH_FAILED)
     try:
         fetch = await _server_client(request).list_movies()
-    except PlexError:
-        return _redirect(request, SettingsStatus.PLEX_REFRESH_FAILED)
+    except MediaServerError:
+        return _redirect(request, SettingsStatus.SERVER_REFRESH_FAILED)
     request.app.state.media_server_cache.save(fetch)
     request.app.state.media_server_backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)
-    return _redirect(request, SettingsStatus.PLEX_REFRESHED)
+    return _redirect(request, SettingsStatus.SERVER_REFRESHED)
 
 
-@router.post("/settings/plex/remove")
-async def remove_plex(request: Request) -> RedirectResponse:
+@router.post("/settings/media-server/remove")
+async def remove_media_server(request: Request) -> RedirectResponse:
     user = current_user(request)
     removed = request.app.state.media_server.remove()
     request.app.state.media_server_cache.forget()
     if removed:
         request.app.state.audit.record(
-            AuditAction.PLEX_REMOVED, actor=user.username, source_ip=client_ip(request)
+            AuditAction.MEDIA_SERVER_REMOVED, actor=user.username, source_ip=client_ip(request)
         )
-    return _redirect(request, SettingsStatus.PLEX_REMOVED)
+    return _redirect(request, SettingsStatus.SERVER_REMOVED)
 
 
 @router.post("/settings/region")

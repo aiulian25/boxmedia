@@ -214,6 +214,42 @@
     });
   });
 
+  /* Which media server is being configured, said in every field that depends on it.
+   *
+   * The port in the address, the name of the secret and where to find it all differ
+   * between Plex and Jellyfin. Without this the card would ask for "Token / API key"
+   * and name both ports at once — readable, but it makes the person do the matching.
+   * Every string comes off a data- attribute rendered by the template, so nothing here
+   * invents copy and the no-JavaScript page still names both.
+   */
+  var kindRadios = document.querySelectorAll("[data-server-kind]");
+  if (kindRadios.length) {
+    var applyKind = function (kind) {
+      var url = document.querySelector("#server-url");
+      var label = document.querySelector("[data-secret-label]");
+      var hint = document.querySelector("[data-secret-hint]");
+      if (url) {
+        url.placeholder = url.getAttribute("data-placeholder-" + kind) || url.placeholder;
+      }
+      if (label) {
+        label.textContent = label.getAttribute("data-label-" + kind) || label.textContent;
+      }
+      if (hint) {
+        hint.textContent = hint.getAttribute("data-hint-" + kind) || hint.textContent;
+      }
+    };
+    Array.prototype.forEach.call(kindRadios, function (radio) {
+      if (radio.checked) {
+        applyKind(radio.value);
+      }
+      radio.addEventListener("change", function () {
+        if (radio.checked) {
+          applyKind(radio.value);
+        }
+      });
+    });
+  }
+
   /* One Save for the whole Settings page.
    *
    * The page is built from separate forms because each posts to the route that owns its

@@ -76,9 +76,9 @@
        your media server has. In-library cards say nothing — Radarr holding the file is
        the stronger statement. #}
     {% if movie.server_state == "yes" %}
-    <span class="server-hint" title="Your Plex server holds this film (matched by id)">Already in Plex</span>
+    <span class="server-hint" title="Your {{ server_name }} server holds this film (matched by id)">Already in {{ server_name }}</span>
     {% elif movie.server_state == "probably" %}
-    <span class="guess-hint" title="A Plex title of the same name and year — nothing verified it is the same film">Probably in Plex — verify</span>
+    <span class="guess-hint" title="A {{ server_name }} title of the same name and year — nothing verified it is the same film">Probably in {{ server_name }} — verify</span>
     {% endif %}
     <div class="poster-meta">
       {# Box-office figures exist only for titles a stored week actually charted. For

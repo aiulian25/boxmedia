@@ -25,8 +25,8 @@ from app.services.apps import ExternalApp, client_for_credentials
 from app.services.mediaserver import (
     LIBRARY_CACHE_TTL_SECONDS,
     RENDER_FETCH_TIMEOUT_SECONDS,
+    MediaServerError,
     MediaServerSnapshot,
-    PlexError,
     snapshot_from_movies,
 )
 from app.services.posters import POSTER_WIDTH, sized
@@ -179,9 +179,26 @@ def render(
         "theme": user.theme if user else THEME_DARK,
         "asset_version": request.app.state.asset_version,
         "csrf_token": security.csrf_token_for(settings.session_secret, session_id),
+        # What to call the media server anywhere a card mentions it. Base context, not
+        # per-view, because two pages print it and neither should be able to disagree
+        # with the Settings card about which server is connected. Reads the stored
+        # connection, which is a small YAML file, and only for a signed-in page.
+        "server_name": _media_server_name(request) if user else "",
     }
     base_context.update(context)
     return templates.TemplateResponse(request, template_name, base_context, status_code=status_code)
+
+
+def _media_server_name(request: Request) -> str:
+    """The connected server's display name, or empty when none is configured.
+
+    Empty rather than a default: a page that says "Already in Plex" to someone running
+    Jellyfin would be worse than one that says nothing, and no hint renders without a
+    connection anyway.
+    """
+    stored = getattr(request.app.state, "media_server", None)
+    connection = stored.load() if stored is not None else None
+    return connection.name if connection is not None else ""
 
 
 def display_initials(display_name: str) -> str:
@@ -310,7 +327,7 @@ async def load_radarr_library(
     return {movie.tmdb_id: movie for movie in library}
 
 
-MEDIA_SERVER_BACKOFF_KEY = "plex"
+MEDIA_SERVER_BACKOFF_KEY = "media-server"
 
 
 async def load_media_server_snapshot(request: Request) -> MediaServerSnapshot | None:
@@ -345,7 +362,7 @@ async def load_media_server_snapshot(request: Request) -> MediaServerSnapshot | 
         fetch = await asyncio.wait_for(
             client.list_movies(), timeout=RENDER_FETCH_TIMEOUT_SECONDS
         )
-    except (PlexError, TimeoutError):
+    except (MediaServerError, TimeoutError):
         backoff.note_failure(MEDIA_SERVER_BACKOFF_KEY)
         return stale
     backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)

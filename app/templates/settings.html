@@ -222,49 +222,82 @@
 
 <section class="settings-section">
   <h3 class="section-title">Media Server</h3>
-  <p class="subtle">Optional. Connect Plex and the weekly cards say when a title is already on your media server — so you don’t add a second copy of something another tool fetched. BoxMedia only ever <strong>reads</strong> Plex; nothing is written, changed, or deleted there.</p>
+  <p class="subtle">Optional. Connect <strong>Plex</strong> or <strong>Jellyfin</strong> and the weekly cards say when a title is already on your media server — so you don’t add a second copy of something another tool fetched. BoxMedia only ever <strong>reads</strong> it; nothing is written, changed, or deleted there.</p>
   <div class="app-card">
     {# One connection, not a list: multiple Radarrs exist because quality profiles
-       differ per instance, and Plex has no analogue of that. #}
-    <form method="post" action="{{ url_base }}/settings/plex" data-settings-form class="app-grid">
+       differ per instance, and a media server has no analogue of that. Which server
+       it is, is a choice on that one connection. #}
+    <form method="post" action="{{ url_base }}/settings/media-server" data-settings-form class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <div>
-        <label for="plex-url">Address</label>
-        <input id="plex-url" name="url" type="text" value="{{ plex.url if plex }}" placeholder="192.168.1.100:32400 or https://plex.example" required>
+      {# The choice comes FIRST and spans the card, because everything below it —
+         what the address looks like, what the secret is called, where to find it —
+         depends on the answer. Radios rather than a select: two named choices, and the
+         one in effect is readable without opening anything. #}
+      <div class="app-grid-full">
+        <fieldset class="theme-choice">
+          <legend>Which server</legend>
+          <label class="theme-option">
+            <input type="radio" name="kind" value="plex" data-server-kind {% if not server or server.kind == 'plex' %}checked{% endif %}>
+            <span>Plex</span>
+          </label>
+          <label class="theme-option">
+            <input type="radio" name="kind" value="jellyfin" data-server-kind {% if server and server.kind == 'jellyfin' %}checked{% endif %}>
+            <span>Jellyfin</span>
+          </label>
+        </fieldset>
       </div>
       <div>
-        <label for="plex-token">Plex token</label>
+        <label for="server-url">Address</label>
+        {# Both defaults shown, so the port that is right for the chosen server is in
+           front of the person choosing it. app.js narrows this to one once a kind is
+           picked; without it the line still names both. #}
+        <input id="server-url" name="url" type="text" value="{{ server.url if server }}"
+               data-placeholder-plex="192.168.1.100:32400 or https://plex.example"
+               data-placeholder-jellyfin="192.168.1.100:8096 or https://jellyfin.example"
+               placeholder="Plex 192.168.1.100:32400 · Jellyfin 192.168.1.100:8096" required>
+      </div>
+      <div>
+        {# Named for whichever server is selected: Plex issues a token, Jellyfin issues
+           an API key from Dashboard → API Keys, and calling it the wrong thing sends
+           people looking for a screen that does not exist. #}
+        <label for="server-token" data-secret-label
+               data-label-plex="Plex token" data-label-jellyfin="Jellyfin API key">{% if server %}{{ server.secret_label }}{% else %}Token / API key{% endif %}</label>
         {# Masked once saved, exactly as the Radarr keys are: leave it blank to keep
-           the stored token when only the address changes. #}
-        <input id="plex-token" name="token" type="password" placeholder="{{ plex.token_mask if plex }}" {% if not plex %}required{% endif %}>
-        <p class="field-note">Sent as a header, never in a URL. Encrypted at rest with the same key as your Radarr API keys.</p>
+           the stored secret when only the address changes. #}
+        <input id="server-token" name="token" type="password" placeholder="{{ server.token_mask if server }}" {% if not server %}required{% endif %}>
+        <p class="field-note" data-secret-hint
+           data-hint-plex="Plex: Settings → Account, or read X-Plex-Token from a library URL."
+           data-hint-jellyfin="Jellyfin: Dashboard → API Keys → add one for BoxMedia.">Sent as a header, never in a URL. Encrypted at rest with the same key as your Radarr API keys.</p>
       </div>
       <div class="app-actions app-actions-row">
         {# Where the verdict lands, filled by app.js with a server-rendered fragment. #}
         <span data-test-result></span>
         {# Hidden until app.js reveals it. Without JavaScript this would have to
-           re-render the form with the typed token echoed back into the HTML; saving
-           still reports whether Plex answered, so only the preview is lost. Before
-           saving, like Radarr's — asking someone to commit a credential to disk in
-           order to find out whether it works is the wrong way round. #}
+           re-render the form with the typed secret echoed back into the HTML; saving
+           still reports whether the server answered, so only the preview is lost.
+           Before saving, like Radarr's — asking someone to commit a credential to disk
+           in order to find out whether it works is the wrong way round. #}
         <button type="submit" class="btn-secondary" formaction="{{ url_base }}{{ server_test_credentials_path }}"
                 data-test-connection hidden>Test Connection</button>
-        <button type="submit" data-form-save class="btn-primary">{% if plex %}Save{% else %}Connect{% endif %}</button>
+        <button type="submit" data-form-save class="btn-primary">{% if server %}Save{% else %}Connect{% endif %}</button>
       </div>
     </form>
-    {% if plex %}
+    {% if server %}
     {# Siblings of the save form, never nested inside it — the Radarr cards' layout,
-       because a form inside a form is invalid HTML and browsers eject the inner one. #}
+       because a form inside a form is invalid HTML and browsers eject the inner one.
+       Each names the server, so there is never doubt about which one is being
+       refreshed, tested or removed. #}
     <div class="app-actions-row">
-      <form method="post" action="{{ url_base }}/settings/plex/refresh">
+      <span class="test-result">Connected to {{ server.name }}</span>
+      <form method="post" action="{{ url_base }}/settings/media-server/refresh">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button type="submit" class="btn-ghost" title="Fetch the library now instead of waiting for the next automatic refresh">Refresh Library</button>
       </form>
-      <form method="post" action="{{ url_base }}/settings/plex/test">
+      <form method="post" action="{{ url_base }}/settings/media-server/test">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="btn-ghost">Test Connection</button>
+        <button type="submit" class="btn-ghost">Test {{ server.name }}</button>
       </form>
-      <form method="post" action="{{ url_base }}/settings/plex/remove">
+      <form method="post" action="{{ url_base }}/settings/media-server/remove">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button type="submit" class="btn-danger">Remove</button>
       </form>
