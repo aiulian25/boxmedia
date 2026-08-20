@@ -457,6 +457,81 @@ def test_no_forward_control_beyond_the_current_week(harness: AppHarness) -> None
     assert "← " in page  # but the previous week is still reachable
 
 
+def test_the_newest_report_offers_no_forward_fetch(harness: AppHarness) -> None:
+    """The reported dead end: on the newest stored week the page offered to fetch the
+    NEXT one — complete, unfetched, and therefore allowed by the old "has it happened
+    yet" guard. But that week is the frontier, and the frontier already has two owners:
+    the weekly check fetches the latest complete week four times a week, and "Run current
+    week" does it on demand. A third button for the same thing is a dead end."""
+    harness.activate()
+    _week_report(harness, "report-20260814-120000-w26", "2026W26")
+    _week_report(harness, "report-20260814-130000-w27", "2026W27")
+
+    page = harness.client.get("/reports/report-20260814-130000-w27").text
+
+    assert "Fetch 2026W28" not in page
+    assert "→" not in page, "no forward control at all on the newest week"
+    assert "← Week 2026W26" in page, "navigation backwards is untouched"
+
+
+def test_a_hole_inside_the_history_is_still_offered(harness: AppHarness) -> None:
+    """The case a human genuinely has to click: no schedule ever fills an interior gap."""
+    harness.activate()
+    _week_report(harness, "report-20260814-120000-w26", "2026W26")
+    # W27 missing.
+    _week_report(harness, "report-20260814-140000-w28", "2026W28")
+
+    page = harness.client.get("/reports/report-20260814-120000-w26").text
+
+    assert "Fetch 2026W27 →" in page
+    assert 'value="2026W27"' in page
+
+
+def test_the_newest_report_is_still_reachable_going_forward(
+    harness: AppHarness,
+) -> None:
+    """Only the FETCH is bounded. A neighbour that HAS a report is navigation, and
+    suppressing it would strand the newest report behind the one before it."""
+    harness.activate()
+    _week_report(harness, "report-20260814-120000-w26", "2026W26")
+    _week_report(harness, "report-20260814-130000-w27", "2026W27")
+
+    page = harness.client.get("/reports/report-20260814-120000-w26").text
+
+    assert "Week 2026W27 →" in page
+    assert "/reports/report-20260814-130000-w27" in page
+
+
+def test_the_unresolved_current_label_is_not_counted_as_the_newest_week(
+    harness: AppHarness,
+) -> None:
+    """A report stored as "current" is a label, not a position, and as text it sorts
+    after every real week id. Counted as the newest week held, it would make even the
+    frontier look like a hole and bring the dead-end button straight back."""
+    harness.activate()
+    _week_report(harness, "report-20260814-120000-w26", "2026W26")
+    _week_report(harness, "report-20260814-150000-cur", "current")
+
+    page = harness.client.get("/reports/report-20260814-120000-w26").text
+
+    assert "Fetch 2026W27" not in page, "'current' was mistaken for a later week"
+
+
+def test_the_unresolved_current_label_does_not_hide_every_hole(
+    harness: AppHarness,
+) -> None:
+    """And the other side of it: excluding "current" must not also exclude the real
+    weeks stored beside it."""
+    harness.activate()
+    _week_report(harness, "report-20260814-120000-w26", "2026W26")
+    _week_report(harness, "report-20260814-140000-w28", "2026W28")
+    _week_report(harness, "report-20260814-150000-cur", "current")
+
+    page = harness.client.get("/reports/report-20260814-120000-w26").text
+
+    assert "Fetch 2026W27 →" in page
+
+
 def test_navigation_absent_for_a_current_week_report(harness: AppHarness) -> None:
     # A report labelled "current" (the test mock's bare page) has no week arithmetic.
     harness.activate()

@@ -586,22 +586,49 @@ def _trend_view(history: list[tuple[str, int, int, str]]) -> list[dict[str, obje
 def _week_neighbours(week: str, reports: list[Report]) -> dict[str, str | None]:
     """The weeks either side of this report, and the reports holding them if any.
 
-    A neighbour that already has a report becomes a link; one that doesn't becomes a
-    fetch. The forward side stops at the current ISO week — there is no point offering to
-    fetch a week that hasn't happened.
+    A neighbour that already has a report becomes a link, in both directions — that is
+    navigation, and it is always offered.
+
+    A neighbour with NO report becomes a fetch only when fetching it is something the app
+    will not do for itself. Forward, that means a hole: a week older than the newest one
+    already stored. Beyond that lies the frontier, which has two owners already — the
+    weekly check fetches the latest complete week four times a week, and "Run current
+    week" does it on demand — so a third button offering the same thing is a dead end
+    dressed as an action. It was reachable: on the newest report, with today in W34 and
+    W33 complete but not yet picked up, the page offered "Fetch 2026W33".
+
+    Backwards is not bounded that way, and deliberately: walking into history is the one
+    thing no schedule ever does, so an older week that was never pulled is always worth
+    offering. This is the same line `ReportsStore.missing_weeks` draws — holes inside the
+    range, never the edges — kept consistent rather than invented twice.
     """
     previous_week = previous_week_id(week)
     next_week = next_week_id(week)
-    if next_week and next_week > bom_week_id(date.today()):
-        next_week = None
 
     existing = {report.week: report.id for report in reports}
+    next_link = existing.get(next_week) if next_week else None
+    if next_week and next_link is None and not _is_a_hole(next_week, existing):
+        next_week = None
+
     return {
         "previous_week": previous_week,
         "previous_link": existing.get(previous_week) if previous_week else None,
         "next_week": next_week,
-        "next_link": existing.get(next_week) if next_week else None,
+        "next_link": next_link,
     }
+
+
+def _is_a_hole(week: str, existing: dict[str, str]) -> bool:
+    """Whether an unfetched week sits inside the stored history rather than past its end.
+
+    `CURRENT_WEEK` is excluded from the comparison: it is the label a run that could not
+    resolve a week id stores, not a position on the calendar, and lexicographically it
+    would out-rank every real week id and make the whole history look like holes.
+    """
+    real_weeks = [
+        stored for stored in existing if stored != CURRENT_WEEK and week_start(stored)
+    ]
+    return bool(real_weeks) and week < max(real_weeks)
 
 
 # Registered BEFORE /reports/{report_id}: routes match in definition order, so with
