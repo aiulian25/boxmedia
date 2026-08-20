@@ -141,7 +141,7 @@ into an empty folder, then:
 # 1. Create your .env from the template and set BM_SESSION_SECRET.
 cp .env.example .env
 #    Generate a session secret:
-docker run --rm --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.2.0 \
+docker run --rm --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.2.1 \
   -c "import secrets; print(secrets.token_urlsafe(48))"
 #    Paste it into BM_SESSION_SECRET in .env.
 
@@ -260,9 +260,9 @@ docker compose down
 
 # 2. Generate a new key next to the old one, then rotate the stored connections.
 docker run --rm -v "$PWD/secrets:/secrets" --entrypoint /usr/bin/python3.11 \
-  ghcr.io/aiulian25/boxmedia:1.2.0 -m app.core.crypto genkey /secrets/boxmedia-new.key
+  ghcr.io/aiulian25/boxmedia:1.2.1 -m app.core.crypto genkey /secrets/boxmedia-new.key
 docker run --rm -v "$PWD/secrets:/secrets" -v "$PWD/data:/data" \
-  --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.2.0 \
+  --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.2.1 \
   -m app.core.crypto rotate /secrets/boxmedia.key /secrets/boxmedia-new.key /data
 
 # 3. Point BM_ENCRYPTION_KEY_FILE (or the compose mount) at the new key, then start.
