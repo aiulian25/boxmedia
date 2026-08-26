@@ -27,6 +27,7 @@ derived from a TMDB request leaves this package without going through `redact` f
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,6 +65,20 @@ TRAKT_API_VERSION = "2"
 USER_AGENT = f"BoxMedia/{__version__} (+https://github.com/aiulian25/boxmedia)"
 
 PROBE_TIMEOUT_SECONDS = 4.0
+
+DISCOVER_CACHE_SCHEMA_VERSION = 1
+DISCOVER_CACHE_FILENAME = "discover.json"
+TRENDING_KEY = "trending"
+ANTICIPATED_KEY = "anticipated"
+FETCHED_AT_KEY = "fetched_at"
+ROWS = (TRENDING_KEY, ANTICIPATED_KEY)
+# Six hours. Trakt's trending list moves on the scale of a day, and this shelf is a
+# browse surface rather than a status board — refreshing it faster would spend somebody
+# else's rate limit to change the order of two cards.
+DISCOVER_CACHE_TTL_SECONDS = 6 * 60 * 60
+# One page of each row. Six across at two rows deep is what the mockup shows; twenty
+# leaves room for the "hide what I already have" filter to remove some and still fill it.
+DISCOVER_ROW_SIZE = 20
 
 # The same mask the connection cards show. Mirrored rather than imported so a credential
 # store does not depend on the connection store for a UI string; a test pins the two
@@ -227,6 +242,138 @@ class DiscoveryStore:
         if field is None:
             raise DiscoveryError(f"unknown discovery provider: {provider!r}")
         return field
+
+
+@dataclass(frozen=True)
+class DiscoverShow:
+    """One row on a Discover shelf, as fetched.
+
+    Deliberately NOT carrying a resolved state. The plan called for one, and storing it
+    would have been a bug you could see: add a series to Sonarr and its card would keep
+    saying "Wanted" until the next refresh six hours later. State is resolved at RENDER
+    against the library snapshots, which are disk reads the page already pays for — so
+    what is cached here is exactly what came off the network and nothing that can go
+    stale independently of it.
+    """
+
+    tmdb_id: int | None
+    tvdb_id: int | None
+    imdb_id: str | None
+    trakt_id: int | None
+    title: str
+    year: int | None
+    overview: str | None
+    poster_url: str | None
+    rating: float | None = None
+    watchers: int | None = None
+    list_count: int | None = None
+
+    @property
+    def addable(self) -> bool:
+        """Whether Sonarr could take this show without a bridging call."""
+        return self.tvdb_id is not None
+
+    def document(self) -> dict[str, object]:
+        return {
+            "tmdb_id": self.tmdb_id, "tvdb_id": self.tvdb_id, "imdb_id": self.imdb_id,
+            "trakt_id": self.trakt_id, "title": self.title, "year": self.year,
+            "overview": self.overview, "poster_url": self.poster_url,
+            "rating": self.rating, "watchers": self.watchers,
+            "list_count": self.list_count,
+        }
+
+
+def _show_from_document(entry: object) -> DiscoverShow | None:
+    """One stored row back into a record, or None when it is not one.
+
+    Tolerant: this is a cache. A row a newer build wrote with a field this one does not
+    know simply loses that field rather than poisoning the shelf.
+    """
+    if not isinstance(entry, dict):
+        return None
+    title = entry.get("title")
+    if not isinstance(title, str) or not title:
+        return None
+
+    def integer(key: str) -> int | None:
+        value = entry.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def text(key: str) -> str | None:
+        value = entry.get(key)
+        return value if isinstance(value, str) and value else None
+
+    rating = entry.get("rating")
+    return DiscoverShow(
+        tmdb_id=integer("tmdb_id"), tvdb_id=integer("tvdb_id"), imdb_id=text("imdb_id"),
+        trakt_id=integer("trakt_id"), title=title, year=integer("year"),
+        overview=text("overview"), poster_url=text("poster_url"),
+        rating=(
+            float(rating)
+            if isinstance(rating, int | float) and not isinstance(rating, bool)
+            else None
+        ),
+        watchers=integer("watchers"), list_count=integer("list_count"),
+    )
+
+
+class DiscoverCache:
+    """The last fetched Discover shelves on disk.
+
+    The page renders from here and ONLY from here. Every external call lives in the
+    Refresh action, so no page load can be held open by a third party having a bad day —
+    which is the difference between a slow shelf and a slow app.
+    """
+
+    def __init__(self, cache_dir: Path) -> None:
+        self._path = cache_dir / DISCOVER_CACHE_FILENAME
+
+    def _document(self) -> dict:
+        if not self._path.exists():
+            return {}
+        try:
+            return filestore.read_json(
+                self._path, expected_version=DISCOVER_CACHE_SCHEMA_VERSION
+            )
+        except (ValueError, OSError):
+            # Including a stamp from a newer build. Losing this costs one Refresh.
+            return {}
+
+    def save(self, rows: dict[str, tuple[DiscoverShow, ...]]) -> None:
+        document: dict[str, object] = {FETCHED_AT_KEY: time.time()}
+        for name in ROWS:
+            document[name] = [show.document() for show in rows.get(name, ())]
+        filestore.write_json(
+            self._path, document, schema_version=DISCOVER_CACHE_SCHEMA_VERSION
+        )
+
+    def load(self) -> dict[str, tuple[DiscoverShow, ...]]:
+        """Both shelves. Empty rows when nothing is cached, which the page renders as an
+        honest "nothing fetched yet" rather than as a failure."""
+        document = self._document()
+        loaded = {}
+        for name in ROWS:
+            stored = document.get(name)
+            entries = stored if isinstance(stored, list) else []
+            loaded[name] = tuple(
+                show for show in (_show_from_document(row) for row in entries) if show
+            )
+        return loaded
+
+    def fetched_at(self) -> float | None:
+        """When the shelves were last filled, or None if never."""
+        value = self._document().get(FETCHED_AT_KEY)
+        return float(value) if isinstance(value, int | float) else None
+
+    def is_stale(self, ttl_seconds: float = DISCOVER_CACHE_TTL_SECONDS) -> bool:
+        """Whether it is worth asking again. Never-fetched counts as stale."""
+        fetched_at = self.fetched_at()
+        return fetched_at is None or (time.time() - fetched_at) > ttl_seconds
+
+    def forget(self) -> None:
+        """Drop the shelves — used when the credentials that filled them are removed, so
+        a page cannot keep showing rows fetched with a key that no longer exists."""
+        self._path.unlink(missing_ok=True)
 
 
 class ProbeResult:

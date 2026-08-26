@@ -27,7 +27,7 @@ from app.services.apps import AppsStore
 from app.services.backfill import BackfillRunner
 from app.services.backup import BackupService
 from app.services.corrections import CorrectionStore
-from app.services.discovery import DiscoveryStore
+from app.services.discovery import DiscoverCache, DiscoveryStore
 from app.services.filters import FiltersStore
 from app.services.ignore import IgnoreStore
 from app.services.mediaserver import MediaServerLibraryCache, MediaServerStore
@@ -40,7 +40,7 @@ from app.services.scheduler import BoxMediaScheduler
 from app.services.series import SeriesLibraryCache
 from app.services.sonarr_options import SonarrOptionsCache
 from app.services.users import UserStore
-from app.web import auth, dashboard, deps, movies, profile, reports, security_page
+from app.web import auth, dashboard, deps, discover, movies, profile, reports, security_page
 from app.web import settings as settings_routes
 
 HEALTH_PATH = "/health"
@@ -156,6 +156,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.media_server = MediaServerStore(settings.config_dir, key=encryption_key, audit=audit)
     app.state.media_server_cache = MediaServerLibraryCache(settings.cache_dir)
+    # The two Trakt shelves. The Discover page renders from here and only from here.
+    app.state.discover_cache = DiscoverCache(settings.cache_dir)
     # What each Sonarr holds, so a Discover card never waits on a live round trip.
     app.state.series_cache = SeriesLibraryCache(settings.cache_dir)
     app.state.media_server_backoff = deps.RadarrBackoff()
@@ -208,6 +210,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(settings_routes.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(reports.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(dashboard.router, prefix=settings.url_base, dependencies=csrf)
+    app.include_router(discover.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(movies.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(security_page.router, prefix=settings.url_base, dependencies=csrf)
 

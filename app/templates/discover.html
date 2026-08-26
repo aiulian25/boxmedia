@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block title %}Discover{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h2 class="headline-lg">Discover</h2>
+  <p class="subtle">What is doing well this week, in cinemas and on television. Films are ranked by Box Office Mojo, series by Trakt; both are matched against what you already hold.</p>
+</section>
+
+{# Every class on this page already existed. The row headers are the month-leaderboard's
+   (.top-gross-head / -title / -meta), the strips are .gross-strip, the cards are the
+   weekly view's .poster-card, and the chips are .btn-primary / .btn-secondary — which
+   are chip-shaped already and themed for both palettes. Nothing new for Tailwind to
+   find, so nothing here can be purged out of the built stylesheet. #}
+
+{# Real links, not a script filter: the chip row is navigation, so it survives with
+   JavaScript off, is bookmarkable, and the back button does what it should. #}
+<div class="run-actions">
+  {% for option in media_types %}
+  <a class="{% if option == media_type %}btn-primary{% else %}btn-secondary{% endif %}"
+     href="{{ url_base }}{{ discover_path }}?type={{ option }}">
+    {% if option == 'all' %}All{% elif option == 'movies' %}Movies{% else %}TV{% endif %}
+  </a>
+  {% endfor %}
+  {% if keys.has_trakt %}
+  <form method="post" action="{{ url_base }}{{ refresh_path }}" class="run-search">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn-secondary">Refresh</button>
+  </form>
+  {% endif %}
+</div>
+
+{# Persistent, not a toast: a missing credential is a state that lasts until it is fixed,
+   and the page below it is empty because of exactly this. #}
+{% if not keys.ready %}
+<p class="banner-warn" role="status">
+  Television needs two credentials of your own — a <strong>TMDB API key</strong> and a <strong>Trakt client ID</strong>. Add them under <strong>Discovery</strong> in <a href="{{ url_base }}/settings">Settings</a>; {{ brand }} ships none.
+</p>
+{% endif %}
+
+{% if media_type != 'tv' %}
+<section class="top-gross">
+  <div class="top-gross-head">
+    <h3 class="top-gross-title">This week at the box office</h3>
+    <span class="top-gross-meta">
+      {%- if film_week %}Mojo · week {{ film_week }}{% if film_week_date %} · {{ film_week_date }}{% endif %} · domestic
+      {%- else %}Mojo · no week fetched yet{% endif -%}
+    </span>
+  </div>
+  {% if films %}
+  <div class="gross-strip">
+    {% for film in films %}
+    <div class="poster-card">
+      <a class="poster-frame{% if not film.tmdb_id %} poster-frame-plain{% endif %}"
+         {% if film.tmdb_id %}href="{{ url_base }}/movies/{{ film.tmdb_id }}" data-movie="{{ film.tmdb_id }}"{% endif %}>
+        {% if film.poster_local %}
+        <img src="{{ film.poster_local }}" alt="{{ film.title }} poster">
+        {% else %}
+        <div class="poster-empty">Poster</div>
+        {% endif %}
+        <div class="badge">
+          {% if film.state == 'in_sonarr' %}
+          <span class="dot dot-in-library"></span><span>In Library</span>
+          {% else %}
+          <span class="dot dot-wanted"></span><span>Wanted</span>
+          {% endif %}
+        </div>
+        <div class="rank-chip">#{{ film.rank }}</div>
+      </a>
+      <div class="poster-title">{{ film.title }}</div>
+      <div class="poster-meta">
+        <span class="gross">{{ film.meta }}</span>
+        <span class="links">{% if film.imdb_url %}<a href="{{ film.imdb_url }}" target="_blank" rel="noopener noreferrer">IMDB</a>{% endif %}</span>
+      </div>
+      {% if film.facts %}<span class="card-facts" title="{{ film.facts }}">{{ film.facts }}</span>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  {# Not an error: a fresh install simply has no week yet, and the television rows below
+     still work. The two halves are independent on purpose. #}
+  <div class="empty-state">No week fetched yet. Run one under <a href="{{ url_base }}/reports">Weekly Reports</a>.</div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% for row in show_rows %}
+<section class="top-gross">
+  <div class="top-gross-head">
+    <h3 class="top-gross-title">{{ row.title }}</h3>
+    <span class="top-gross-meta">{{ row.source }}</span>
+  </div>
+  {% if row.cards %}
+  <div class="gross-strip">
+    {% for show in row.cards %}
+    <div class="poster-card">
+      <div class="poster-frame poster-frame-plain">
+        {% if show.poster_local %}
+        <img src="{{ show.poster_local }}" alt="{{ show.title }} poster">
+        {% else %}
+        <div class="poster-empty">Poster</div>
+        {% endif %}
+        <div class="badge">
+          {% if show.state == 'in_sonarr' %}
+          <span class="dot dot-in-library"></span><span>In Sonarr</span>
+          {% elif show.state == 'on_server' or show.state == 'maybe_on_server' %}
+          <span class="dot dot-wanted"></span><span>On {{ show.server_name }}</span>
+          {% elif show.state == 'no_tvdb' %}
+          <span class="dot dot-wanted"></span><span>No id</span>
+          {% else %}
+          <span class="dot dot-wanted"></span><span>Wanted</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="poster-title">{{ show.title }}</div>
+      <div class="poster-meta">
+        <span class="gross">{{ show.meta }}</span>
+        <span class="links">{% if show.imdb_url %}<a href="{{ show.imdb_url }}" target="_blank" rel="noopener noreferrer">IMDB</a>{% endif %}</span>
+      </div>
+      {% if show.facts %}<span class="card-facts" title="{{ show.facts }}">{{ show.facts }}</span>{% endif %}
+      {# The two registers this app uses everywhere: green states a fact, amber states a
+         guess and asks you to check it. Each line truncates rather than widening the
+         card, so a longer translation shortens the line instead of breaking the grid. #}
+      {% if show.state == 'in_sonarr' %}
+      <span class="server-hint" title="{{ show.state_text }}">{{ show.state_text }}</span>
+      {% elif show.state == 'on_server' %}
+      <span class="server-hint" title="Your {{ show.server_name }} holds this series (matched by id) — Sonarr does not">Already on {{ show.server_name }}</span>
+      {% elif show.state == 'maybe_on_server' %}
+      <span class="guess-hint" title="A {{ show.server_name }} series of the same name and year — nothing verified it is the same show">Probably on {{ show.server_name }} — verify</span>
+      {% elif show.state == 'no_tvdb' %}
+      <span class="guess-hint" title="Sonarr identifies a series by its TVDB id, and TMDB has none for this show">{{ show.state_text }}</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% elif keys.ready %}
+  <div class="empty-state">Nothing fetched yet — press <strong>Refresh</strong> above.</div>
+  {% endif %}
+</section>
+{% endfor %}
+
+{# The honest footnote, and the reason this page is arranged the way it is. #}
+<p class="field-note">Films are ranked by what they took at the box office; there is no equivalent chart for television, so series are ranked by how many people are watching them on Trakt right now. Nothing on this page is sent anywhere until you ask for it.</p>
+{% endblock %}
