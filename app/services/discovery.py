@@ -85,6 +85,30 @@ def redact(text: object) -> str:
     return _API_KEY_PARAM_RE.sub(rf"\1{REDACTED}", str(text))
 
 
+def scrub(exc: BaseException) -> BaseException:
+    """Neutralise a caught exception before raising our own in its place.
+
+    `raise OurError(...) from None` suppresses the original for a printed traceback, but
+    it does NOT clear `__context__` — the original object is still attached, and anything
+    that walks the chain rather than formatting a traceback (a structured logger, an
+    error reporter, a debugger repr) reads it. For an httpx transport error that object's
+    text is the request URL, which for TMDB carries the key.
+
+    So the original is scrubbed in place: its own message is redacted, and the `Request`
+    httpx hangs off it — whose `.url` carries the key structurally, not just as text — is
+    dropped. The exception is on its way to being discarded either way; this makes it
+    safe to discard sloppily.
+    """
+    exc.args = tuple(redact(arg) if isinstance(arg, str) else arg for arg in exc.args)
+    try:
+        # httpx stores it privately and exposes `.request`, which then raises rather
+        # than answering. That is the right failure for an object nothing should read.
+        exc._request = None  # noqa: SLF001 — deliberately reaching into a doomed object
+    except AttributeError:
+        pass
+    return exc
+
+
 class DiscoveryError(Exception):
     """Base class for discovery-credential failures."""
 
