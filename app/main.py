@@ -27,6 +27,7 @@ from app.services.apps import AppsStore
 from app.services.backfill import BackfillRunner
 from app.services.backup import BackupService
 from app.services.corrections import CorrectionStore
+from app.services.discovery import DiscoveryStore
 from app.services.filters import FiltersStore
 from app.services.ignore import IgnoreStore
 from app.services.mediaserver import MediaServerLibraryCache, MediaServerStore
@@ -147,6 +148,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The Plex trio: connection (token encrypted with the same key as the Radarr
     # ones), the on-disk library snapshot, and its own backoff so a down media server
     # cannot cost every render a timeout.
+    # The user's own TMDB key and Trakt client ID, encrypted with the same key as
+    # every other stored credential. The app ships none of its own.
+    app.state.discovery = DiscoveryStore(
+        settings.config_dir, key=encryption_key, audit=audit
+    )
     app.state.media_server = MediaServerStore(settings.config_dir, key=encryption_key, audit=audit)
     app.state.media_server_cache = MediaServerLibraryCache(settings.cache_dir)
     app.state.media_server_backoff = deps.RadarrBackoff()

@@ -48,6 +48,8 @@ class AuditAction:
     APP_UPDATED = "app_updated"
     APP_REMOVED = "app_removed"
     APP_TESTED = "app_tested"
+    DISCOVERY_KEY_SAVED = "discovery_key_saved"  # noqa: S105 — action name, not a secret
+    DISCOVERY_KEY_REMOVED = "discovery_key_removed"  # noqa: S105 — action name
     MEDIA_SERVER_UPDATED = "media_server_updated"
     MEDIA_SERVER_REMOVED = "media_server_removed"
     MEDIA_SERVER_TESTED = "media_server_tested"

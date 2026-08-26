@@ -505,18 +505,30 @@ def test_the_mirrored_filters_constants_match_the_real_ones() -> None:
 def test_every_schema_stamped_store_is_covered(tmp_path: Path) -> None:
     """A new store added to config/ without an entry here would restore unvalidated.
 
-    Compares the table against what a real backup of a fully populated install holds.
+    The seed list is derived from the stores' OWN filename constants rather than typed
+    out here — hand-listing is what let mediaserver.yml and sonarr_options.yml sit
+    unvalidated: the test only ever checked the files it happened to write, so a store
+    it did not know about could not fail it. Both hold encrypted credentials.
     """
+    from app.services.apps import APPS_FILENAME
     from app.services.backup import _STORE_VERSIONS
+    from app.services.discovery import DISCOVERY_FILENAME
+    from app.services.ignore import IGNORE_FILENAME
+    from app.services.mediaserver import MEDIA_SERVER_FILENAME
+    from app.services.radarr_options import RADARR_OPTIONS_FILENAME
+    from app.services.sonarr_options import SONARR_OPTIONS_FILENAME
 
     settings, key = _make_settings(tmp_path, "coverage")
     audit = AuditLog(settings.logs_dir / "audit.jsonl")
     UserStore(settings.config_dir, audit=audit).bootstrap_if_missing()
     for name, body in (
-        ("apps.yml", "schema_version: 1\napps: []\n"),
+        (APPS_FILENAME, "schema_version: 1\napps: []\n"),
         ("filters.yml", "schema_version: 1\n"),
-        ("ignored.yml", "schema_version: 1\nignored: []\n"),
-        ("radarr_options.yml", "schema_version: 2\nby_app: {}\n"),
+        (IGNORE_FILENAME, "schema_version: 1\nignored: []\n"),
+        (RADARR_OPTIONS_FILENAME, "schema_version: 2\nby_app: {}\n"),
+        (SONARR_OPTIONS_FILENAME, "schema_version: 2\nby_app: {}\n"),
+        (MEDIA_SERVER_FILENAME, "schema_version: 1\nserver: {}\n"),
+        (DISCOVERY_FILENAME, "schema_version: 1\n"),
     ):
         (settings.config_dir / name).write_text(body, encoding="utf-8")
 

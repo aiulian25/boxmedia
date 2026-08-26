@@ -19,6 +19,11 @@ SETTINGS_ACTIONS = {
     "/account/profile",
     "/account/theme",
     "/settings/media-server",
+    # Two credentials you type and then save, like every other card here. Its Test
+    # buttons live in the same form so they can read what was typed, but they are
+    # submit buttons — and the bar posts `new FormData(form)`, which excludes those,
+    # so pressing Save sends the two key fields and nothing else.
+    "/settings/discovery",
     "/settings/filters",
     "/settings/region",
     "/settings/backups/schedule",
@@ -32,6 +37,9 @@ NEVER_BATCHED = {
     "/settings/media-server/remove",
     "/settings/media-server/refresh",
     "/settings/media-server/test",
+    "/settings/discovery/test",
+    "/settings/discovery/tmdb/delete",
+    "/settings/discovery/trakt/delete",
     "/settings/backups/create",
     "/settings/backups/import",
     "/settings/maintenance/prune-posters",
@@ -55,6 +63,10 @@ def _fully_configured(harness: AppHarness) -> dict[str, str]:
 
     harness.activate()
     harness.client.app.state.apps.add(name="Main", url=FIX_RADARR_URL, api_key=RADARR_KEY)
+    harness.client.post(
+        "/settings/discovery",
+        data={"tmdb_key": "a" * 32, "trakt_client_id": "b" * 42},
+    )
     harness.client.post(
         "/settings/media-server",
         data={"url": "http://plex.local:32400", "token": "t" * 20},

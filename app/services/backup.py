@@ -31,7 +31,9 @@ from app import __version__
 from app.core import crypto, filestore
 from app.core.audit import AuditAction, AuditLog
 from app.services.apps import APPS_FILENAME, APPS_SCHEMA_VERSION
+from app.services.discovery import DISCOVERY_FILENAME, DISCOVERY_SCHEMA_VERSION
 from app.services.ignore import IGNORE_FILENAME, IGNORE_SCHEMA_VERSION
+from app.services.mediaserver import MEDIA_SERVER_FILENAME, MEDIA_SERVER_SCHEMA_VERSION
 from app.services.radarr_options import (
     RADARR_OPTIONS_FILENAME,
     RADARR_OPTIONS_SCHEMA_VERSION,
@@ -41,6 +43,7 @@ from app.services.reports import (
     REPORT_FILENAME_SUFFIX,
     REPORT_SCHEMA_VERSION,
 )
+from app.services.sonarr_options import SONARR_OPTIONS_FILENAME
 from app.services.users import USER_FILENAME, USER_SCHEMA_VERSION
 
 BACKUP_PREFIX = "boxmedia-"
@@ -78,6 +81,26 @@ _STORE_VERSIONS = (
         f"{CONFIG_SUBDIR}/{RADARR_OPTIONS_FILENAME}",
         filestore.read_yaml,
         RADARR_OPTIONS_SCHEMA_VERSION,
+    ),
+    # Sonarr's options share Radarr's model and therefore its schema version — see
+    # sonarr_options.py, where the cache is the same class with its own file.
+    (
+        f"{CONFIG_SUBDIR}/{SONARR_OPTIONS_FILENAME}",
+        filestore.read_yaml,
+        RADARR_OPTIONS_SCHEMA_VERSION,
+    ),
+    # Both of these hold ENCRYPTED CREDENTIALS. An archive from a newer build whose
+    # shape this one cannot read must be refused, not half-loaded into the place the
+    # media-server token and the discovery keys live.
+    (
+        f"{CONFIG_SUBDIR}/{MEDIA_SERVER_FILENAME}",
+        filestore.read_yaml,
+        MEDIA_SERVER_SCHEMA_VERSION,
+    ),
+    (
+        f"{CONFIG_SUBDIR}/{DISCOVERY_FILENAME}",
+        filestore.read_yaml,
+        DISCOVERY_SCHEMA_VERSION,
     ),
 )
 

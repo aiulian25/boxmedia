@@ -288,6 +288,77 @@
 </section>
 
 <section class="settings-section">
+  <h3 class="section-title">Discovery</h3>
+  <p class="subtle">Optional, and needed only for <strong>TV</strong>. Series are ranked by Trakt and described by TMDB, so each needs a credential of your own — {{ brand }} ships none. Both are encrypted at rest with the same key as your API keys, and you can change or delete either at any time.</p>
+  <div class="app-card">
+    {# One card, one Save, two independent credentials — the connection cards' shape.
+       Each field says whether something is stored through its placeholder mask, exactly
+       as a saved API Key field does, and neither value is ever rendered: the template is
+       handed booleans, not secrets. #}
+    {# One form carrying both fields AND both Test buttons, exactly as the Add New App
+       card does: a Test has to send what has been TYPED, and a button in a sibling form
+       cannot reach it. `formaction` sends the same body to the probe route instead, and
+       each button carries its own `provider` — a submit button's name/value is part of
+       the submission, so no hidden field is needed and no script builds the request. #}
+    <form method="post" action="{{ url_base }}{{ discovery_path }}" data-settings-form class="app-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div>
+        <label for="tmdb-key">TMDB API key</label>
+        <input id="tmdb-key" name="tmdb_key" type="password"
+               placeholder="{% if discovery.has_tmdb %}{{ discovery.mask }}{% endif %}"
+               autocomplete="off" spellcheck="false">
+        <p class="field-note">themoviedb.org → your account → Settings → API → the <strong>v3</strong> key. Free, and yours.</p>
+        {% if discovery.has_tmdb %}<p class="field-note">Stored — leave blank to keep it.</p>{% endif %}
+      </div>
+      <div>
+        <label for="trakt-id">Trakt client ID</label>
+        <input id="trakt-id" name="trakt_client_id" type="password"
+               placeholder="{% if discovery.has_trakt %}{{ discovery.mask }}{% endif %}"
+               autocomplete="off" spellcheck="false">
+        <p class="field-note">trakt.tv → Settings → Your API Apps → create one → the <strong>client ID</strong>. No Trakt account is connected; only public rankings are read.</p>
+        {% if discovery.has_trakt %}<p class="field-note">Stored — leave blank to keep it.</p>{% endif %}
+      </div>
+      <div class="app-actions">
+        <div class="app-actions-row">
+          {# The verdict lands here, replaced wholesale by a server-rendered fragment —
+             the same slot and the same component the connection cards use. Which key it
+             is about is in the sentence, so one slot serves both buttons. #}
+          <span data-test-result></span>
+          {# Hidden until app.js reveals it. Without JavaScript a plain submit would have
+             to re-render this page with the typed key echoed back into the HTML to avoid
+             making you retype it, so the button is offered only where the fetch exists.
+             Nobody is stranded: Save reports whether the key was accepted. #}
+          <button type="submit" class="btn-ghost" formnovalidate
+                  formaction="{{ url_base }}{{ discovery_test_path }}"
+                  name="provider" value="tmdb" data-test-connection hidden>Test TMDB</button>
+          <button type="submit" class="btn-ghost" formnovalidate
+                  formaction="{{ url_base }}{{ discovery_test_path }}"
+                  name="provider" value="trakt" data-test-connection hidden>Test Trakt</button>
+          <button type="submit" data-form-save class="btn-secondary">Save</button>
+        </div>
+      </div>
+    </form>
+    {# Siblings of the save form, never nested inside it — a form inside a form is
+       invalid HTML and browsers eject the inner one. Deleting is its own button because
+       leaving a field blank means "keep it", and the two must not be one gesture. #}
+    <div class="app-actions-row">
+      {% if discovery.has_tmdb %}
+      <form method="post" action="{{ url_base }}{{ discovery_path }}/tmdb/delete">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-danger">Delete TMDB key</button>
+      </form>
+      {% endif %}
+      {% if discovery.has_trakt %}
+      <form method="post" action="{{ url_base }}{{ discovery_path }}/trakt/delete">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-danger">Delete Trakt ID</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="settings-section">
   <h3 class="section-title">Media Server</h3>
   <p class="subtle">Optional. Connect <strong>Plex</strong> or <strong>Jellyfin</strong> and the weekly cards say when a title is already on your media server — so you don’t add a second copy of something another tool fetched. BoxMedia only ever <strong>reads</strong> it; nothing is written, changed, or deleted there.</p>
   <div class="app-card">

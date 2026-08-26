@@ -42,6 +42,17 @@ from app.services.boxoffice import (
     spans_multiple_years,
     week_chip_label,
 )
+from app.services.discovery import (
+    KEY_MASK,
+    PROVIDER_NAMES,
+    PROVIDER_TMDB,
+    PROVIDER_TRAKT,
+    PROVIDERS,
+    DiscoveryError,
+    ProbeResult,
+    probe_tmdb,
+    probe_trakt,
+)
 from app.services.filters import (
     DEFAULT_BACKUP_INTERVAL_DAYS,
     DEFAULT_BACKUP_KEEP,
@@ -67,7 +78,12 @@ from app.services.mediaserver import (
 )
 from app.services.pipeline import SCRAPE_FAILURE_SUBDIR
 from app.services.posters import POSTER_SUBDIR, POSTER_WIDTH, sized
-from app.services.radarr import RadarrAuthError, RadarrConnectionError, RadarrError
+from app.services.radarr import (
+    RadarrAuthError,
+    RadarrConnectionError,
+    RadarrError,
+    build_verify,
+)
 from app.services.radarr_options import RadarrOptions
 from app.services.reports import Report
 from app.services.sonarr import (
@@ -107,6 +123,8 @@ router = APIRouter()
 SETTINGS_PATH = "/settings"
 TEST_CREDENTIALS_PATH = "/settings/apps/test"
 SERVER_TEST_CREDENTIALS_PATH = "/settings/media-server/test-credentials"
+DISCOVERY_PATH = "/settings/discovery"
+DISCOVERY_TEST_PATH = "/settings/discovery/test"
 # Radarr names itself in /system/status. Sonarr and Lidarr answer the same shape, so
 # without this an "it works" would be a lie about which app answered.
 RADARR_APP_NAME = "radarr"
@@ -169,6 +187,9 @@ class SettingsStatus:
     SETTINGS_SAVED = "settings_saved"
     SETTINGS_SAVE_FAILED = "settings_save_failed"
     SERVER_REFRESH_FAILED = "server_refresh_failed"
+    DISCOVERY_SAVED = "discovery_saved"
+    DISCOVERY_REMOVED = "discovery_removed"
+    DISCOVERY_INVALID = "discovery_invalid"
 
 
 _SUCCESS = "success"
@@ -226,6 +247,12 @@ STATUS_MESSAGES: dict[str, tuple[str, str]] = {
     SettingsStatus.SERVER_REFRESH_FAILED: (
         _ERROR,
         "Could not read the library — check the connection and try Test.",
+    ),
+    SettingsStatus.DISCOVERY_SAVED: (_SUCCESS, "Discovery keys saved."),
+    SettingsStatus.DISCOVERY_REMOVED: (_SUCCESS, "Key deleted."),
+    SettingsStatus.DISCOVERY_INVALID: (
+        _ERROR,
+        "That key could not be saved — check it and try again.",
     ),
     SettingsStatus.SETTINGS_SAVED: (_SUCCESS, "Settings saved."),
     SettingsStatus.SETTINGS_SAVE_FAILED: (
@@ -374,6 +401,11 @@ async def settings_page(request: Request) -> object:
         snapshots=_snapshot_views(request),
         test_credentials_path=TEST_CREDENTIALS_PATH,
         server_test_credentials_path=SERVER_TEST_CREDENTIALS_PATH,
+        # What is configured, never the values — a template that cannot reach a
+        # secret cannot leak one.
+        discovery=request.app.state.discovery.load().public(),
+        discovery_path=DISCOVERY_PATH,
+        discovery_test_path=DISCOVERY_TEST_PATH,
         ignored=ignored,
         app_kinds=[
             {"value": kind, "name": KIND_NAMES[kind], "media": KIND_MEDIA[kind]}
@@ -862,6 +894,100 @@ async def save_media_server(
         AuditAction.MEDIA_SERVER_UPDATED, actor=user.username, source_ip=client_ip(request)
     )
     return _redirect(request, SettingsStatus.SERVER_SAVED)
+
+
+# --- Discovery credentials (TV step 5) ---
+
+
+@router.post(DISCOVERY_PATH)
+def save_discovery_keys(
+    request: Request,
+    tmdb_key: str = Form(""),
+    trakt_client_id: str = Form(""),
+) -> RedirectResponse:
+    """Save whichever of the two credentials was typed.
+
+    Both fields on one card and one Save, like the connection cards: two Save buttons
+    meant filling in both, pressing one, and silently losing the other. A blank field
+    keeps what is stored — the contract every secret field in this app has — so editing
+    one key never forces re-pasting the other. Clearing one is `remove_discovery_key`,
+    its own button, because "leave it alone" and "delete it" must not be one gesture.
+    """
+    current_user(request)
+    store = request.app.state.discovery
+    try:
+        store.save(PROVIDER_TMDB, tmdb_key)
+        store.save(PROVIDER_TRAKT, trakt_client_id)
+    except DiscoveryError:
+        return _redirect(request, SettingsStatus.DISCOVERY_INVALID)
+    return _redirect(request, SettingsStatus.DISCOVERY_SAVED)
+
+
+@router.post(DISCOVERY_PATH + "/{provider}/delete")
+def remove_discovery_key(request: Request, provider: str) -> RedirectResponse:
+    """Forget one credential. The user ruling: these are theirs to remove at any time."""
+    current_user(request)
+    try:
+        request.app.state.discovery.remove(provider)
+    except DiscoveryError:
+        return _redirect(request, SettingsStatus.DISCOVERY_INVALID)
+    return _redirect(request, SettingsStatus.DISCOVERY_REMOVED)
+
+
+@router.post(DISCOVERY_TEST_PATH)
+async def test_discovery_key(
+    request: Request,
+    provider: str = Form(...),
+    tmdb_key: str = Form(""),
+    trakt_client_id: str = Form(""),
+) -> object:
+    """Probe one credential — the typed one if there is one, else the stored one.
+
+    Same contract as the connection Test buttons: authenticated, CSRF-guarded, held for
+    the length of this request, never written to disk or the audit log. Testing what has
+    been TYPED is the point — it is how a key is checked before it is committed to disk,
+    which is the right way round.
+
+    The reply is our own copy in every branch. Nothing either API said is repeated back,
+    and no message here is built from a URL: for TMDB that URL carries the key.
+    """
+    current_user(request)
+    if provider not in PROVIDERS:
+        # The card submits one of two. Anything else is a bug or an attack, and must not
+        # become a probe of an arbitrary credential under a made-up label.
+        return render(
+            request,
+            "_connection_test.html",
+            result={"state": ProbeResult.UNREACHABLE, "version": None, "app_name": "Discovery"},
+        )
+    # Whichever field this button belongs to. Both arrive because both share the card's
+    # one form — that is what lets a key be checked BEFORE it is committed to disk.
+    typed = tmdb_key if provider == PROVIDER_TMDB else trakt_client_id
+    secret = typed.strip()
+    if not secret or secret == KEY_MASK:
+        # Nothing typed: test what is stored, so the button still answers "does the key
+        # I saved last week still work?".
+        secret = request.app.state.discovery.decrypt(provider) or ""
+    app_name = PROVIDER_NAMES[provider]
+    if not secret:
+        return render(
+            request,
+            "_connection_test.html",
+            result={"state": ProbeResult.AUTH, "version": None, "app_name": app_name},
+        )
+    verify = build_verify(
+        tls_verify=request.app.state.settings.outbound_tls_verify,
+        ca_file=str(request.app.state.settings.tls_ca_file)
+        if request.app.state.settings.tls_ca_file
+        else None,
+    )
+    probe = probe_tmdb if provider == PROVIDER_TMDB else probe_trakt
+    state = await probe(secret, verify=verify)
+    return render(
+        request,
+        "_connection_test.html",
+        result={"state": state, "version": None, "app_name": app_name},
+    )
 
 
 @router.post(SERVER_TEST_CREDENTIALS_PATH)

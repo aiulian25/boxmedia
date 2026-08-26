@@ -187,9 +187,19 @@
       // address would say the wrong thing about what is now in the form.
       testSlot.textContent = "";
 
+      // A native submission includes the pressed button's own name/value; `new
+      // FormData(form)` does not. Added back explicitly rather than with FormData's
+      // two-argument form, which is recent enough to leave older browsers silently
+      // posting a body with a field missing. This is how one form can carry two Test
+      // buttons that mean different things — the Discovery card's TMDB and Trakt.
+      var body = new FormData(testForm);
+      if (testButton.name) {
+        body.append(testButton.name, testButton.value);
+      }
+
       fetch(testButton.getAttribute("formaction"), {
         method: "POST",
-        body: new FormData(testForm),
+        body: body,
         credentials: "same-origin",
         headers: { "X-Requested-With": "fetch" }
       })

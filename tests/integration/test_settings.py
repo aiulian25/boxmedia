@@ -798,3 +798,230 @@ def test_a_sonarr_profile_is_vetted_against_the_sonarr_cache(harness: AppHarness
 
     assert SettingsStatus.APP_INVALID in response.headers["location"]
     assert harness.client.app.state.apps.get(app_id).quality_profile_id is None
+
+
+# --- Discovery credentials (TV step 5) ---
+
+TMDB_KEY = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+TRAKT_ID = "Zx-9QwErTyUiOpAsDfGhJkLzXcVbNm1234567890abc"
+TMDB_CONFIG_URL = "https://api.themoviedb.org/3/configuration"
+TRAKT_TRENDING_URL = "https://api.trakt.tv/shows/trending"
+
+
+def _save_keys(harness: AppHarness, tmdb: str = TMDB_KEY, trakt: str = TRAKT_ID) -> None:
+    harness.client.post(
+        "/settings/discovery",
+        data={"tmdb_key": tmdb, "trakt_client_id": trakt},
+        follow_redirects=False,
+    )
+
+
+def test_discovery_keys_are_saved_encrypted_and_never_echoed(harness: AppHarness) -> None:
+    harness.activate()
+    response = harness.client.post(
+        "/settings/discovery",
+        data={"tmdb_key": TMDB_KEY, "trakt_client_id": TRAKT_ID},
+        follow_redirects=False,
+    )
+    assert SettingsStatus.DISCOVERY_SAVED in response.headers["location"]
+
+    page = harness.client.get("/settings").text
+    assert TMDB_KEY not in page
+    assert TRAKT_ID not in page
+    stored = (harness.settings.config_dir / "discovery.yml").read_text(encoding="utf-8")
+    assert TMDB_KEY not in stored
+    assert TRAKT_ID not in stored
+    assert stored.count("gcm:v1:") == 2
+
+
+def test_the_card_says_a_key_is_stored_without_showing_it(harness: AppHarness) -> None:
+    harness.activate()
+    blank = harness.client.get("/settings").text
+    assert "Stored — leave blank to keep it." not in blank
+
+    _save_keys(harness)
+    page = harness.client.get("/settings").text
+    assert page.count("Stored — leave blank to keep it.") == 2
+    # The mask is a placeholder, so the field reads as filled without carrying a value.
+    assert 'name="tmdb_key"' in page
+    assert 'value="' + TMDB_KEY not in page
+
+
+def test_a_blank_field_keeps_the_stored_key(harness: AppHarness) -> None:
+    """Re-saving the card after editing only one key must not wipe the other."""
+    harness.activate()
+    _save_keys(harness)
+
+    harness.client.post(
+        "/settings/discovery",
+        data={"tmdb_key": "", "trakt_client_id": ""},
+        follow_redirects=False,
+    )
+
+    store = harness.client.app.state.discovery
+    assert store.tmdb_key() == TMDB_KEY
+    assert store.trakt_client_id() == TRAKT_ID
+
+
+def test_delete_is_offered_only_once_there_is_something_to_delete(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    assert "Delete TMDB key" not in harness.client.get("/settings").text
+
+    _save_keys(harness)
+    page = harness.client.get("/settings").text
+    assert "Delete TMDB key" in page
+    assert "Delete Trakt ID" in page
+
+
+def test_deleting_one_key_leaves_the_other(harness: AppHarness) -> None:
+    harness.activate()
+    _save_keys(harness)
+
+    response = harness.client.post(
+        "/settings/discovery/tmdb/delete", follow_redirects=False
+    )
+    assert SettingsStatus.DISCOVERY_REMOVED in response.headers["location"]
+
+    store = harness.client.app.state.discovery
+    assert store.tmdb_key() is None
+    assert store.trakt_client_id() == TRAKT_ID
+
+
+@respx.mock
+def test_testing_a_typed_key_probes_it_before_it_is_stored(harness: AppHarness) -> None:
+    """The point of the button: checking a key before committing it to disk is the right
+    way round. So the typed value must reach the probe, not the stored one."""
+    route = respx.get(TMDB_CONFIG_URL).mock(
+        return_value=httpx.Response(200, json={"images": {}})
+    )
+    harness.activate()
+
+    response = harness.client.post(
+        "/settings/discovery/test",
+        data={"provider": "tmdb", "tmdb_key": TMDB_KEY, "trakt_client_id": ""},
+    )
+
+    assert "TMDB responded" in response.text
+    assert route.calls.last.request.url.params["api_key"] == TMDB_KEY
+    # Nothing was stored by testing.
+    assert harness.client.app.state.discovery.tmdb_key() is None
+
+
+@respx.mock
+def test_testing_with_an_empty_field_falls_back_to_the_stored_key(
+    harness: AppHarness,
+) -> None:
+    """So the button still answers "does the key I saved last week still work?"."""
+    route = respx.get(TRAKT_TRENDING_URL).mock(
+        return_value=httpx.Response(200, json=[{"show": {"title": "X"}}])
+    )
+    harness.activate()
+    _save_keys(harness)
+
+    response = harness.client.post(
+        "/settings/discovery/test",
+        data={"provider": "trakt", "tmdb_key": "", "trakt_client_id": ""},
+    )
+
+    assert "Trakt responded" in response.text
+    assert route.calls.last.request.headers["trakt-api-key"] == TRAKT_ID
+
+
+@respx.mock
+def test_a_rejected_key_says_so_in_the_shared_fragment(harness: AppHarness) -> None:
+    respx.get(TMDB_CONFIG_URL).mock(return_value=httpx.Response(401))
+    harness.activate()
+
+    response = harness.client.post(
+        "/settings/discovery/test",
+        data={"provider": "tmdb", "tmdb_key": TMDB_KEY, "trakt_client_id": ""},
+    )
+    assert "TMDB rejected the API key" in response.text
+
+
+@respx.mock
+def test_an_unreachable_provider_says_so(harness: AppHarness) -> None:
+    respx.get(TRAKT_TRENDING_URL).mock(side_effect=httpx.ConnectError("no route"))
+    harness.activate()
+
+    response = harness.client.post(
+        "/settings/discovery/test",
+        data={"provider": "trakt", "tmdb_key": "", "trakt_client_id": TRAKT_ID},
+    )
+    assert "Could not reach it" in response.text
+    assert "Trakt" in response.text
+
+
+def test_testing_with_nothing_typed_and_nothing_stored_is_not_a_probe(
+    harness: AppHarness,
+) -> None:
+    """No respx mock here on purpose: if this made a real request the test would fail
+    on an unmocked call, which is exactly the assertion."""
+    harness.activate()
+
+    response = harness.client.post(
+        "/settings/discovery/test",
+        data={"provider": "tmdb", "tmdb_key": "", "trakt_client_id": ""},
+    )
+    assert "TMDB rejected the API key" in response.text
+
+
+def test_an_unknown_provider_is_refused_rather_than_probed(harness: AppHarness) -> None:
+    """The card submits one of two. Anything else must not become a probe of an
+    arbitrary credential under a made-up label."""
+    harness.activate()
+
+    response = harness.client.post(
+        "/settings/discovery/test",
+        data={"provider": "lastfm", "tmdb_key": TMDB_KEY, "trakt_client_id": ""},
+    )
+    assert "Could not reach it" in response.text
+    assert "Lastfm" not in response.text
+
+
+def test_deleting_an_unknown_provider_changes_nothing(harness: AppHarness) -> None:
+    harness.activate()
+    _save_keys(harness)
+
+    harness.client.post("/settings/discovery/lastfm/delete", follow_redirects=False)
+
+    assert harness.client.app.state.discovery.load().ready is True
+
+
+def test_the_card_names_where_each_credential_comes_from(harness: AppHarness) -> None:
+    """A key you cannot find is a key you cannot enter."""
+    harness.activate()
+    page = harness.client.get("/settings").text
+
+    assert "themoviedb.org" in page
+    assert "trakt.tv" in page
+    assert "<strong>v3</strong>" in page
+    assert "<strong>client ID</strong>" in page
+    # And the honest limit of what Trakt is used for.
+    assert "No Trakt account is connected" in page
+
+
+def test_both_test_buttons_share_one_form_so_they_can_read_the_typed_keys(
+    harness: AppHarness,
+) -> None:
+    """A button in a sibling form cannot reach the fields; formaction sends the same body
+    to the probe route instead. Each button carries its own provider as its name/value,
+    so no hidden field is needed and no script builds the request."""
+    harness.activate()
+    page = harness.client.get("/settings").text
+
+    assert 'name="provider" value="tmdb" data-test-connection' in page
+    assert 'name="provider" value="trakt" data-test-connection' in page
+    assert "/settings/discovery/test" in page
+
+
+def test_the_shared_test_handler_sends_the_pressed_buttons_value() -> None:
+    """`new FormData(form)` drops the submit button's name/value, which a native
+    submission includes — without adding it back, one form with two Test buttons posts a
+    body with no provider at all."""
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[2] / "app/static/js/app.js").read_text()
+    assert "body.append(testButton.name, testButton.value)" in script
