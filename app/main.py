@@ -36,6 +36,7 @@ from app.services.radarr_options import RadarrOptionsCache
 from app.services.release_ids import ReleaseIdCache
 from app.services.reports import ReportsStore
 from app.services.scheduler import BoxMediaScheduler
+from app.services.sonarr_options import SonarrOptionsCache
 from app.services.users import UserStore
 from app.web import auth, dashboard, deps, movies, profile, reports, security_page
 from app.web import settings as settings_routes
@@ -137,6 +138,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ignore = IgnoreStore(settings.config_dir, audit=audit)
     app.state.corrections = CorrectionStore(settings.config_dir)
     app.state.radarr_options = RadarrOptionsCache(settings.config_dir)
+    # Its own file: profile ids are per database, so a glance at sonarr_options.yml
+    # answers what that server offers without reading past a Radarr's entries.
+    app.state.sonarr_options = SonarrOptionsCache(settings.config_dir)
     # Per app instance, not global: a test's dead connection must not silence
     # another's.
     app.state.radarr_backoff = deps.RadarrBackoff()

@@ -214,41 +214,64 @@
     });
   });
 
-  /* Which media server is being configured, said in every field that depends on it.
+  /* Which service is being configured, said in every field that depends on it.
    *
-   * The port in the address, the name of the secret and where to find it all differ
-   * between Plex and Jellyfin. Without this the card would ask for "Token / API key"
-   * and name both ports at once — readable, but it makes the person do the matching.
+   * Two cards ask this question — Plex vs Jellyfin on the media server, Radarr vs
+   * Sonarr on Add New App — and the answer changes the same three kinds of thing: the
+   * port in the address, the name of a field, and where to find the credential. ONE
+   * mechanism, configured twice, so a third service is a config entry rather than a
+   * third copy of this loop.
+   *
    * Every string comes off a data- attribute rendered by the template, so nothing here
-   * invents copy and the no-JavaScript page still names both.
-   */
-  var kindRadios = document.querySelectorAll("[data-server-kind]");
-  if (kindRadios.length) {
-    var applyKind = function (kind) {
-      var url = document.querySelector("#server-url");
-      var label = document.querySelector("[data-secret-label]");
-      var hint = document.querySelector("[data-secret-hint]");
-      if (url) {
-        url.placeholder = url.getAttribute("data-placeholder-" + kind) || url.placeholder;
-      }
-      if (label) {
-        label.textContent = label.getAttribute("data-label-" + kind) || label.textContent;
-      }
-      if (hint) {
-        hint.textContent = hint.getAttribute("data-hint-" + kind) || hint.textContent;
+   * invents copy, nothing is built by string-concatenation, and the no-JavaScript page
+   * still names both options in its static placeholder.
+   *
+   * `textContent`, never innerHTML: these values are template-authored, but writing
+   * markup from script is how that stops being true later. */
+  var wireKindSwap = function (radioAttribute, fields) {
+    var radios = document.querySelectorAll("[" + radioAttribute + "]");
+    if (!radios.length) {
+      return;
+    }
+    var apply = function (kind) {
+      for (var index = 0; index < fields.length; index++) {
+        var field = fields[index];
+        var element = document.querySelector(field.selector);
+        if (!element) {
+          continue;
+        }
+        var value = element.getAttribute(field.prefix + kind);
+        if (!value) {
+          continue;
+        }
+        if (field.property === "placeholder") {
+          element.placeholder = value;
+        } else {
+          element.textContent = value;
+        }
       }
     };
-    Array.prototype.forEach.call(kindRadios, function (radio) {
+    Array.prototype.forEach.call(radios, function (radio) {
       if (radio.checked) {
-        applyKind(radio.value);
+        apply(radio.value);
       }
       radio.addEventListener("change", function () {
         if (radio.checked) {
-          applyKind(radio.value);
+          apply(radio.value);
         }
       });
     });
-  }
+  };
+
+  wireKindSwap("data-server-kind", [
+    { selector: "#server-url", prefix: "data-placeholder-", property: "placeholder" },
+    { selector: "[data-secret-label]", prefix: "data-label-", property: "text" },
+    { selector: "[data-secret-hint]", prefix: "data-hint-", property: "text" }
+  ]);
+  wireKindSwap("data-app-kind", [
+    { selector: "#new-url", prefix: "data-placeholder-", property: "placeholder" },
+    { selector: "[data-app-hint]", prefix: "data-hint-", property: "text" }
+  ]);
 
   /* One Save for the whole Settings page.
    *

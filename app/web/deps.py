@@ -21,7 +21,13 @@ from fastapi.templating import Jinja2Templates
 
 from app.core import security
 from app.core.sessions import COOKIE_NAME
-from app.services.apps import ExternalApp, client_for_credentials
+from app.services.apps import (
+    KIND_SONARR,
+    ExternalApp,
+    InvalidAppError,
+    client_for_credentials,
+    sonarr_client_for_credentials,
+)
 from app.services.mediaserver import (
     LIBRARY_CACHE_TTL_SECONDS,
     RENDER_FETCH_TIMEOUT_SECONDS,
@@ -32,6 +38,7 @@ from app.services.mediaserver import (
 from app.services.posters import POSTER_WIDTH, sized
 from app.services.radarr import RadarrClient, RadarrError, RadarrMovie
 from app.services.radarr_options import RadarrOptions, fetch_options
+from app.services.sonarr import SonarrClient, SonarrError
 from app.services.users import THEME_DARK, User
 
 BRAND_NAME = "BoxMedia"
@@ -261,6 +268,37 @@ def radarr_client_for(
     )
 
 
+def sonarr_client_for(
+    request: Request, app_id: str, *, timeout: float | None = None
+) -> SonarrClient:
+    """The Sonarr twin of `radarr_client_for` — one place for the TLS dance."""
+    settings = request.app.state.settings
+    return request.app.state.apps.build_sonarr_client(
+        app_id,
+        tls_verify=settings.outbound_tls_verify,
+        ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+        timeout=timeout,
+    )
+
+
+def sonarr_client_for_credentials_dep(
+    request: Request, url: str, api_key: str, *, timeout: float | None = None
+) -> SonarrClient:
+    """The Sonarr twin of `radarr_client_for_credentials`, for the pre-save test.
+
+    The outbound-TLS settings are the app's own rather than anything the form can
+    influence — a page must not be able to talk BoxMedia out of verifying a certificate.
+    """
+    settings = request.app.state.settings
+    return sonarr_client_for_credentials(
+        url,
+        api_key,
+        tls_verify=settings.outbound_tls_verify,
+        ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+        timeout=timeout,
+    )
+
+
 def radarr_client_for_credentials(
     request: Request, url: str, api_key: str, *, timeout: float | None = None
 ) -> RadarrClient:
@@ -396,6 +434,46 @@ async def load_radarr_options(request: Request, app_id: str | None = None) -> Ra
     if options != cache.load(app_id):
         cache.save(app_id, options)
     return options
+
+
+async def load_sonarr_options(request: Request, app_id: str) -> RadarrOptions:
+    """Live profiles/folders from one Sonarr, falling back to that connection's cache.
+
+    The Radarr twin above, sharing its backoff — connection ids are unique across kinds,
+    so one failure map covers both and a Sonarr that is down costs the same one probe.
+    Same shape because a profile and a folder are the same concept on both servers; see
+    `sonarr_options.py` for why they still get their own file.
+    """
+    cache = request.app.state.sonarr_options
+    if radarr_backoff(request).should_skip(app_id):
+        return cache.load(app_id)  # the same fallback the failure path returns
+    try:
+        client = sonarr_client_for(request, app_id, timeout=RADARR_OPTIONS_TIMEOUT_SECONDS)
+        options = await asyncio.wait_for(
+            fetch_options(client), timeout=RADARR_OPTIONS_TIMEOUT_SECONDS
+        )
+    except (SonarrError, TimeoutError, KeyError, InvalidAppError):
+        radarr_backoff(request).note_failure(app_id)
+        return cache.load(app_id)
+    radarr_backoff(request).note_success(app_id)
+    # Only rewrite the cache when the options actually changed — otherwise every page
+    # view churns sonarr_options.yml under the global filestore write lock for nothing.
+    if options != cache.load(app_id):
+        cache.save(app_id, options)
+    return options
+
+
+async def load_all_sonarr_options(request: Request) -> dict[str, RadarrOptions]:
+    """Every Sonarr connection's options, fetched concurrently.
+
+    Its own gather rather than joining the Radarr one: the two build different clients,
+    and one slow server should cost the timeout, not the sum.
+    """
+    apps = request.app.state.apps.list_apps(KIND_SONARR)
+    if not apps:
+        return {}
+    results = await asyncio.gather(*[load_sonarr_options(request, app.id) for app in apps])
+    return dict(zip([app.id for app in apps], results, strict=True))
 
 
 async def load_all_radarr_options(request: Request) -> dict[str, RadarrOptions]:

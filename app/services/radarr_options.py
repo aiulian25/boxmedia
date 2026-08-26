@@ -52,10 +52,16 @@ async def fetch_options(client: object) -> RadarrOptions:
 
 
 class RadarrOptionsCache:
-    """Last-known profiles and root folders, per connection."""
+    """Last-known profiles and root folders, per connection.
 
-    def __init__(self, config_dir: Path) -> None:
-        self._path = config_dir / RADARR_OPTIONS_FILENAME
+    `filename` exists so Sonarr can keep its own cache file without a second copy of
+    this class: profiles and root folders are the same concept on both servers, and
+    `fetch_options` above already asks a client for them rather than knowing which one
+    it is. See `sonarr_options.py`.
+    """
+
+    def __init__(self, config_dir: Path, *, filename: str = RADARR_OPTIONS_FILENAME) -> None:
+        self._path = config_dir / filename
 
     def _load_all(self) -> dict[str, RadarrOptions]:
         if not self._path.exists():

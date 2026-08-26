@@ -93,7 +93,7 @@
 
 <section class="settings-section">
   <h3 class="section-title">External Apps</h3>
-  <p class="subtle">Radarr connections. API keys are encrypted at rest; leave the key blank to keep it unchanged. The <strong>primary</strong> connection is the one weekly runs and every Add to Radarr use.</p>
+  <p class="subtle">Radarr connections fetch films, Sonarr connections fetch series. API keys are encrypted at rest; leave the key blank to keep it unchanged. The <strong>primary</strong> connection of each kind is the one weekly runs and every Add use.</p>
 
   {% for app in apps %}
   <div class="app-card">
@@ -104,14 +104,18 @@
     {% set state = health.get(app.id) %}
     {% if state == 'ok' %}
     <div class="app-health app-health-ok">
-      <span class="dot dot-connected animate-pulse"></span><span>Connected — Radarr is responding</span>
+      <span class="dot dot-connected animate-pulse"></span><span>Connected — {{ app.kind_name }} is responding</span>
     {% elif state == 'auth' %}
     <div class="app-health app-health-auth">
       <span class="dot dot-failed"></span><span>API key rejected — update the API Key below and Save</span>
     {% else %}
     <div class="app-health app-health-unreachable">
-      <span class="dot dot-failed"></span><span>Unreachable — check the address, that Radarr is running, and TLS</span>
+      <span class="dot dot-failed"></span><span>Unreachable — check the address, that {{ app.kind_name }} is running, and TLS</span>
     {% endif %}
+      {# Which server this card is, always — the fields below differ between them, and
+         a row of look-alike cards with only the address to tell them apart is how
+         someone edits the wrong one. Primary is per kind, so both tags can be true. #}
+      <span class="tag">{{ app.kind_name }}</span>
       {% if app.primary %}<span class="tag">Primary</span>{% endif %}
     </div>
     <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}" data-settings-form class="app-grid">
@@ -131,7 +135,9 @@
       {# Same form as the identity fields above: one card, one Save. Its own values,
          because a profile id and a folder path mean nothing on another instance. #}
       <div>
-        <label for="dq-{{ app.id }}">Adds as</label>
+        {# Named for what this connection actually adds, so a Sonarr card never says
+           "film". One label, two words, rather than two near-identical cards. #}
+        <label for="dq-{{ app.id }}">Adds {{ 'series' if app.kind == 'sonarr' else 'films' }} as</label>
         {% if app.options.profiles %}
         <select id="dq-{{ app.id }}" name="quality_profile_id" class="select-field">
           {% for profile in app.options.profiles %}
@@ -151,9 +157,42 @@
           {% endfor %}
         </select>
         {% else %}
-        <input id="df-{{ app.id }}" name="root_folder" type="text" value="{{ app.root_folder or '' }}" placeholder="/movies">
+        <input id="df-{{ app.id }}" name="root_folder" type="text" value="{{ app.root_folder or '' }}" placeholder="{{ '/tv' if app.kind == 'sonarr' else '/movies' }}">
         {% endif %}
       </div>
+      {# Sonarr's three, and only Sonarr's: a film has no seasons and no series type.
+         Absent from a Radarr card entirely rather than disabled, so there is nothing to
+         wonder about. `_validated_defaults` drops them server-side for a Radarr anyway,
+         so a crafted form cannot write them onto one. #}
+      {% if app.kind == 'sonarr' %}
+      <div>
+        <label for="st-{{ app.id }}">Series type</label>
+        <select id="st-{{ app.id }}" name="series_type" class="select-field">
+          {% for value in series_types %}
+          <option value="{{ value }}" {% if value == (app.series_type or 'standard') %}selected{% endif %}>{{ value | capitalize }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {# Spans the grid so two long labels wrap onto their own lines instead of squeezing
+         a column — the same reason the media-server kind fieldset spans it, and what
+         keeps a longer translation of "Search for missing episodes…" from widening the
+         card. `.theme-choice`/`.theme-option` reused rather than a new pair: it is
+         already the app's checkbox-and-label row, already themed, and already compiled
+         into the stylesheet, so this needs no new class for Tailwind to find. #}
+      <div class="app-grid-full">
+        <fieldset class="theme-choice">
+          <legend>Adding a series</legend>
+          <label class="theme-option" for="sf-{{ app.id }}">
+            <input id="sf-{{ app.id }}" name="season_folders" type="checkbox" {% if app.season_folders is not false %}checked{% endif %}>
+            <span>Use season folders</span>
+          </label>
+          <label class="theme-option" for="soa-{{ app.id }}">
+            <input id="soa-{{ app.id }}" name="search_on_add" type="checkbox" {% if app.search_on_add is not false %}checked{% endif %}>
+            <span>Search for missing episodes on add</span>
+          </label>
+        </fieldset>
+      </div>
+      {% endif %}
       <div class="app-actions">
         <button type="submit" data-form-save class="btn-secondary">Save</button>
       </div>
@@ -182,6 +221,22 @@
     <h4 class="section-subtitle">Add New App</h4>
     <form method="post" action="{{ url_base }}/settings/apps" class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      {# The choice comes FIRST and spans the card, because what the address looks like
+         and what the connection can hold both depend on the answer — the same reasoning,
+         and the same fieldset, the Media Server card uses for Plex vs Jellyfin. Radios
+         rather than a select: two named choices, and the one in effect is readable
+         without opening anything. A second service must never mean a second pattern. #}
+      <div class="app-grid-full">
+        <fieldset class="theme-choice">
+          <legend>Which app</legend>
+          {% for kind in app_kinds %}
+          <label class="theme-option">
+            <input type="radio" name="kind" value="{{ kind.value }}" data-app-kind {% if loop.first %}checked{% endif %}>
+            <span>{{ kind.name }} — {{ kind.media }}</span>
+          </label>
+          {% endfor %}
+        </fieldset>
+      </div>
       <div>
         <label for="new-name">App Name</label>
         <input id="new-name" name="name" type="text" placeholder="Local, Remote 4K, Pizza…" maxlength="{{ max_app_name_length }}" required>
@@ -191,16 +246,28 @@
         {% if apps %}
         <p class="field-note">How you’ll pick it when sending a title. Rename it any time.</p>
         {% else %}
-        <p class="field-note">Have fun with it — you can rename it any time, and a memorable name is how you’ll tell them apart if you add another Radarr later.</p>
+        <p class="field-note">Have fun with it — you can rename it any time, and a memorable name is how you’ll tell them apart if you add another later.</p>
         {% endif %}
       </div>
       <div>
         <label for="new-url">Address</label>
-        <input id="new-url" name="url" type="text" placeholder="192.168.1.100:7878 or https://radarr.example" required>
+        {# Both defaults named, so the port that is right for the chosen app is in front
+           of the person choosing it. app.js narrows this to one once a kind is picked;
+           without it the line still names both, exactly as the media-server card does. #}
+        <input id="new-url" name="url" type="text"
+               data-placeholder-radarr="192.168.1.100:7878 or https://radarr.example"
+               data-placeholder-sonarr="192.168.1.100:8989 or https://sonarr.example"
+               placeholder="Radarr 192.168.1.100:7878 · Sonarr 192.168.1.100:8989" required>
       </div>
       <div>
         <label for="new-key">API Key</label>
         <input id="new-key" name="api_key" type="password" required>
+        {# Where to find it, for whichever app is selected — both named without
+           JavaScript, narrowed to one with it. Same data-hint-<kind> mechanic as the
+           media-server card's secret hint. #}
+        <p class="field-note" data-app-hint
+           data-hint-radarr="Radarr: Settings → General → Security → API Key."
+           data-hint-sonarr="Sonarr: Settings → General → Security → API Key.">Settings → General → Security → API Key, in whichever app you picked.</p>
       </div>
       <div class="app-actions">
         <div class="app-actions-row add-actions">

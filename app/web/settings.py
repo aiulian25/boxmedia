@@ -18,7 +18,15 @@ from fastapi.responses import FileResponse, RedirectResponse
 from app.core.audit import AuditAction
 from app.core.filestore import dir_size_bytes
 from app.services import boxoffice
-from app.services.apps import APP_KINDS, KIND_RADARR, MAX_APP_NAME_LENGTH, InvalidAppError
+from app.services.apps import (
+    APP_KINDS,
+    KIND_MEDIA,
+    KIND_NAMES,
+    KIND_RADARR,
+    KIND_SONARR,
+    MAX_APP_NAME_LENGTH,
+    InvalidAppError,
+)
 from app.services.backup import (
     MAX_UPLOAD_BYTES,
     BackupCorruptError,
@@ -62,17 +70,29 @@ from app.services.posters import POSTER_SUBDIR, POSTER_WIDTH, sized
 from app.services.radarr import RadarrAuthError, RadarrConnectionError, RadarrError
 from app.services.radarr_options import RadarrOptions
 from app.services.reports import Report
+from app.services.sonarr import (
+    APP_NAME as SONARR_APP_NAME,
+)
+from app.services.sonarr import (
+    SERIES_TYPES,
+    SonarrAuthError,
+    SonarrConnectionError,
+    SonarrError,
+)
 from app.web.deps import (
     MEDIA_SERVER_BACKOFF_KEY,
     client_ip,
     current_user,
     format_timestamp,
     load_all_radarr_options,
+    load_all_sonarr_options,
     optional_int,
     radarr_backoff,
     radarr_client_for,
     radarr_client_for_credentials,
     render,
+    sonarr_client_for,
+    sonarr_client_for_credentials_dep,
 )
 from app.web.profile import (
     MAX_DISPLAY_NAME_LENGTH,
@@ -302,9 +322,13 @@ async def settings_page(request: Request) -> object:
     # still the one in charge, and the badge has to say so. One per kind — which Radarr
     # the weekly run talks to and which Sonarr takes a series are separate answers.
     primary_by_kind = {kind: request.app.state.apps.primary_id(kind) for kind in APP_KINDS}
-    # Each connection's own profiles/folders — Radarr assigns profile ids per database,
-    # so one shared list would offer the wrong quality for the other instance.
-    options_by_app = await load_all_radarr_options(request)
+    # Each connection's own profiles/folders — both servers assign profile ids per
+    # database, so one shared list would offer the wrong quality for another instance.
+    # Both kinds are gathered together so the page costs one wall, not two in sequence.
+    radarr_options, sonarr_options = await asyncio.gather(
+        load_all_radarr_options(request), load_all_sonarr_options(request)
+    )
+    options_by_app = {**radarr_options, **sonarr_options}
     apps = []
     # The one caller that wants every kind: this page is where connections are managed,
     # so one invisible here would be one nobody could edit or remove.
@@ -351,6 +375,11 @@ async def settings_page(request: Request) -> object:
         test_credentials_path=TEST_CREDENTIALS_PATH,
         server_test_credentials_path=SERVER_TEST_CREDENTIALS_PATH,
         ignored=ignored,
+        app_kinds=[
+            {"value": kind, "name": KIND_NAMES[kind], "media": KIND_MEDIA[kind]}
+            for kind in APP_KINDS
+        ],
+        series_types=SERIES_TYPES,
         first_run=not apps,
         banner_kind=banner[0] if banner else None,
         banner_text=banner[1] if banner else None,
@@ -436,22 +465,39 @@ def _storage_view(request: Request) -> list[dict[str, str]]:
 
 
 async def _connection_health(request: Request, apps: list[dict]) -> dict[str, str]:
-    """Probe every configured connection concurrently; best-effort, never raises."""
+    """Probe every configured connection concurrently; best-effort, never raises.
+
+    Concurrently and not in sequence so the page costs one 4s wall in total rather than
+    one per connection — the reason that mattered for two Radarrs matters more now that
+    a Sonarr can sit beside them.
+    """
     if not apps:
         return {}
-    states = await asyncio.gather(*[_probe(request, app["id"]) for app in apps])
+    states = await asyncio.gather(
+        *[_probe(request, app["id"], app.get("kind", KIND_RADARR)) for app in apps]
+    )
     return {app["id"]: state for app, state in zip(apps, states, strict=True)}
 
 
-async def _probe(request: Request, app_id: str) -> str:
+async def _probe(request: Request, app_id: str, kind: str = KIND_RADARR) -> str:
+    """Is this connection answering? Same 4s wall for both kinds.
+
+    Kind-aware because the two build different clients — and because a Sonarr probed
+    with a Radarr client would answer `/system/status` happily and go green, which is
+    exactly the wrong-address mistake this dot exists to catch.
+    """
+    build = sonarr_client_for if kind == KIND_SONARR else radarr_client_for
     try:
-        client = radarr_client_for(request, app_id, timeout=HEALTH_TIMEOUT_SECONDS)
+        client = build(request, app_id, timeout=HEALTH_TIMEOUT_SECONDS)
         # Hard wall-time bound so even slow DNS on an unresolvable host can't stall
         # the Settings page (httpx's timeout does not cover name resolution).
         await asyncio.wait_for(client.system_status(), timeout=HEALTH_TIMEOUT_SECONDS)
-    except RadarrAuthError:
+    except (RadarrAuthError, SonarrAuthError):
         return AppHealth.AUTH
-    except (RadarrConnectionError, RadarrError, TimeoutError):
+    except (
+        RadarrConnectionError, RadarrError, SonarrConnectionError, SonarrError,
+        TimeoutError, InvalidAppError,
+    ):
         return AppHealth.UNREACHABLE
     return AppHealth.OK
 
@@ -472,6 +518,8 @@ class TestResult:
     AUTH = "auth"
     UNREACHABLE = "unreachable"
     BAD_URL = "bad_url"
+    # "Something answered and spoke the API, but it is not the app you picked." The name
+    # is historical — it now covers a Sonarr card pointed at a Radarr just as well.
     NOT_RADARR = "not_radarr"
 
 
@@ -480,6 +528,7 @@ async def test_credentials(
     request: Request,
     url: str = Form(...),
     api_key: str = Form(...),
+    kind: str = Form(KIND_RADARR),
 ) -> object:
     """Probe a connection the user has typed but not saved. Stores nothing.
 
@@ -488,38 +537,59 @@ async def test_credentials(
     disk or to the audit log. The reply is our own copy in every branch: nothing the
     remote host said is repeated back, since an error page from an unknown address is not
     text this app relays.
+
+    One route for both kinds rather than a second one beside it: the contract, the
+    bound, and the fragment are identical, and only which client gets built differs.
     """
     current_user(request)
-    result = await _test_credentials(request, url, api_key)
+    result = await _test_credentials(request, url, api_key, kind)
     return render(request, "_connection_test.html", result=result)
 
 
-async def _test_credentials(request: Request, url: str, api_key: str) -> dict[str, str | None]:
+async def _test_credentials(
+    request: Request, url: str, api_key: str, kind: str = KIND_RADARR
+) -> dict[str, str | None]:
+    # An unknown kind is not a reason to guess: the form only ever submits one of two,
+    # so anything else is a bug or an attack and gets the same answer a bad address does.
+    if kind not in APP_KINDS:
+        return {"state": TestResult.BAD_URL, "version": None, "app_name": KIND_NAMES[KIND_RADARR]}
+    app_name = KIND_NAMES[kind]
+    result: dict[str, str | None] = {"state": TestResult.OK, "version": None, "app_name": app_name}
     try:
-        client = radarr_client_for_credentials(
-            request, url, api_key, timeout=HEALTH_TIMEOUT_SECONDS
+        build = (
+            sonarr_client_for_credentials_dep
+            if kind == KIND_SONARR
+            else radarr_client_for_credentials
         )
+        client = build(request, url, api_key, timeout=HEALTH_TIMEOUT_SECONDS)
         # Same hard wall-time bound as the on-load probes: httpx's own timeout does not
         # cover name resolution, so an unresolvable host would otherwise hold the request.
         status = await asyncio.wait_for(
             client.system_status(), timeout=HEALTH_TIMEOUT_SECONDS
         )
     except InvalidAppError:
-        return {"state": TestResult.BAD_URL, "version": None}
-    except RadarrAuthError:
-        return {"state": TestResult.AUTH, "version": None}
-    except (RadarrConnectionError, RadarrError, TimeoutError):
-        return {"state": TestResult.UNREACHABLE, "version": None}
-    if not _is_radarr(status):
-        return {"state": TestResult.NOT_RADARR, "version": None}
-    return {"state": TestResult.OK, "version": _version_of(status)}
+        return {**result, "state": TestResult.BAD_URL}
+    except (RadarrAuthError, SonarrAuthError):
+        return {**result, "state": TestResult.AUTH}
+    except (RadarrConnectionError, RadarrError, SonarrConnectionError, SonarrError, TimeoutError):
+        return {**result, "state": TestResult.UNREACHABLE}
+    if not _names_itself(status, kind):
+        return {**result, "state": TestResult.NOT_RADARR}
+    return {**result, "version": _version_of(status)}
 
 
-def _is_radarr(status: object) -> bool:
-    """Radarr names itself in /system/status; Sonarr and Lidarr answer the same shape."""
+def _names_itself(status: object, kind: str) -> bool:
+    """Did the app that answered say it is the one the card is for?
+
+    Radarr, Sonarr and Lidarr all answer `/system/status` with the same shape, so the
+    name is the only thing distinguishing them — and pointing a Sonarr card at a Radarr
+    is exactly as easy a mistake as the reverse. Without this the dot goes green and
+    every later call fails somewhere confusing.
+    """
     if not isinstance(status, dict):
         return False
-    return str(status.get("appName", "")).strip().casefold() == RADARR_APP_NAME
+    expected = SONARR_APP_NAME if kind == KIND_SONARR else RADARR_APP_NAME
+    return str(status.get("appName", "")).strip().casefold() == expected
 
 
 def _version_of(status: dict) -> str | None:
@@ -538,23 +608,28 @@ async def add_app(
     name: str = Form(...),
     url: str = Form(...),
     api_key: str = Form(...),
+    kind: str = Form(KIND_RADARR),
 ) -> RedirectResponse:
     """Save a connection, then say whether it actually answers.
 
-    The test is not a gate: a Radarr that is switched off, or not built yet, is still
+    The test is not a gate: a server that is switched off, or not built yet, is still
     worth configuring. But adding one that cannot work should never look like success,
     and this is the path that holds with JavaScript off, where the Add form's own Test
     button is not offered.
+
+    `kind` defaults to Radarr so a form from before the radio existed — or one submitted
+    with the field stripped — still adds what it always added. `add` itself refuses an
+    unknown value, so nothing invented gets stored.
     """
     current_user(request)
     try:
-        app = request.app.state.apps.add(name=name, url=url, api_key=api_key)
+        app = request.app.state.apps.add(name=name, url=url, api_key=api_key, kind=kind)
     except InvalidAppError:
         return _redirect(request, SettingsStatus.APP_INVALID)
     # A brand-new id cannot be backed off, but clearing is what keeps that true if an id
     # is ever reused — and it costs nothing.
     radarr_backoff(request).note_success(app.id)
-    return _redirect(request, _ADDED_STATUS[await _probe(request, app.id)])
+    return _redirect(request, _ADDED_STATUS[await _probe(request, app.id, app.kind)])
 
 
 @router.post("/settings/apps/{app_id}")
@@ -566,17 +641,27 @@ def update_app(
     api_key: str = Form(""),
     quality_profile_id: str = Form(""),
     root_folder: str = Form(""),
+    series_type: str = Form(""),
+    season_folders: str = Form(""),
+    search_on_add: str = Form(""),
 ) -> RedirectResponse:
     """Everything about one connection, saved together.
 
     Identity and defaults share a route because they share a card: two Save buttons meant
     editing the name and the quality, pressing one, and silently losing the other.
 
-    The defaults are vetted against what THIS Radarr reported, so a profile id from
+    The defaults are vetted against what THIS server reported, so a profile id from
     another instance's database can never be stored against it.
+
+    The last three are Sonarr's and arrive empty from every Radarr card, where the fields
+    do not exist. `_validated_defaults` drops them for a Radarr connection rather than
+    trusting the form not to send them.
     """
     current_user(request)
-    defaults = _validated_defaults(request, app_id, quality_profile_id, root_folder)
+    defaults = _validated_defaults(
+        request, app_id, quality_profile_id, root_folder,
+        series_type=series_type, season_folders=season_folders, search_on_add=search_on_add,
+    )
     if defaults is None:
         return _redirect(request, SettingsStatus.APP_INVALID)
     try:
@@ -593,18 +678,28 @@ def update_app(
 
 
 def _validated_defaults(
-    request: Request, app_id: str, quality_profile_id: str, root_folder: str
+    request: Request,
+    app_id: str,
+    quality_profile_id: str,
+    root_folder: str,
+    *,
+    series_type: str = "",
+    season_folders: str = "",
+    search_on_add: str = "",
 ) -> dict[str, object] | None:
-    """The add-as quality and folder for one connection, or None when either is one that
+    """The add-as defaults for one connection, or None when any value is one that
     connection is known NOT to offer.
 
     Vetted against the cached options only when there ARE cached options. With nothing
-    cached — a connection added while Radarr was unreachable — the card renders plain
+    cached — a connection added while the server was unreachable — the card renders plain
     number/text inputs instead of dropdowns, and refusing what is typed into them would
     make that fallback a dead end. An id we cannot check is not an id we know to be
-    wrong; if it is, the add fails at Radarr and says so.
+    wrong; if it is, the add fails at the server and says so.
     """
-    options = request.app.state.radarr_options.load(app_id)
+    kind = _kind_of(request, app_id)
+    state = request.app.state
+    cache = state.sonarr_options if kind == KIND_SONARR else state.radarr_options
+    options = cache.load(app_id)
     profile_id = optional_int(quality_profile_id)
     if (
         profile_id is not None
@@ -615,7 +710,39 @@ def _validated_defaults(
     folder = root_folder.strip() or None
     if folder is not None and options.root_folders and folder not in options.root_folders:
         return None
-    return {"quality_profile_id": profile_id, "root_folder": folder}
+    defaults: dict[str, object] = {"quality_profile_id": profile_id, "root_folder": folder}
+    if kind != KIND_SONARR:
+        # A film has no seasons and no series type. Dropped here rather than trusted
+        # not to arrive: the store would otherwise write them onto a Radarr connection
+        # because a crafted form said so.
+        return defaults
+    chosen_type = series_type.strip() or None
+    if chosen_type is not None and chosen_type not in SERIES_TYPES:
+        return None
+    defaults["series_type"] = chosen_type
+    # Unchecked boxes are simply absent from a form submission, so "" is False here and
+    # not "leave it alone" — the store's None-means-keep contract would make a toggle
+    # impossible to turn off. The card always renders both, so both are always answered.
+    defaults["season_folders"] = _checked(season_folders)
+    defaults["search_on_add"] = _checked(search_on_add)
+    return defaults
+
+
+def _checked(value: str) -> bool:
+    """A checkbox as submitted. Browsers send the value only when it is ticked."""
+    return value.strip().lower() in ("on", "true", "1", "yes")
+
+
+def _kind_of(request: Request, app_id: str) -> str:
+    """What kind of server a stored connection is, or Radarr when there is no such id.
+
+    Radarr for an unknown id so the caller behaves exactly as it did before kinds — the
+    update itself then fails on the missing id and reports it.
+    """
+    try:
+        return request.app.state.apps.get(app_id).kind
+    except KeyError:
+        return KIND_RADARR
 
 
 @router.post("/settings/apps/{app_id}/delete")
@@ -623,7 +750,10 @@ def delete_app(request: Request, app_id: str) -> RedirectResponse:
     current_user(request)
     try:
         request.app.state.apps.remove(app_id)
+        # Whichever cache holds it — forgetting from the wrong one would leave a
+        # removed connection's profiles on disk forever.
         request.app.state.radarr_options.forget(app_id)
+        request.app.state.sonarr_options.forget(app_id)
         radarr_backoff(request).forget(app_id)
     except KeyError:
         return _redirect(request, SettingsStatus.APP_INVALID)

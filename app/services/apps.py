@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 from app.core import crypto, filestore
 from app.core.audit import AuditAction, AuditLog
 from app.services.radarr import RadarrClient, build_verify
-from app.services.sonarr import SERIES_TYPES
+from app.services.sonarr import SERIES_TYPES, SonarrClient
 
 APPS_SCHEMA_VERSION = 1
 APPS_FILENAME = "apps.yml"
@@ -159,6 +159,28 @@ def normalize_url(raw: str) -> str:
     if not parsed.netloc:
         raise InvalidAppError(f"could not parse address: {raw!r}")
     return candidate.rstrip("/")
+
+
+def sonarr_client_for_credentials(
+    url: str,
+    api_key: str,
+    *,
+    tls_verify: bool,
+    ca_file: str | None,
+    timeout: float | None = None,
+) -> SonarrClient:
+    """A Sonarr client for credentials, stored or not.
+
+    The Radarr twin below, for the same reason: testing an address before it is saved
+    has to talk to exactly what saving it would talk to, so it goes through the same
+    `normalize_url`.
+    """
+    return SonarrClient(
+        normalize_url(url),
+        api_key.strip(),
+        verify=build_verify(tls_verify=tls_verify, ca_file=ca_file),
+        **({"timeout": timeout} if timeout is not None else {}),
+    )
 
 
 def client_for_credentials(
@@ -392,6 +414,33 @@ class AppsStore:
                 f"{app.name} is a {app.kind_name} connection, not Radarr"
             )
         return client_for_credentials(
+            app.url,
+            self.decrypt_key(app_id),
+            tls_verify=tls_verify,
+            ca_file=ca_file,
+            timeout=timeout,
+        )
+
+    def build_sonarr_client(
+        self,
+        app_id: str,
+        *,
+        tls_verify: bool,
+        ca_file: str | None,
+        timeout: float | None = None,
+    ) -> SonarrClient:
+        """A Sonarr client for a stored Sonarr connection.
+
+        Refuses any other kind, for `build_client`'s reason in the other direction:
+        Radarr answers `/api/v3/system/status` too, so a Sonarr client pointed at one
+        would go green and then fail at the first `series` call.
+        """
+        app = self.get(app_id)
+        if app.kind != KIND_SONARR:
+            raise InvalidAppError(
+                f"{app.name} is a {app.kind_name} connection, not Sonarr"
+            )
+        return sonarr_client_for_credentials(
             app.url,
             self.decrypt_key(app_id),
             tls_verify=tls_verify,

@@ -206,3 +206,47 @@ def test_every_settings_card_keeps_a_save_button_without_the_script(
     assert "data-form-save" in page
     for tag in re.findall(r"<button[^>]*data-form-save[^>]*>", page):
         assert "hidden" not in tag
+
+
+def test_the_which_app_choice_names_both_ports_without_the_script(
+    harness: AppHarness,
+) -> None:
+    """app.js narrows the address placeholder to the chosen app. With the script blocked
+    the static placeholder must still name BOTH ports, or the field silently asks for one
+    of them and gives no clue which — the contract the media-server card already keeps."""
+    harness.activate()
+
+    page = harness.client.get("/settings").text
+
+    assert "Radarr 192.168.1.100:7878 · Sonarr 192.168.1.100:8989" in page
+    # And the radio itself is a plain form control, so the choice submits either way.
+    assert 'type="radio" name="kind" value="radarr"' in page
+    assert 'type="radio" name="kind" value="sonarr"' in page
+
+
+def test_one_kind_swap_serves_both_service_pickers(harness: AppHarness) -> None:
+    """Two cards ask "which service" — Plex vs Jellyfin, and Radarr vs Sonarr. They share
+    ONE mechanism in app.js, configured twice, so a third service is a config entry rather
+    than a third copy of the loop. Pinned in source for the same reason the plural
+    `querySelectorAll` above is: the duplicated version is the one that rots."""
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[2] / "app/static/js/app.js").read_text()
+
+    assert script.count("var wireKindSwap = function") == 1
+    assert 'wireKindSwap("data-server-kind"' in script
+    assert 'wireKindSwap("data-app-kind"' in script
+    # Values are written as text, never as markup: these come from the template today,
+    # and writing innerHTML from script is how that stops being true later.
+    assert "innerHTML" not in script.split("var wireKindSwap")[1].split("wireKindSwap(")[0]
+
+
+def test_both_service_pickers_ship_their_radios_server_side(harness: AppHarness) -> None:
+    """The swap is an enhancement, not the mechanism. Both fieldsets are plain radios in
+    the HTML, so with the script blocked the choice still reaches the server."""
+    harness.activate()
+
+    page = harness.client.get("/settings").text
+
+    assert page.count("data-app-kind") == 2  # Radarr and Sonarr
+    assert page.count("data-server-kind") == 2  # Plex and Jellyfin
