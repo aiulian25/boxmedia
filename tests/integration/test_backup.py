@@ -502,6 +502,27 @@ def test_the_mirrored_filters_constants_match_the_real_ones() -> None:
     )
 
 
+def test_the_running_version_matches_the_one_the_project_ships() -> None:
+    """`app.__version__` is stamped into every backup manifest and announced to TMDB and
+    Trakt in the User-Agent, so a stale value makes both quietly wrong about the build.
+
+    It HAD gone stale — 0.1.0 while the project shipped 1.2.1 — because nothing compared
+    the two. Read from `app/__init__.py` rather than package metadata on purpose: the
+    runtime image copies `app/` in and never installs the project as a distribution, so
+    `importlib.metadata` would raise there.
+    """
+    import re
+
+    from app import __version__
+
+    pyproject = (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    shipped = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
+    assert shipped is not None, "pyproject.toml has no version to compare against"
+    assert __version__ == shipped.group(1)
+
+
 def test_every_schema_stamped_store_is_covered(tmp_path: Path) -> None:
     """A new store added to config/ without an entry here would restore unvalidated.
 

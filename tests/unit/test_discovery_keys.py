@@ -136,16 +136,30 @@ def test_an_unknown_provider_is_refused(store: DiscoveryStore) -> None:
 def test_the_audit_records_the_action_not_the_value(
     store: DiscoveryStore, tmp_path: Path
 ) -> None:
-    """A credential must not reach the audit log — nor its length, which narrows a guess."""
+    """A credential must not reach the audit log — nor its length, which narrows a guess.
+
+    The records are PARSED rather than substring-searched. Looking for `str(len(key))` in
+    the raw text was flaky at about one run in seven: the length is 32, and so is every
+    timestamp that happens to land on the 32nd second.
+    """
+    import json
+
     store.save(PROVIDER_TMDB, TMDB_KEY)
     store.remove(PROVIDER_TMDB)
 
-    log = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
-    assert AuditAction.DISCOVERY_KEY_SAVED in log
-    assert AuditAction.DISCOVERY_KEY_REMOVED in log
-    assert PROVIDER_TMDB in log
-    assert TMDB_KEY not in log
-    assert str(len(TMDB_KEY)) not in log
+    lines = (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines if line.strip()]
+    actions = [record.get("action") for record in records]
+    assert AuditAction.DISCOVERY_KEY_SAVED in actions
+    assert AuditAction.DISCOVERY_KEY_REMOVED in actions
+
+    for record in records:
+        assert record.get("provider") in (None, PROVIDER_TMDB)
+        # Nothing anywhere in the row is the secret, or measures it.
+        for value in record.values():
+            assert value != TMDB_KEY
+            assert not (isinstance(value, str) and TMDB_KEY in value)
+            assert value != len(TMDB_KEY)
 
 
 def test_the_mask_matches_the_connection_cards(store: DiscoveryStore) -> None:

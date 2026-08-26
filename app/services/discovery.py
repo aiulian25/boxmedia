@@ -32,6 +32,7 @@ from pathlib import Path
 
 import httpx
 
+from app import __version__
 from app.core import crypto, filestore
 from app.core.audit import AuditAction, AuditLog
 
@@ -56,8 +57,11 @@ TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p"
 TRAKT_BASE_URL = "https://api.trakt.tv"
 TRAKT_API_VERSION = "2"
-# Ours, not another application's. A public API is entitled to know who is calling.
-USER_AGENT = "BoxMedia/1.0 (+https://github.com/aiulian25/boxmedia)"
+# Ours, not another application's, and naming the build that is actually running. A
+# public API is entitled to know who is calling — the teardown found nzb360 announcing
+# itself as "nzb360/1.0" to Trakt, and borrowing someone else's identity is both rude
+# and useless to the operator trying to work out who is generating traffic.
+USER_AGENT = f"BoxMedia/{__version__} (+https://github.com/aiulian25/boxmedia)"
 
 PROBE_TIMEOUT_SECONDS = 4.0
 
@@ -251,16 +255,27 @@ async def probe_tmdb(api_key: str, *, verify: bool | str = True) -> str:
     )
 
 
+def trakt_headers(client_id: str) -> dict[str, str]:
+    """What every Trakt request carries. One builder so the credential probe and the
+    real client can never disagree about what a Trakt request looks like.
+
+    The client ID is a HEADER, never a query parameter — which is why nothing on the
+    Trakt side needs `redact`: its URLs carry no credential at all.
+    """
+    return {
+        "trakt-api-key": client_id.strip(),
+        "trakt-api-version": TRAKT_API_VERSION,
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/json",
+    }
+
+
 async def probe_trakt(client_id: str, *, verify: bool | str = True) -> str:
     """Does this Trakt client ID work? One trending row is the smallest thing to ask for."""
     return await _probe(
         f"{TRAKT_BASE_URL}/shows/trending",
         params={"limit": 1},
-        headers={
-            "trakt-api-key": client_id.strip(),
-            "trakt-api-version": TRAKT_API_VERSION,
-            "User-Agent": USER_AGENT,
-        },
+        headers=trakt_headers(client_id),
         verify=verify,
     )
 
