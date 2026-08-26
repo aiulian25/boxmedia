@@ -77,7 +77,12 @@ from app.services.mediaserver import (
     client_for_credentials as server_client_for_credentials,
 )
 from app.services.pipeline import SCRAPE_FAILURE_SUBDIR
-from app.services.posters import POSTER_SUBDIR, POSTER_WIDTH, sized
+from app.services.posters import (
+    POSTER_SUBDIR,
+    POSTER_WIDTH,
+    SERIES_POSTER_WIDTH,
+    sized,
+)
 from app.services.radarr import (
     RadarrAuthError,
     RadarrConnectionError,
@@ -1325,6 +1330,15 @@ def prune_posters(request: Request) -> RedirectResponse:
         for report in request.app.state.reports.list_reports()
         for movie in report.movies
         if movie.poster_url
+    }
+    # Series posters are kept by the same rule and at THEIR width. Without this every
+    # press of Prune would wipe the artwork off every TV card — the keep-set is built
+    # from the stored records, and a series is recorded in the library cache rather than
+    # in a weekly report. A Discover row's poster is genuinely not kept: that shelf
+    # re-fetches on its own TTL, so an orphan there costs one download, not a record.
+    keep |= {
+        sized(poster_url, SERIES_POSTER_WIDTH)
+        for poster_url in request.app.state.series_cache.poster_urls()
     }
     removed = request.app.state.posters.prune(keep)
     request.app.state.audit.record(

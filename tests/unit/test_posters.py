@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import httpx
@@ -11,8 +12,13 @@ from app.services.posters import (
     FAILED_RETRY_AFTER_SECONDS,
     MAX_POSTER_BYTES,
     POSTER_SUBDIR,
+    POSTER_SUFFIX,
+    POSTER_WIDTH,
+    SERIES_POSTER_WIDTH,
     PosterCache,
+    sized,
 )
+from app.services.tmdb import image_url
 
 POSTER_URL = "http://radarr.local/MediaCover/1/poster.jpg"
 
@@ -219,3 +225,93 @@ async def test_an_already_cached_poster_is_never_re_requested(tmp_path: Path) ->
         await cache.ensure(client, POSTER_URL)
 
     assert route.call_count == 1
+
+
+# --- TMDB-shaped URLs (TV step 10) ---
+#
+# The cache was written for Radarr's own metadata host. Television feeds it URLs that
+# come straight off image.tmdb.org instead, and this section proves the three guarantees
+# the TV pages are about to depend on hold for that shape too — before they depend on
+# them, which is the whole reason this is its own step.
+
+TMDB_POSTER = f"https://image.tmdb.org/t/p/{SERIES_POSTER_WIDTH}/abc123.jpg"
+
+
+@respx.mock
+async def test_a_tmdb_poster_is_cached_under_its_sha1(tmp_path: Path) -> None:
+    """The name is a digest of the URL, so it is same-origin, opaque, and reveals
+    nothing about where the bytes came from — which is what lets the CSP stay
+    `img-src 'self'` with no third-party host allow-listed."""
+    respx.get(TMDB_POSTER).mock(
+        return_value=httpx.Response(200, content=b"\xff\xd8\xff jpeg")
+    )
+    cache = PosterCache(tmp_path)
+    async with httpx.AsyncClient() as client:
+        assert await cache.ensure(client, TMDB_POSTER) is True
+
+    expected = hashlib.sha1(TMDB_POSTER.encode()).hexdigest() + POSTER_SUFFIX  # noqa: S324
+    assert cache.local_name(TMDB_POSTER) == expected
+    assert (tmp_path / POSTER_SUBDIR / expected).read_bytes().startswith(b"\xff\xd8\xff")
+    # And it serves only through the guard, by that name.
+    assert cache.serve_path(expected) is not None
+
+
+@respx.mock
+async def test_the_size_cap_holds_against_a_tmdb_url(tmp_path: Path) -> None:
+    """TMDB serves `original` at 1-3 MB and will serve it to anyone who asks for the
+    wrong path. The cap is measured as the body ARRIVES, so an oversized image costs
+    neither the disk nor the memory in a 256 MB container."""
+    respx.get(TMDB_POSTER).mock(
+        return_value=httpx.Response(200, content=b"x" * (MAX_POSTER_BYTES + 1))
+    )
+    cache = PosterCache(tmp_path)
+    async with httpx.AsyncClient() as client:
+        assert await cache.ensure(client, TMDB_POSTER) is False
+    assert not cache.is_cached(TMDB_POSTER)
+
+
+@respx.mock
+async def test_a_failed_tmdb_poster_is_not_retried_on_every_render(tmp_path: Path) -> None:
+    """A Discover shelf is six posters wide and re-renders often. Without the cooldown,
+    one dead URL costs the download timeout on every single view of that page."""
+    route = respx.get(TMDB_POSTER).mock(return_value=httpx.Response(404))
+    cache = PosterCache(tmp_path)
+    async with httpx.AsyncClient() as client:
+        assert await cache.ensure(client, TMDB_POSTER) is False
+        assert await cache.ensure(client, TMDB_POSTER) is False
+        assert await cache.ensure(client, TMDB_POSTER) is False
+
+    assert route.call_count == 1, "the dead URL was asked again inside its cooldown"
+    assert FAILED_RETRY_AFTER_SECONDS > 0
+
+
+@respx.mock
+async def test_a_tmdb_url_survives_a_round_trip_through_sized(tmp_path: Path) -> None:
+    """Every call site routes through `sized`, and the cache keys on the URL — so if
+    `sized` rewrote a TMDB URL the fetch and the keep-set would disagree and maintenance
+    would delete what the page had just downloaded."""
+    composed = image_url("/abc123.jpg", SERIES_POSTER_WIDTH)
+    assert composed == TMDB_POSTER
+    assert sized(composed, SERIES_POSTER_WIDTH) == composed
+
+    respx.get(TMDB_POSTER).mock(return_value=httpx.Response(200, content=b"jpeg"))
+    cache = PosterCache(tmp_path)
+    async with httpx.AsyncClient() as client:
+        await cache.ensure(client, sized(composed, SERIES_POSTER_WIDTH))
+    assert cache.is_cached(composed)
+
+
+def test_series_and_film_widths_are_separate_and_series_is_smaller() -> None:
+    """Series render smaller on BOTH their surfaces — a Discover strip is six across
+    (~178px) and the show detail's poster is 160, against the movie grid's 208. One
+    width per medium, so one cache entry per image."""
+    assert SERIES_POSTER_WIDTH != POSTER_WIDTH
+    assert int(SERIES_POSTER_WIDTH.lstrip("w")) < int(POSTER_WIDTH.lstrip("w"))
+
+
+def test_the_two_widths_are_different_cache_entries(tmp_path: Path) -> None:
+    """Which is exactly why a grid width and a detail width for one image would be two
+    downloads, two files, and two things for `prune` to know about."""
+    cache = PosterCache(tmp_path)
+    film = sized(TMDB_POSTER, POSTER_WIDTH)
+    assert cache.local_name(film) != cache.local_name(TMDB_POSTER)

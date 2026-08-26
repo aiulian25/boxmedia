@@ -38,6 +38,15 @@ _TMDB_IMAGE_PATH = "/t/p/"
 # ratio at 2.4x on a 1x display and 1.2x on a 2x one, so detail survives at either. The
 # movie modal reuses this URL, so the grid and the modal share one cache entry.
 POSTER_WIDTH = "w500"
+# Series posters render smaller than film ones on BOTH of their surfaces: a Discover
+# strip is six across (~178 CSS px) and the show detail's poster is 160, against the
+# movie grid's 208. So they get their own, smaller width — and ONE of it, for the reason
+# the paragraph above gives: the cache keys on the URL, so a grid form and a detail form
+# would be two entries for one image, twice the disk, and two things for `prune` to have
+# to know about. 342 is 1.9x at 1x and ~1.0x at 2x on both, which is where detail stops
+# being the constraint. A full-bleed detail hero would be the moment a second width earns
+# its place; a 160px box is not.
+SERIES_POSTER_WIDTH = "w342"
 # Credit headshots render at 96x144 CSS px — 185 is ~native on a 2x display.
 HEADSHOT_WIDTH = "w185"
 

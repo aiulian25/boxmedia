@@ -68,6 +68,11 @@ class CachedSeries:
     imdb_id: str | None = None
     tmdb_id: int | None = None
     title_slug: str | None = None
+    # Remembered so `prune` can keep it. The poster cache deletes every file no keep-set
+    # names, and that set is built from the stored RECORDS — for films the weekly
+    # reports, for series this. Without it, pressing Prune would wipe the artwork off
+    # every TV card and the next render would re-download the lot.
+    poster_url: str | None = None
 
     @property
     def missing_episode_count(self) -> int:
@@ -160,6 +165,7 @@ def _cached_from(series: SonarrSeries) -> CachedSeries:
         imdb_id=series.imdb_id,
         tmdb_id=series.tmdb_id,
         title_slug=series.title_slug,
+        poster_url=series.poster_url,
     )
 
 
@@ -191,6 +197,9 @@ def _series_from_document(entry: object) -> CachedSeries | None:
         tmdb_id=_int_or_none(entry.get("tmdb_id")),
         title_slug=(
             entry.get("title_slug") if isinstance(entry.get("title_slug"), str) else None
+        ),
+        poster_url=(
+            entry.get("poster_url") if isinstance(entry.get("poster_url"), str) else None
         ),
     )
 
@@ -263,6 +272,7 @@ class SeriesLibraryCache:
                     "imdb_id": item.imdb_id,
                     "tmdb_id": item.tmdb_id,
                     "title_slug": item.title_slug,
+                    "poster_url": item.poster_url,
                 }
                 for item in series
             ],
@@ -311,6 +321,20 @@ class SeriesLibraryCache:
         if loaded is None:
             return True
         return (time.time() - loaded[1]) > ttl_seconds
+
+    def poster_urls(self) -> set[str]:
+        """Every poster the cached libraries reference, for the prune keep-set.
+
+        Raw URLs — the caller sizes them, exactly as the reports' keep-set is sized,
+        because the cache keys on the sized form and a keep-set built from the other
+        form would mark every poster an orphan.
+        """
+        return {
+            series.poster_url
+            for library in self.load_all().values()
+            for series in library
+            if series.poster_url
+        }
 
     def forget(self, app_id: str) -> None:
         """Drop a removed connection's library so it cannot keep decorating cards, and

@@ -317,23 +317,30 @@ def radarr_client_for_credentials(
     )
 
 
-async def cache_posters(request: Request, items: list[dict]) -> None:
+async def cache_posters(
+    request: Request, items: list[dict], *, width: str = POSTER_WIDTH
+) -> None:
     """Fetch each item's remote poster once into the local cache and set a same-origin
-    `poster_local` URL (or None). Shared by the dashboard and the report detail.
+    `poster_local` URL (or None). Shared by the dashboard, the report detail, and the
+    television pages.
 
     Distinct posters download concurrently, so first-view latency is the slowest single
-    poster, not the sum of them all."""
+    poster, not the sum of them all.
+
+    `width` defaults to the film width, so every caller that predates television is
+    untouched. Television passes SERIES_POSTER_WIDTH — its surfaces are smaller, and one
+    width per medium keeps one cache entry per image. Whatever the width, the SAME value
+    must reach `prune`'s keep-set, or maintenance deletes what the page just fetched.
+    """
     cache = request.app.state.posters
     url_base = request.app.state.settings.url_base
     # Every poster path routes through posters.sized() — the cache keys on the URL, so
     # fetching one form and pruning another would delete the whole cache.
-    urls = {
-        sized(item["poster_url"], POSTER_WIDTH) for item in items if item.get("poster_url")
-    }
+    urls = {sized(item["poster_url"], width) for item in items if item.get("poster_url")}
     async with httpx.AsyncClient() as client:
         await asyncio.gather(*[cache.ensure(client, url) for url in urls])
     for item in items:
-        poster_url = sized(item.get("poster_url"), POSTER_WIDTH)
+        poster_url = sized(item.get("poster_url"), width)
         if poster_url and cache.is_cached(poster_url):
             item["poster_local"] = f"{url_base}/posters/{cache.local_name(poster_url)}"
         else:

@@ -277,3 +277,59 @@ def test_the_newest_failure_is_listed_first(harness: AppHarness) -> None:
     page = harness.client.get("/settings").text
 
     assert page.index(newer.name) < page.index(older.name)
+
+
+def test_prune_keeps_the_posters_of_series_you_actually_hold(harness: AppHarness) -> None:
+    """The hazard this step uncovered. The keep-set was built from stored REPORTS alone,
+    and a series is recorded in the library cache rather than in a weekly report — so
+    every press of Prune would have wiped the artwork off every TV card, and the next
+    render would re-download the lot.
+    """
+    from app.services.posters import SERIES_POSTER_WIDTH, sized
+    from app.services.sonarr import SonarrSeries
+
+    harness.activate()
+    _seed_report_with_poster(harness)
+    kept_film = _write_poster(harness, POSTER_URL)
+
+    raw = "https://image.tmdb.org/t/p/original/show.jpg"
+    harness.client.app.state.series_cache.save("app-sonarr", (
+        SonarrSeries(
+            sonarr_id=14, tvdb_id=121361, title="The Hollow Coast", year=2023,
+            monitored=True, ended=False, episode_count=34, episode_file_count=26,
+            poster_url=raw,
+        ),
+    ))
+    # Cached at the width the pages actually request, which is the width the keep-set
+    # must name back — the cache keys on the sized URL.
+    kept_series = _write_poster(harness, sized(raw, SERIES_POSTER_WIDTH))
+    orphan = _write_poster(harness, ORPHAN_URL)
+
+    harness.client.post("/settings/maintenance/prune-posters", follow_redirects=False)
+
+    assert kept_film.exists()
+    assert kept_series.exists(), "a held series' poster was pruned"
+    assert not orphan.exists()
+
+
+def test_prune_still_drops_a_series_poster_at_the_wrong_width(harness: AppHarness) -> None:
+    """The other half of the same rule, stated so it cannot rot: the keep-set names ONE
+    width per medium, so a file cached at any other width is an orphan by definition.
+    That is exactly why the grid and the detail share a width rather than having two."""
+    from app.services.posters import POSTER_WIDTH, sized
+    from app.services.sonarr import SonarrSeries
+
+    harness.activate()
+    raw = "https://image.tmdb.org/t/p/original/show.jpg"
+    harness.client.app.state.series_cache.save("app-sonarr", (
+        SonarrSeries(
+            sonarr_id=14, tvdb_id=121361, title="The Hollow Coast", year=2023,
+            monitored=True, ended=False, episode_count=34, episode_file_count=26,
+            poster_url=raw,
+        ),
+    ))
+    wrong_width = _write_poster(harness, sized(raw, POSTER_WIDTH))
+
+    harness.client.post("/settings/maintenance/prune-posters", follow_redirects=False)
+
+    assert not wrong_width.exists()
