@@ -27,6 +27,19 @@ build and push.txt
 docker-compose.prod.yml
 Jellyfin.md
 
+# The TV teardown carries LIVE CREDENTIALS in its section 0 — a TMDB v3 key and a Trakt
+# client ID, in plaintext. It is reference material, never a source file: the app ships
+# no keys of its own, and the dev instance gets these typed into its Settings UI, where
+# they land encrypted like every other secret. Ignored by name because this checkout
+# holds it at the repo root rather than under the already-ignored /backups/ — which is
+# all it took for a `git add -A` to stage it.
+tv-discovery.md
+
+# Design-canvas working files for the TV revamp (artboards plus the 2.4 MB seeded
+# canvas). Kept on disk like every other pre-release mockup; the published canvas is
+# the record, and the seeded file is build output.
+/tv/
+
 # Compiled Tailwind output (produced at build time)
 /app/static/css/app.css
 

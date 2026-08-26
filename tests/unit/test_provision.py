@@ -203,3 +203,48 @@ def test_only_the_init_may_write_the_key() -> None:
 
     assert _mount(services["init"], "/secrets").endswith(":/secrets")
     assert _mount(services["boxmedia"], "/secrets:ro").endswith(":ro")
+
+
+def _dev_compose() -> dict:
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "docker-compose.dev.yml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def test_the_dev_stack_cannot_adopt_the_published_stacks_container() -> None:
+    """A container name is GLOBAL to the Docker daemon, not scoped to its compose
+    project — so two checkouts whose compose files both say `container_name: boxmedia`
+    fight over one container, and the second `up` adopts and recreates the first's.
+    That has happened here. The dev stack must therefore share NOTHING nameable with
+    the published one: not the container names, not the image tag, not the host port."""
+    dev, published = _dev_compose(), _compose()
+
+    dev_names = {s["container_name"] for s in dev["services"].values()}
+    published_names = {s["container_name"] for s in published["services"].values()}
+    assert not dev_names & published_names
+
+    assert {s["image"] for s in dev["services"].values()}.isdisjoint(
+        {s["image"] for s in published["services"].values()}
+    )
+    assert _host_port(dev) != _host_port(published)
+
+
+def _host_port(compose: dict) -> str:
+    """The published side of the app's port mapping, however the address is written."""
+    mapping = compose["services"]["boxmedia"]["ports"][0]
+    return mapping.rsplit(":", 2)[-2]
+
+
+def test_the_dev_services_cannot_be_pointed_at_different_directories() -> None:
+    """The same desync the published file is pinned against, on the file the dev stack
+    actually runs from — init preparing one path while the app mounts another fails
+    identically to an unprepared install."""
+    services = _dev_compose()["services"]
+    if "init" not in services:
+        pytest.skip("this dev stack has no init service to disagree with")
+
+    assert _mount(services["init"], "/data") == _mount(services["boxmedia"], "/data")
+    assert "./data:/data" not in _mount(services["boxmedia"], "/data")
+    assert _mount(services["init"], "/secrets").endswith(":/secrets")
+    assert _mount(services["boxmedia"], "/secrets:ro").endswith(":ro")

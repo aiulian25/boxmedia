@@ -1,11 +1,61 @@
-# BoxMedia — DEV stack (docker-compose.dev.yml). Publishes on the LAN (0.0.0.0)
+# BoxMedia — TV DEV stack (docker-compose.dev.yml). Publishes on the LAN (0.0.0.0)
 # over plain HTTP for local testing. For production, front it with a reverse proxy
 # (nginx/Traefik/Caddy/Pangolin/Cloudflare) that terminates TLS and bind 127.0.0.1.
+#
+# THIS IS THE TV COPY, not main. Everything that names something is deliberately
+# distinct from /home/iulian/projects/BoxMedia so the two stacks cannot touch each
+# other: project name, container names, image tag, host port, and the data and secrets
+# directories under this checkout. Container names are GLOBAL in Docker — not scoped to
+# a compose project — so an inherited `container_name: boxmedia` is all it would take
+# for this stack to adopt and recreate main's container.
+name: boxmedia-tv
+
+# The one place the image tag is written. Both services take it from here, so they
+# cannot run different builds of the same app.
+x-image: &image boxmedia:tv-dev
+
+x-data: &data ${BM_DATA_PATH:-./data}:/data
+
 services:
+  # Runs once, exits, and is the only thing here that is root. Docker creates a missing
+  # bind-mount source as root:root, and the app runs as uid 65532 on a read-only
+  # filesystem — so without this, the very first `up -d` on a fresh checkout dies with
+  # "PermissionError: /data/config" before the app can say anything useful. It hands
+  # /data to that uid and generates the encryption key if there is none. See
+  # app/core/provision.py: it refuses to mint a fresh key over an existing install.
+  init:
+    build: .
+    image: *image
+    container_name: boxmedia-tv-init
+    user: "0:0"
+    entrypoint: ["/usr/bin/python3.11", "-m", "app.core.provision"]
+    # The same .env, so it prepares whatever BM_DATA_DIR and BM_ENCRYPTION_KEY_FILE
+    # actually name — a rotated key has a different filename.
+    env_file: .env
+    volumes:
+      - *data
+      # Writable here and read-only on the app: this is the one moment the key is
+      # created, and nothing afterwards has any business changing it.
+      - ${BM_SECRETS_PATH:-./secrets}:/secrets
+    # It only ever touches those two paths: no network, and only the capabilities a
+    # chown needs.
+    network_mode: none
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
   boxmedia:
     build: .
-    image: boxmedia:0.1.0
-    container_name: boxmedia
+    image: *image
+    container_name: boxmedia-tv
+    depends_on:
+      init:
+        condition: service_completed_successfully
     env_file: .env
     environment:
       # uvicorn reads FORWARDED_ALLOW_IPS to trust the proxy's X-Forwarded-* headers,
@@ -14,12 +64,15 @@ services:
     ports:
       # Host port from .env (ruling #10); container-internal port is fixed at 8686.
       # DEV: bound to 0.0.0.0 so other machines on the LAN can reach it directly.
-      - "0.0.0.0:${BM_HOST_PORT:-58546}:8686"
+      # 58547 here, one past main's 58546, so both dev stacks can run at once.
+      - "0.0.0.0:${BM_HOST_PORT:-58547}:8686"
     volumes:
-      - ./data:/data
+      - *data
       # Encryption key mounted read-only from OUTSIDE ./data, so a backup of the
       # data dir can never contain the key that decrypts it (ruling #9 / Step 4).
-      - ./secrets/boxmedia.key:/secrets/boxmedia.key:ro
+      # The whole directory rather than the file: Docker answers a missing file mount
+      # by creating a DIRECTORY of that name, which is its own confusing failure.
+      - ${BM_SECRETS_PATH:-./secrets}:/secrets:ro
     read_only: true
     tmpfs:
       - /tmp
