@@ -29,13 +29,14 @@ from app.services.mediaserver import (
     MediaServerFetch,
     MediaServerLibraryCache,
     MediaServerMovie,
+    MediaServerSeries,
     MediaServerStore,
     PlexAuthError,
     PlexClient,
     PlexError,
     _movie_from_item,
     _movie_from_jellyfin_item,
-    snapshot_from_movies,
+    snapshot_from_library,
     validated_kind,
 )
 
@@ -104,7 +105,7 @@ def test_an_overlong_id_is_no_id_rather_than_a_truncated_one() -> None:
 
 
 def _snapshot() -> object:
-    return snapshot_from_movies((
+    return snapshot_from_library((
         MediaServerMovie(title="Neon Rain", year=2026, tmdb_id=52001, imdb_id="tt5200001"),
         MediaServerMovie(title="Old Rip", year=1998, tmdb_id=None, imdb_id="tt0120338"),
         MediaServerMovie(title="Home Video", year=2020, tmdb_id=None, imdb_id=None),
@@ -534,7 +535,7 @@ async def test_a_jellyfin_library_becomes_the_same_snapshot_a_plex_one_does() ->
     ]))
 
     fetch = await _jf_client().list_movies()
-    snapshot = snapshot_from_movies(fetch.movies)
+    snapshot = snapshot_from_library(fetch.movies)
 
     assert snapshot.holds(52001, None, "Spelled Differently", None) == HOLDS_YES
     assert snapshot.holds(None, None, "Home Video", 2020) == HOLDS_PROBABLY
@@ -637,3 +638,327 @@ def test_removing_clears_the_pre_kinds_file_too(tmp_path: Path) -> None:
 
     assert store.remove() is True
     assert store.load() is None
+
+
+# --- television (TV step 9) ---
+
+
+def _show_item(title: str, year: int | None, guids: list[str], legacy: str = "") -> dict:
+    item: dict = {"title": title, "guid": legacy or f"plex://show/{title}"}
+    if year is not None:
+        item["year"] = year
+    if guids:
+        item["Guid"] = [{"id": guid} for guid in guids]
+    return item
+
+
+def test_a_plex_show_reads_all_three_ids() -> None:
+    from app.services.mediaserver import _series_from_item
+
+    series = _series_from_item(
+        _show_item("The Hollow Coast", 2023, [
+            "tvdb://121361", "tmdb://1396", "imdb://tt0944947",
+        ])
+    )
+
+    assert series.title == "The Hollow Coast"
+    assert series.year == 2023
+    # The one Sonarr keys on, so the one an "already on Plex" answer is most often about.
+    assert series.tvdb_id == 121361
+    assert series.tmdb_id == 1396
+    assert series.imdb_id == "tt0944947"
+
+
+def test_a_tvdb_guid_is_never_read_as_a_tmdb_one() -> None:
+    """The two scheme names differ by a single letter. Reading one as the other would
+    stamp a TVDB id into a TMDB field and match the wrong show entirely."""
+    from app.services.mediaserver import _series_from_item
+
+    series = _series_from_item(_show_item("Only TVDB", 2020, ["tvdb://121361"]))
+
+    assert series.tvdb_id == 121361
+    assert series.tmdb_id is None
+
+
+def test_a_show_catalogued_by_the_tmdb_agent_still_lands() -> None:
+    """A library with no TVDB id at all is normal, and the show is still held."""
+    from app.services.mediaserver import _series_from_item
+
+    series = _series_from_item(_show_item("TMDB Only", 2021, ["tmdb://1396"]))
+
+    assert series.tvdb_id is None
+    assert series.tmdb_id == 1396
+
+
+def test_a_show_with_no_ids_contributes_title_and_year() -> None:
+    from app.services.mediaserver import _series_from_item
+
+    series = _series_from_item(_show_item("Home Recording", 2019, []))
+
+    assert (series.tvdb_id, series.tmdb_id, series.imdb_id) == (None, None, None)
+    assert (series.title, series.year) == ("Home Recording", 2019)
+
+
+def test_a_jellyfin_series_reads_ids_by_key() -> None:
+    from app.services.mediaserver import _series_from_jellyfin_item
+
+    series = _series_from_jellyfin_item(_jf_item("The Hollow Coast", 2023, {
+        "Tvdb": "121361", "Tmdb": "1396", "Imdb": "tt0944947",
+    }))
+
+    assert series.tvdb_id == 121361
+    assert series.tmdb_id == 1396
+    assert series.imdb_id == "tt0944947"
+
+
+def test_the_tmdb_collection_trap_stays_fenced_for_series() -> None:
+    """The M5 failure arriving from a new direction. A live Jellyfin answers with
+    TmdbCollection beside Tmdb, and reading ids by searching the joined text — which is
+    right for Plex's URI strings — would stamp the COLLECTION id onto the show. Fenced
+    for movies already; series get the same fence from the same helper."""
+    from app.services.mediaserver import _series_from_jellyfin_item
+
+    series = _series_from_jellyfin_item(_jf_item("Trap", 2020, {
+        "TmdbCollection": "999999", "Tvdb": "121361",
+    }))
+
+    assert series.tmdb_id is None, "the collection id was read as the show's id"
+    assert series.tvdb_id == 121361
+
+
+def test_the_movie_and_series_readers_share_one_fence() -> None:
+    """One place to be right rather than two — the movie half taught us this trap."""
+    from app.services.mediaserver import _movie_from_jellyfin_item, _series_from_jellyfin_item
+
+    providers = {"TmdbCollection": "999999"}
+    assert _movie_from_jellyfin_item(_jf_item("F", 2020, providers)).tmdb_id is None
+    assert _series_from_jellyfin_item(_jf_item("S", 2020, providers)).tmdb_id is None
+
+
+def test_an_overlong_series_imdb_id_is_no_id() -> None:
+    from app.services.mediaserver import _series_from_jellyfin_item
+
+    series = _series_from_jellyfin_item(_jf_item("X", 2020, {"Imdb": "tt1234567890"}))
+    assert series.imdb_id is None
+
+
+# --- the snapshot's two registers, for television ---
+
+
+def _series_snapshot() -> object:
+    return snapshot_from_library(
+        (),
+        series=(
+            MediaServerSeries(
+                title="The Hollow Coast", year=2023,
+                tvdb_id=121361, tmdb_id=1396, imdb_id="tt0944947",
+            ),
+            MediaServerSeries(title="Sodium Lights", year=2024),
+            MediaServerSeries(title="Undated Show", year=None),
+        ),
+    )
+
+
+def test_a_tvdb_match_is_a_confident_yes() -> None:
+    snapshot = _series_snapshot()
+    assert snapshot.holds_series(121361, None, None, "Different Spelling", 1900) == HOLDS_YES
+
+
+def test_a_series_tmdb_or_imdb_match_is_also_confident() -> None:
+    snapshot = _series_snapshot()
+    assert snapshot.holds_series(None, 1396, None, "x", None) == HOLDS_YES
+    assert snapshot.holds_series(None, None, "tt0944947", "x", None) == HOLDS_YES
+
+
+def test_a_series_title_and_year_match_is_the_amber_guess() -> None:
+    snapshot = _series_snapshot()
+    assert snapshot.holds_series(None, None, None, "sodium lights", 2024) == HOLDS_PROBABLY
+
+
+def test_a_conflicting_year_is_not_a_series_match() -> None:
+    """The reboot trap: claiming a 2024 show covers a 2031 revival would cause the exact
+    double-take this exists to prevent."""
+    snapshot = _series_snapshot()
+    assert snapshot.holds_series(None, None, None, "Sodium Lights", 2031) is None
+
+
+def test_a_series_with_no_year_matches_any_asked_year() -> None:
+    """Absence of evidence is not a conflicting year."""
+    snapshot = _series_snapshot()
+    assert snapshot.holds_series(None, None, None, "Undated Show", 2031) == HOLDS_PROBABLY
+
+
+def test_a_series_the_server_does_not_hold_is_none() -> None:
+    snapshot = _series_snapshot()
+    assert snapshot.holds_series(99, 99, "tt9999999", "Nothing Like It", 2020) is None
+
+
+def test_films_and_series_never_answer_for_each_other() -> None:
+    """A film and a show can share a title AND a TMDB id namespace. Answering a series
+    question from the movie registers would render "already on Plex" over a show nobody
+    owns."""
+    snapshot = snapshot_from_library(
+        (MediaServerMovie(title="Fargo", year=1996, tmdb_id=275, imdb_id="tt0116282"),),
+        series=(MediaServerSeries(title="Sodium Lights", year=2024, tvdb_id=7),),
+    )
+
+    assert snapshot.holds_series(None, 275, None, "Fargo", 1996) is None
+    assert snapshot.holds(None, None, "Sodium Lights", 2024) is None
+    # Each still answers its own.
+    assert snapshot.holds(275, None, "x", None) == HOLDS_YES
+    assert snapshot.holds_series(7, None, None, "x", None) == HOLDS_YES
+
+
+# --- listing shows ---
+
+
+@respx.mock
+async def test_only_show_sections_are_read_for_series() -> None:
+    """Plex's type=2 is a show, the way type=1 is a movie. Asking a TV section for
+    type=1 returns nothing rather than erroring — silence that reads as "you own no
+    television"."""
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=_sections_body())
+    )
+    route = respx.get(f"{PLEX_URL}/library/sections/2/all").mock(
+        return_value=_page([_show_item("The Hollow Coast", 2023, ["tvdb://121361"])], 1)
+    )
+
+    series, truncated = await _client().list_shows()
+
+    assert [s.title for s in series] == ["The Hollow Coast"]
+    assert truncated is False
+    assert route.calls.last.request.url.params["type"] == "2"
+
+
+@respx.mock
+async def test_a_library_read_stitches_films_and_shows() -> None:
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=_sections_body())
+    )
+    respx.get(f"{PLEX_URL}/library/sections/1/all").mock(
+        return_value=_page([_movie_item("Neon Rain", 2026, ["tmdb://52001"])], 1)
+    )
+    respx.get(f"{PLEX_URL}/library/sections/5/all").mock(return_value=_page([], 0))
+    respx.get(f"{PLEX_URL}/library/sections/2/all").mock(
+        return_value=_page([_show_item("The Hollow Coast", 2023, ["tvdb://121361"])], 1)
+    )
+
+    fetch = await _client().list_library()
+
+    assert [m.title for m in fetch.movies] == ["Neon Rain"]
+    assert [s.title for s in fetch.series] == ["The Hollow Coast"]
+
+
+@respx.mock
+async def test_a_movies_only_install_never_walks_the_tv_library() -> None:
+    """Reading a whole TV library every fifteen minutes to answer a question nobody on
+    this install is asking is a cost that shows up as a slow page on someone's NAS."""
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=_sections_body())
+    )
+    respx.get(f"{PLEX_URL}/library/sections/1/all").mock(return_value=_page([], 0))
+    respx.get(f"{PLEX_URL}/library/sections/5/all").mock(return_value=_page([], 0))
+    shows = respx.get(f"{PLEX_URL}/library/sections/2/all").mock(
+        return_value=_page([], 0)
+    )
+
+    fetch = await _client().list_library(include_series=False)
+
+    assert fetch.series == ()
+    assert not shows.called
+
+
+@respx.mock
+async def test_a_trimmed_show_list_makes_the_whole_answer_partial() -> None:
+    """The card that says "truncated" must not claim completeness because the other half
+    fitted."""
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=_sections_body())
+    )
+    respx.get(f"{PLEX_URL}/library/sections/1/all").mock(return_value=_page([], 0))
+    respx.get(f"{PLEX_URL}/library/sections/5/all").mock(return_value=_page([], 0))
+    respx.get(f"{PLEX_URL}/library/sections/2/all").mock(
+        return_value=_page(
+            [_show_item(f"S{i}", 2020, []) for i in range(PLEX_PAGE_SIZE)], 10**6
+        )
+    )
+
+    fetch = await _client().list_library()
+    assert fetch.truncated is True
+
+
+@respx.mock
+async def test_jellyfin_asks_for_series_not_episodes() -> None:
+    """A series is one item with its episodes beneath it. Asking for Episode would bring
+    a 200-episode show back as 200 rows."""
+    route = respx.get(f"{JELLYFIN_URL}/Items").mock(
+        return_value=_items([_jf_item("The Hollow Coast", 2023, {"Tvdb": "121361"})])
+    )
+
+    series, truncated = await _jf_client().list_shows()
+
+    assert [s.tvdb_id for s in series] == [121361]
+    assert truncated is False
+    assert route.calls.last.request.url.params["IncludeItemTypes"] == "Series"
+
+
+@respx.mock
+async def test_jellyfin_movies_still_ask_for_movies() -> None:
+    """The regression half of routing both through one pager."""
+    route = respx.get(f"{JELLYFIN_URL}/Items").mock(
+        return_value=_items([_jf_item("Neon Rain", 2026, {"Tmdb": "52001"})])
+    )
+    fetch = await _jf_client().list_movies()
+
+    assert [m.tmdb_id for m in fetch.movies] == [52001]
+    assert route.calls.last.request.url.params["IncludeItemTypes"] == "Movie"
+
+
+# --- the cache: additive, so yesterday's file still loads ---
+
+
+def test_a_cache_written_before_television_loads_fine(tmp_path: Path) -> None:
+    """Additive field with a default, so no schema bump and no migration — this
+    project's own convention. An existing install must not lose its movie snapshot
+    because television arrived."""
+    import json
+
+    from app.services.mediaserver import LIBRARY_CACHE_FILENAME, MediaServerLibraryCache
+
+    (tmp_path / LIBRARY_CACHE_FILENAME).write_text(
+        json.dumps({
+            "schema_version": 1,
+            "fetched_at": 1.0,
+            "truncated": False,
+            "movies": [{"title": "Neon Rain", "year": 2026, "tmdb_id": 52001,
+                        "imdb_id": "tt5200001"}],
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = MediaServerLibraryCache(tmp_path).load()
+    assert loaded is not None
+    snapshot, _ = loaded
+
+    assert snapshot.holds(52001, None, "x", None) == HOLDS_YES
+    # No series key at all reads as no series, not as an error.
+    assert snapshot.holds_series(1, 1, "tt1", "Anything", 2020) is None
+
+
+def test_series_round_trip_through_the_cache(tmp_path: Path) -> None:
+    from app.services.mediaserver import MediaServerLibraryCache
+
+    cache = MediaServerLibraryCache(tmp_path)
+    cache.save(MediaServerFetch(
+        movies=(),
+        truncated=False,
+        series=(MediaServerSeries(
+            title="The Hollow Coast", year=2023, tvdb_id=121361, tmdb_id=1396,
+        ),),
+    ))
+
+    snapshot, _ = cache.load()
+    assert snapshot.holds_series(121361, None, None, "x", None) == HOLDS_YES
+    # Both registers survive the round trip, each still saying what it means.
+    assert snapshot.holds_series(None, None, None, "the hollow coast", 2023) == HOLDS_PROBABLY

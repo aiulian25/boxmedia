@@ -33,7 +33,7 @@ from app.services.mediaserver import (
     RENDER_FETCH_TIMEOUT_SECONDS,
     MediaServerError,
     MediaServerSnapshot,
-    snapshot_from_movies,
+    snapshot_from_library,
 )
 from app.services.posters import POSTER_WIDTH, sized
 from app.services.radarr import RadarrClient, RadarrError, RadarrMovie
@@ -397,15 +397,22 @@ async def load_media_server_snapshot(request: Request) -> MediaServerSnapshot | 
             ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
             timeout=RENDER_FETCH_TIMEOUT_SECONDS,
         )
+        # Only walk the TV library when there is a Sonarr to compare it against.
+        # Otherwise it is a full library read every fifteen minutes to answer a question
+        # nobody on this install is asking.
+        include_series = bool(request.app.state.apps.list_apps(KIND_SONARR))
         fetch = await asyncio.wait_for(
-            client.list_movies(), timeout=RENDER_FETCH_TIMEOUT_SECONDS
+            client.list_library(include_series=include_series),
+            timeout=RENDER_FETCH_TIMEOUT_SECONDS,
         )
     except (MediaServerError, TimeoutError):
         backoff.note_failure(MEDIA_SERVER_BACKOFF_KEY)
         return stale
     backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)
     cache.save(fetch)
-    return snapshot_from_movies(fetch.movies, truncated=fetch.truncated)
+    return snapshot_from_library(
+        fetch.movies, series=fetch.series, truncated=fetch.truncated
+    )
 
 
 async def load_radarr_options(request: Request, app_id: str | None = None) -> RadarrOptions:
