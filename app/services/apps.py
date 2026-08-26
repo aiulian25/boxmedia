@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 from app.core import crypto, filestore
 from app.core.audit import AuditAction, AuditLog
 from app.services.radarr import RadarrClient, build_verify
+from app.services.sonarr import SERIES_TYPES
 
 APPS_SCHEMA_VERSION = 1
 APPS_FILENAME = "apps.yml"
@@ -61,12 +62,11 @@ KIND_MEDIA = {KIND_RADARR: "films", KIND_SONARR: "series"}
 
 # Sonarr-only add options. A film has no seasons and no series type, so these are
 # absent from every Radarr connection rather than stored as meaningless nulls.
+# SERIES_TYPES itself lives in sonarr.py — it is that server's vocabulary, and the
+# owning module holds the constant so there is one list to be wrong about.
 SERIES_TYPE_KEY = "series_type"
 SEASON_FOLDERS_KEY = "season_folders"
 SEARCH_ON_ADD_KEY = "search_on_add"
-SERIES_TYPE_STANDARD = "standard"
-# Sonarr's own three; the value is passed through to it verbatim.
-SERIES_TYPES = (SERIES_TYPE_STANDARD, "daily", "anime")
 
 
 class AppNotFoundError(KeyError):
