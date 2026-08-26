@@ -238,13 +238,21 @@ async def calendar(
         # Carried by the chips so switching Movies/TV keeps the week you are looking at.
         week_value=week_start.isoformat(),
         last_fetch=_last_fetch_display(cache),
-        # Filled in by step 15's morning job. Until one exists, the line states the
-        # refresh that actually happens instead of promising a time nothing keeps — the
-        # weekly page's own rule, where a schedule that never fired says so.
-        next_fetch=None,
+        # None until a scheduler is running — under a bare TestClient, or on an install
+        # whose lifespan has not started one. The line then states the refresh that
+        # actually happens instead of promising a time nothing keeps, which is the weekly
+        # page's own rule: a schedule that has never fired says so.
+        next_fetch=_next_fetch_display(request),
         incomplete_notice=None if complete else INCOMPLETE_NOTICE,
         configured=bool(request.app.state.apps.list_apps(kind=None)),
     )
+
+
+def _next_fetch_display(request: Request) -> str | None:
+    """When the morning job next re-reads the week, or None when nothing is scheduled."""
+    scheduler = request.app.state.scheduler
+    next_run = scheduler.next_calendar_run_at() if scheduler else None
+    return format_timestamp(next_run) if next_run else None
 
 
 def _last_fetch_display(cache: object) -> str:

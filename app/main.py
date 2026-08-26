@@ -25,6 +25,7 @@ from app.core.security import LoginRateLimiter
 from app.core.sessions import COOKIE_NAME, SessionStore
 from app.services.apps import AppsStore
 from app.services.backfill import BackfillRunner
+from app.services.backoff import RadarrBackoff
 from app.services.backup import BackupService
 from app.services.calendar import CalendarCache
 from app.services.corrections import CorrectionStore
@@ -35,6 +36,7 @@ from app.services.mediaserver import MediaServerLibraryCache, MediaServerStore
 from app.services.pipeline import Pipeline
 from app.services.posters import PosterCache
 from app.services.radarr_options import RadarrOptionsCache
+from app.services.refresh import ServerRefresher
 from app.services.release_ids import ReleaseIdCache
 from app.services.reports import ReportsStore
 from app.services.scheduler import BoxMediaScheduler
@@ -126,6 +128,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             backup_keep=config.backup_keep,
             audit=audit,
             reports=running_app.state.reports,
+            refresher=running_app.state.refresher,
         )
         scheduler.start()
         running_app.state.scheduler = scheduler
@@ -157,7 +160,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.sonarr_options = SonarrOptionsCache(settings.config_dir)
     # Per app instance, not global: a test's dead connection must not silence
     # another's.
-    app.state.radarr_backoff = deps.RadarrBackoff()
+    app.state.radarr_backoff = RadarrBackoff()
     # The Plex trio: connection (token encrypted with the same key as the Radarr
     # ones), the on-disk library snapshot, and its own backoff so a down media server
     # cannot cost every render a timeout.
@@ -175,7 +178,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.calendar_cache = CalendarCache(settings.cache_dir)
     # What each Sonarr holds, so a Discover card never waits on a live round trip.
     app.state.series_cache = SeriesLibraryCache(settings.cache_dir)
-    app.state.media_server_backoff = deps.RadarrBackoff()
+    app.state.media_server_backoff = RadarrBackoff()
+    # What re-reads your own servers into the caches above — the calendar page's
+    # stale top-up and the morning jobs are the same work, so they are one object.
+    app.state.refresher = ServerRefresher(
+        apps=app.state.apps,
+        settings=settings,
+        calendar_cache=app.state.calendar_cache,
+        series_cache=app.state.series_cache,
+        backoff=app.state.radarr_backoff,
+    )
     app.state.backups = BackupService(
         settings.data_dir, settings.backups_dir, key=encryption_key, audit=audit
     )

@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import time
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import respx
@@ -460,6 +461,25 @@ def test_the_header_states_the_refresh_that_actually_happens(
     assert "Last fetch:" in page
     assert "Next automatic fetch" not in page
     assert "more than fifteen minutes old" in page
+
+
+def test_the_header_names_the_next_automatic_fetch_once_one_is_scheduled(
+    harness: AppHarness,
+) -> None:
+    """Step 15's morning job is what fills this in. A bare TestClient never runs the
+    lifespan, so the app under test has no scheduler until one is put there."""
+    harness.activate()
+    _seed(harness, _episode())
+    harness.client.app.state.scheduler = SimpleNamespace(
+        next_calendar_run_at=lambda: datetime(2026, 8, 27, 6, 0, tzinfo=UTC)
+    )
+    try:
+        page = harness.client.get("/calendar").text
+    finally:
+        harness.client.app.state.scheduler = None
+
+    assert "Next automatic fetch: 27/8/2026 06:00" in page
+    assert "more than fifteen minutes old" not in page
 
 
 def test_an_install_with_no_connections_is_told_what_to_do(

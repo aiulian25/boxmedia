@@ -8,9 +8,8 @@ middleware already attached to the request.
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -28,12 +27,7 @@ from app.services.apps import (
     client_for_credentials,
     sonarr_client_for_credentials,
 )
-from app.services.calendar import (
-    CalendarEntry,
-    entry_from_episode,
-    entry_from_release,
-    window_for,
-)
+from app.services.backoff import RadarrBackoff
 from app.services.mediaserver import (
     LIBRARY_CACHE_TTL_SECONDS,
     RENDER_FETCH_TIMEOUT_SECONDS,
@@ -50,16 +44,6 @@ from app.services.users import THEME_DARK, User
 BRAND_NAME = "BoxMedia"
 RADARR_OPTIONS_TIMEOUT_SECONDS = 4.0
 RADARR_LIBRARY_TIMEOUT_SECONDS = 4.0
-# The calendar is a page's whole content rather than a decoration, so it is worth a
-# little more patience than a library probe — but still a hard ceiling, because a
-# page that hangs on somebody's NAS is a page nobody can close.
-CALENDAR_TIMEOUT_SECONDS = 6.0
-# How long a connection that just failed is left alone before a page bothers it again.
-# Shorter than the poster cache's 300s equivalent: a Radarr comes back on a timescale a
-# person notices, and the cost of guessing wrong is only that one page renders without a
-# library it could have had. Long enough that a dead box costs one timeout a minute
-# rather than one per page view.
-RADARR_RETRY_AFTER_SECONDS = 60.0
 # The three chips both Discover and the Calendar offer. Shared for the reason the banner
 # messages below are shared: two pages now ask the reader the same question, and a chip
 # labelled differently on one of them would read as a different filter. `all` first
@@ -101,55 +85,6 @@ DETAIL_STATUS_MESSAGES = {
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
-
-
-class RadarrBackoff:
-    """Which connections recently failed a best-effort read, so pages stop waiting on them.
-
-    A down Radarr costs the full 4s timeout per connection per render — on the dashboard,
-    the weekly view, the search modal and the movie modal alike. The poster cache already
-    solves this shape of problem for image hosts (posters.FAILED_RETRY_AFTER_SECONDS);
-    this is the same idea for the Radarr reads that merely decorate a page.
-
-    Deliberately NOT consulted by anything whose job is to find out whether a box is back:
-    the Settings health dots, Test Connection, and the scheduler's own run all still
-    really try, every time. A backoff that suppressed those would hide recovery instead of
-    surviving an outage.
-
-    Bounded by the number of configured connections, and per app instance rather than
-    global, so tests and multiple apps stay isolated.
-    """
-
-    def __init__(self, retry_after_seconds: float = RADARR_RETRY_AFTER_SECONDS) -> None:
-        self._retry_after = retry_after_seconds
-        self._failed_at: dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def should_skip(self, app_id: str) -> bool:
-        """True while a recent failure should still be honoured, expiring the entry once
-        it is old enough to be worth another attempt."""
-        with self._lock:
-            failed_at = self._failed_at.get(app_id)
-            if failed_at is None:
-                return False
-            if time.monotonic() - failed_at < self._retry_after:
-                return True
-            del self._failed_at[app_id]
-            return False
-
-    def note_failure(self, app_id: str) -> None:
-        with self._lock:
-            self._failed_at[app_id] = time.monotonic()
-
-    def note_success(self, app_id: str) -> None:
-        """Answered — or its details were just edited, which is a reason to try again now
-        rather than after the wait."""
-        with self._lock:
-            self._failed_at.pop(app_id, None)
-
-    def forget(self, app_id: str) -> None:
-        """Drop a removed connection's entry so the map cannot outlive apps.yml."""
-        self.note_success(app_id)
 
 
 def radarr_backoff(request: Request) -> RadarrBackoff:
@@ -505,136 +440,22 @@ async def load_sonarr_options(request: Request, app_id: str) -> RadarrOptions:
 
 
 async def refresh_series_library(request: Request, app_id: str) -> bool:
-    """Re-read one Sonarr's library into the cache. True when it answered.
-
-    Best-effort and bounded, like every other read a page depends on: a Sonarr that is
-    switched off leaves the previous snapshot in place rather than emptying it, because
-    "we could not look" and "you own nothing" are different claims and only one of them
-    is true.
-    """
-    try:
-        client = sonarr_client_for(request, app_id, timeout=RADARR_LIBRARY_TIMEOUT_SECONDS)
-        series = await asyncio.wait_for(
-            client.list_series(), timeout=RADARR_LIBRARY_TIMEOUT_SECONDS
-        )
-    except (SonarrError, TimeoutError, KeyError, InvalidAppError):
-        radarr_backoff(request).note_failure(app_id)
-        return False
-    radarr_backoff(request).note_success(app_id)
-    request.app.state.series_cache.save(app_id, tuple(series))
-    return True
+    """One Sonarr's library, re-read into the snapshot. True when it answered."""
+    return await request.app.state.refresher.series_library(app_id)
 
 
 async def refresh_stale_series_libraries(request: Request) -> None:
-    """Top up whichever Sonarr snapshots have aged out, all at once.
-
-    Skips the ones still inside their TTL and the ones already known to be down, so an
-    offline connection costs one probe a minute rather than one per page view — the
-    backoff's whole reason. Concurrent, so one slow server costs the timeout and not the
-    sum of them.
-    """
-    cache = request.app.state.series_cache
-    stale = [
-        app.id
-        for app in request.app.state.apps.list_apps(KIND_SONARR)
-        if cache.is_stale(app.id) and not radarr_backoff(request).should_skip(app.id)
-    ]
-    if not stale:
-        return
-    await asyncio.gather(*[refresh_series_library(request, app_id) for app_id in stale])
-
-
-async def _read_calendar(
-    request: Request,
-    app: ExternalApp,
-    *,
-    start: datetime,
-    end: datetime,
-    now: datetime,
-) -> list[CalendarEntry] | None:
-    """One connection's window as entries, or None when it could not be read.
-
-    The two kinds differ in four places — which client, which error, which reader, and
-    which id the queue is keyed by — and in nothing else, so they share one body.
-    """
-    if radarr_backoff(request).should_skip(app.id):
-        return None
-    is_series = app.kind == KIND_SONARR
-    build = sonarr_client_for if is_series else radarr_client_for
-    try:
-        client = build(request, app.id, timeout=CALENDAR_TIMEOUT_SECONDS)
-        rows, progress = await asyncio.gather(
-            asyncio.wait_for(
-                client.calendar(start, end), timeout=CALENDAR_TIMEOUT_SECONDS
-            ),
-            _queue_or_empty(client),
-        )
-    except (RadarrError, SonarrError, TimeoutError, KeyError, InvalidAppError):
-        radarr_backoff(request).note_failure(app.id)
-        return None
-    radarr_backoff(request).note_success(app.id)
-    if not is_series:
-        return [
-            entry_from_release(
-                row, connection=app.name, progress=progress.get(row.radarr_id), now=now
-            )
-            for row in rows
-        ]
-    episodes = [
-        entry_from_episode(
-            row, connection=app.name, progress=progress.get(row.series_id), now=now
-        )
-        for row in rows
-    ]
-    return [entry for entry in episodes if entry is not None]
-
-
-async def _queue_or_empty(client: RadarrClient | SonarrClient) -> dict[int, float]:
-    """How far along each download is, or nothing.
-
-    The queue decorates the calendar; it does not define it. A server that answers its
-    calendar but not its queue should still fill the week, with no progress bars.
-    """
-    try:
-        return await asyncio.wait_for(client.queue(), timeout=CALENDAR_TIMEOUT_SECONDS)
-    except (RadarrError, SonarrError, TimeoutError, KeyError):
-        return {}
+    """Top up whichever Sonarr snapshots have aged out, all at once."""
+    await request.app.state.refresher.stale_series_libraries()
 
 
 async def refresh_calendar(request: Request) -> bool:
-    """Re-read every connection's window into the merged cache. True when all answered.
+    """This install's merged calendar, re-read. True when every connection answered.
 
-    A connection that does not answer keeps the rows it contributed last time rather than
-    vanishing from the week: "we could not look" and "nothing is due" are different claims
-    and only one of them is true. The caller gets False so the page can say which it is.
-
-    Rows from a connection that no longer exists are dropped rather than kept — otherwise
-    a deleted Radarr would go on filling days forever, with nothing left to refresh it.
+    An adapter, not an implementation: the morning job needs exactly this work done and
+    has no request to hang it off, so the work itself lives in `ServerRefresher`.
     """
-    now = datetime.now(UTC)
-    start, end = window_for(now.date())
-    apps = request.app.state.apps.list_apps(kind=None)
-    # Every connection at once: one slow server costs the timeout, never the sum.
-    results = await asyncio.gather(
-        *[_read_calendar(request, app, start=start, end=end, now=now) for app in apps]
-    )
-    answered = {
-        app.name for app, rows in zip(apps, results, strict=True) if rows is not None
-    }
-    configured = {app.name for app in apps}
-    kept = [
-        entry
-        for entry in request.app.state.calendar_cache.load()
-        if entry.connection in configured and entry.connection not in answered
-    ]
-    fresh = [entry for rows in results if rows is not None for entry in rows]
-    if answered or not apps:
-        # Nothing answered means nothing was learned. Writing an empty week here would
-        # stamp it fresh and turn "we could not look" into "nothing is due" — so the
-        # previous answer keeps its own timestamp and stays visibly stale instead. With
-        # no connections configured at all, an empty week is the true answer.
-        request.app.state.calendar_cache.save(fresh + kept)
-    return all(rows is not None for rows in results)
+    return await request.app.state.refresher.calendar()
 
 
 async def load_all_sonarr_options(request: Request) -> dict[str, RadarrOptions]:

@@ -49,6 +49,8 @@ class AuditAction:
     APP_REMOVED = "app_removed"
     APP_TESTED = "app_tested"
     DISCOVER_REFRESHED = "discover_refreshed"
+    CALENDAR_REFRESHED = "calendar_refreshed"
+    REFRESH_FAILED = "refresh_failed"
     DISCOVERY_KEY_SAVED = "discovery_key_saved"  # noqa: S105 — action name, not a secret
     DISCOVERY_KEY_REMOVED = "discovery_key_removed"  # noqa: S105 — action name
     MEDIA_SERVER_UPDATED = "media_server_updated"

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -13,10 +13,15 @@ from app.services.filters import SCHEDULE_MODE_INTERVAL
 from app.services.reports import Report, ReportTotals, RunStatus
 from app.services.scheduler import (
     BACKUP_JOB_ID,
+    CALENDAR_JOB_ID,
+    DAILY_REFRESH_HOUR_UTC,
+    DAILY_REFRESH_JITTER_SECONDS,
     MAX_JITTER_SECONDS,
+    SERIES_JOB_ID,
     BoxMediaScheduler,
     _jitter_for,
 )
+from app.services.sonarr import SonarrError
 
 WEEKLY_HOURS = 168
 
@@ -241,3 +246,227 @@ async def test_the_scheduler_still_works_without_an_audit_handle(tmp_path: Path)
         backups=FailingBackups(BackupError("nope")), backup_interval_days=1,
     )
     await scheduler._run_backup()
+
+
+class StubRefresher:
+    """Stands in for ServerRefresher: records what the morning jobs asked it to do."""
+
+    def __init__(self, complete: bool = True, error: Exception | None = None) -> None:
+        self.calls: list[str] = []
+        self.complete = complete
+        self.error = error
+
+    async def calendar(self) -> bool:
+        self.calls.append("calendar")
+        if self.error is not None:
+            raise self.error
+        return self.complete
+
+    async def series(self) -> bool:
+        self.calls.append("series")
+        if self.error is not None:
+            raise self.error
+        return self.complete
+
+
+def _with_refresher(refresher: object, **overrides: object) -> BoxMediaScheduler:
+    return BoxMediaScheduler(
+        StubPipeline(), interval_hours=WEEKLY_HOURS, refresher=refresher, **overrides
+    )
+
+
+# --- TV step 15: the morning jobs ---
+
+
+async def test_both_morning_jobs_fire_daily_at_six_utc() -> None:
+    scheduler = _with_refresher(StubRefresher())
+    scheduler.start()
+    try:
+        for job_id in (CALENDAR_JOB_ID, SERIES_JOB_ID):
+            job = scheduler._scheduler.get_job(job_id)
+            assert job is not None, job_id
+            fields = {field.name: str(field) for field in job.trigger.fields}
+            assert fields["hour"] == str(DAILY_REFRESH_HOUR_UTC)
+            # Every day: a calendar that is a day stale is a calendar nobody trusts.
+            assert fields["day_of_week"] == "*"
+            assert str(job.trigger.timezone) == "UTC"
+    finally:
+        scheduler.shutdown()
+
+
+async def test_the_morning_jobs_are_jittered_like_everything_else() -> None:
+    scheduler = _with_refresher(StubRefresher())
+    scheduler.start()
+    try:
+        for job_id in (CALENDAR_JOB_ID, SERIES_JOB_ID):
+            job = scheduler._scheduler.get_job(job_id)
+            assert job.trigger.jitter == DAILY_REFRESH_JITTER_SECONDS
+    finally:
+        scheduler.shutdown()
+
+
+async def test_no_morning_jobs_without_a_refresher() -> None:
+    """A bare scheduler runs the weekly chart job and nothing else — the same shape the
+    backup service already has."""
+    scheduler = BoxMediaScheduler(StubPipeline(), interval_hours=WEEKLY_HOURS)
+    scheduler.start()
+    try:
+        assert scheduler._scheduler.get_job(CALENDAR_JOB_ID) is None
+        assert scheduler._scheduler.get_job(SERIES_JOB_ID) is None
+    finally:
+        scheduler.shutdown()
+
+
+async def test_the_morning_jobs_get_no_catchup() -> None:
+    """Unlike a missed week, a missed refresh is not a hole: the page re-reads on open
+    when its cache is stale. Catching up would spend a burst of requests at boot to buy
+    back what the next page view buys for free."""
+    scheduler = _with_refresher(StubRefresher())
+    scheduler.start()
+    try:
+        assert scheduler._scheduler.get_job(f"{CALENDAR_JOB_ID}-catchup") is None
+        assert scheduler._scheduler.get_job(f"{SERIES_JOB_ID}-catchup") is None
+    finally:
+        scheduler.shutdown()
+
+
+async def test_saving_settings_leaves_the_morning_jobs_alone() -> None:
+    """Reschedule-on-save touches the chart and backup jobs, which is what the form
+    changes. The morning pair has no setting behind it and must simply keep firing."""
+    scheduler = _with_refresher(StubRefresher(), backups=StubBackups())
+    scheduler.start()
+    try:
+        before = scheduler.next_calendar_run_at()
+        scheduler.reschedule(24, backup_interval_days=2)
+        job = scheduler._scheduler.get_job(CALENDAR_JOB_ID)
+        assert job is not None
+        assert scheduler.next_calendar_run_at() == before
+        assert scheduler._scheduler.get_job(SERIES_JOB_ID) is not None
+    finally:
+        scheduler.shutdown()
+
+
+async def test_the_calendar_job_refreshes_the_calendar() -> None:
+    refresher = StubRefresher()
+    await _with_refresher(refresher)._run_calendar_refresh()
+    assert refresher.calls == ["calendar"]
+
+
+async def test_the_series_job_refreshes_the_series_snapshot() -> None:
+    refresher = StubRefresher()
+    await _with_refresher(refresher)._run_series_refresh()
+    assert refresher.calls == ["series"]
+
+
+async def test_a_scheduled_calendar_refresh_is_audited(tmp_path: Path) -> None:
+    """A page states a claim from this — "Last fetch: …" — and the audit log is where an
+    admin checks that claim against what actually ran."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    scheduler = _with_refresher(StubRefresher(complete=False), audit=audit)
+
+    await scheduler._run_calendar_refresh()
+
+    rows = [row for row in audit.tail(10) if row["action"] == "calendar_refreshed"]
+    assert len(rows) == 1
+    assert rows[0]["complete"] is False
+
+
+async def test_the_series_job_writes_no_audit_row(tmp_path: Path) -> None:
+    """It backs no visible claim about freshness, and a second daily row would be noise in
+    a log that is read for sign-ins and key changes."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+
+    await _with_refresher(StubRefresher(), audit=audit)._run_series_refresh()
+
+    assert audit.tail(10) == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError(28, "No space left on device"),  # the realistic one: the cache write
+        SonarrError("connection reset"),
+    ],
+)
+async def test_a_failed_morning_job_is_recorded_and_survived(
+    tmp_path: Path, error: Exception
+) -> None:
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    scheduler = _with_refresher(StubRefresher(error=error), audit=audit)
+
+    await scheduler._run_calendar_refresh()  # must not raise — one bad morning is not fatal
+
+    rows = [row for row in audit.tail(10) if row["action"] == "refresh_failed"]
+    assert len(rows) == 1
+    assert rows[0]["job"] == CALENDAR_JOB_ID
+    assert str(error) in rows[0]["error"]
+    # And the claim it would otherwise have made is NOT written down.
+    assert [row for row in audit.tail(10) if row["action"] == "calendar_refreshed"] == []
+
+
+async def test_a_programming_error_in_a_morning_job_is_not_swallowed(
+    tmp_path: Path,
+) -> None:
+    """Environment failures are survived; a bug should still surface loudly rather than
+    being logged as "refresh failed" every morning — the backup job's own rule."""
+    scheduler = _with_refresher(
+        StubRefresher(error=TypeError("bad call")), audit=AuditLog(tmp_path / "audit.jsonl")
+    )
+    with pytest.raises(TypeError):
+        await scheduler._run_calendar_refresh()
+
+
+async def test_a_failing_series_job_is_recorded_under_its_own_name(
+    tmp_path: Path,
+) -> None:
+    audit = AuditLog(tmp_path / "audit.jsonl")
+
+    await _with_refresher(
+        StubRefresher(error=OSError("disk")), audit=audit
+    )._run_series_refresh()
+
+    rows = [row for row in audit.tail(10) if row["action"] == "refresh_failed"]
+    assert rows[0]["job"] == SERIES_JOB_ID
+
+
+async def test_next_calendar_run_at_is_none_before_start() -> None:
+    assert _with_refresher(StubRefresher()).next_calendar_run_at() is None
+
+
+async def test_next_calendar_run_at_reports_the_morning_job() -> None:
+    """What the calendar page prints beside the last fetch."""
+    scheduler = _with_refresher(StubRefresher())
+    scheduler.start()
+    try:
+        next_run = scheduler.next_calendar_run_at()
+        assert next_run is not None
+        assert next_run > datetime.now(UTC)
+    finally:
+        scheduler.shutdown()
+
+
+async def test_a_morning_job_without_a_refresher_does_nothing_rather_than_crashing() -> None:
+    """The bodies are reachable through APScheduler's own machinery; neither may assume
+    the optional collaborator is there."""
+    scheduler = BoxMediaScheduler(StubPipeline(), interval_hours=WEEKLY_HOURS)
+    await scheduler._run_calendar_refresh()
+    await scheduler._run_series_refresh()
+
+
+async def test_nothing_reaches_a_third_party_unattended() -> None:
+    """The whole registered set, pinned. Discover deliberately has no job — its TTL and
+    its Refresh button are enough, and unattended traffic to Trakt and TMDB should stay at
+    zero. This fails the moment a job is added that would change that, which is the point:
+    the decision is easy to make again by accident.
+    """
+    scheduler = _with_refresher(StubRefresher(), backups=StubBackups(), backup_interval_days=1)
+    scheduler.start()
+    try:
+        registered = {job.id for job in scheduler._scheduler.get_jobs()}
+        assert registered <= {
+            "weekly-box-office", "weekly-box-office-catchup",
+            BACKUP_JOB_ID, CALENDAR_JOB_ID, SERIES_JOB_ID,
+        }
+        assert CALENDAR_JOB_ID in registered and SERIES_JOB_ID in registered
+    finally:
+        scheduler.shutdown()
