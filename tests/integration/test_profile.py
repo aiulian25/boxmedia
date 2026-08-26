@@ -172,13 +172,13 @@ def test_choosing_light_is_stored_and_rendered(harness: AppHarness) -> None:
     assert response.status_code == 303
     assert ProfileStatus.THEME_UPDATED in response.headers["location"]
     assert "theme: light" in _user_yml(harness)
-    assert 'class="light"' in harness.client.get("/dashboard").text
+    assert 'class="light"' in harness.client.get("/library").text
 
 
 def test_the_default_is_dark_and_says_so_in_the_markup(harness: AppHarness) -> None:
     harness.activate()
 
-    assert 'class="dark"' in harness.client.get("/dashboard").text
+    assert 'class="dark"' in harness.client.get("/library").text
 
 
 def test_switching_back_to_dark_works(harness: AppHarness) -> None:
@@ -187,7 +187,7 @@ def test_switching_back_to_dark_works(harness: AppHarness) -> None:
 
     harness.client.post(THEME_PATH, data={"theme": "dark"}, follow_redirects=False)
 
-    assert 'class="dark"' in harness.client.get("/dashboard").text
+    assert 'class="dark"' in harness.client.get("/library").text
     assert "theme: dark" in _user_yml(harness)
 
 
@@ -203,7 +203,7 @@ def test_an_unknown_theme_is_refused_and_changes_nothing(harness: AppHarness) ->
 
     assert ProfileStatus.INVALID_PROFILE in response.headers["location"]
     assert _user_yml(harness) == before
-    assert 'class="dark"' in harness.client.get("/dashboard").text
+    assert 'class="dark"' in harness.client.get("/library").text
 
 
 def test_a_crafted_theme_never_reaches_the_markup(harness: AppHarness) -> None:
@@ -212,7 +212,7 @@ def test_a_crafted_theme_never_reaches_the_markup(harness: AppHarness) -> None:
     harness.client.post(
         THEME_PATH, data={"theme": '"><script>alert(1)</script>'}, follow_redirects=False
     )
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "<script>alert(1)</script>" not in page
     assert 'class="dark"' in page
@@ -233,7 +233,7 @@ def test_a_user_yml_written_before_the_setting_existed_loads_as_dark(
     )
     assert "theme:" not in path.read_text(encoding="utf-8")
 
-    page = harness.client.get("/dashboard")
+    page = harness.client.get("/library")
 
     assert page.status_code == 200
     assert 'class="dark"' in page.text
@@ -248,7 +248,7 @@ def test_a_theme_this_build_does_not_ship_falls_back_rather_than_failing(
     path.write_text(path.read_text(encoding="utf-8").replace("theme: dark", "theme: solarized"),
                     encoding="utf-8")
 
-    page = harness.client.get("/dashboard")
+    page = harness.client.get("/library")
 
     assert page.status_code == 200
     assert 'class="dark"' in page.text

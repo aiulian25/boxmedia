@@ -21,13 +21,15 @@
 <body class="bg-background text-on-background min-h-screen font-body-md antialiased"{% if current_user %} data-progress-url="{{ url_base }}/progress"{% endif %}>
 {% if current_user %}
 <header class="topnav">
-  <a class="brand" href="{{ url_base }}/dashboard">
+  <a class="brand" href="{{ url_base }}/library">
     <img class="brand-mark" src="{{ url_base }}/static/logo.png?v={{ asset_version }}" alt="" width="32" height="32">
     <span>{{ brand }}</span>
   </a>
   <nav class="navlinks">
-    <a href="{{ url_base }}/dashboard" class="{% if active_nav == 'dashboard' %}active{% endif %}">Box Office</a>
-    <a href="{{ url_base }}/reports" class="{% if active_nav == 'reports' %}active{% endif %}">Weekly Reports</a>
+    <a href="{{ url_base }}/library" class="{% if active_nav == 'library' %}active{% endif %}">Library</a>
+    <a href="{{ url_base }}/reports" class="{% if active_nav == 'boxoffice' %}active{% endif %}">Box Office</a>
+    <a href="{{ url_base }}/discover" class="{% if active_nav == 'discover' %}active{% endif %}">Discover</a>
+    <a href="{{ url_base }}/calendar" class="{% if active_nav == 'calendar' %}active{% endif %}">Calendar</a>
     <a href="{{ url_base }}/settings" class="{% if active_nav == 'settings' %}active{% endif %}">Settings</a>
   </nav>
   {# One group so the bar keeps three flex children and justify-between spaces the

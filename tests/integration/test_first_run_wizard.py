@@ -39,7 +39,7 @@ def test_settings_shows_welcome_banner_until_connection_added(harness: AppHarnes
     assert "Welcome to BoxMedia" not in after.text
 
 
-def test_forced_change_goes_to_dashboard_when_connection_exists(harness: AppHarness) -> None:
+def test_forced_change_goes_to_the_library_when_connection_exists(harness: AppHarness) -> None:
     # Pre-seed a connection, then run the forced-change flow.
     harness.client.app.state.apps.add(name="Radarr", url=RADARR_URL, api_key=RADARR_KEY)
     harness.client.post(
@@ -52,4 +52,4 @@ def test_forced_change_goes_to_dashboard_when_connection_exists(harness: AppHarn
         data={"new_password": NEW_PASSWORD, "confirm_password": NEW_PASSWORD},
         follow_redirects=False,
     )
-    assert changed.headers["location"].endswith("/dashboard")
+    assert changed.headers["location"].endswith("/library")

@@ -504,6 +504,9 @@ html.light {
   /* Sits opposite the search box; wraps under it on narrow screens because .toolbar is
      flex-wrap, so a long translated count never squeezes the input. */
   .library-count { @apply text-label-md text-outline pb-2 whitespace-nowrap; }
+  /* The number inside a Library chip. Dimmed rather than sized down: it has to stay
+     legible on the filled chip too, where the ground is the primary colour. */
+  .chip-count { @apply ml-2 opacity-60 tabular-nums; }
   .poster-grid { @apply grid grid-cols-2 md:grid-cols-5 gap-4; }
   /* scroll-mt clears the 64px sticky topnav: without it the browser lands the card
      exactly under the bar and the title the user searched for is the one thing hidden.

@@ -1,0 +1,60 @@
+{# One series in the Library grid — the film card's anatomy, class for class.
+
+   .poster-card, .poster-shell, .poster-frame, .rank-chip, .where / .where-chip and
+   .server-hint are all the objects the film card already uses, so a series is a
+   different thing to look at rather than a different kind of page. Nothing new was
+   invented for it, and nothing here can be purged out of the built stylesheet. #}
+  <div class="poster-card">
+    <div class="poster-shell">
+      {# Sonarr keys series on TVDB and only sometimes carries a TMDB id, so a card
+         without one gets no link rather than a guessed address — exactly what a film
+         Radarr never matched does. #}
+      <a class="poster-frame{% if not card.tmdb_id %} poster-frame-plain{% endif %}"
+         {% if card.tmdb_id %}href="{{ url_base }}/shows/{{ card.tmdb_id }}" data-show="{{ card.tmdb_id }}"{% endif %}>
+        {% if card.poster_local %}
+        <img src="{{ card.poster_local }}" alt="{{ card.title }} poster">
+        {% else %}
+        <div class="poster-empty">Poster</div>
+        {% endif %}
+        {# The type mark sits in the rank chip's slot — the one overlay position a film
+           card leaves empty here, and the reason no new geometry was needed. #}
+        <div class="rank-chip">TV</div>
+        <div class="badge">
+          {% if card.complete %}
+          <span class="dot dot-in-library"></span><span>In Sonarr</span>
+          {% else %}
+          <span class="dot dot-wanted"></span><span>Incomplete</span>
+          {% endif %}
+        </div>
+      </a>
+      {# Which Sonarr holds it, with how much of it is on disk as a band along the chip's
+         own bottom edge — the same eleven literal classes the film chip fills with
+         download progress, because a per-card width would have to be an inline style and
+         the CSP forbids one. The exact figure is in the tooltip.
+
+         Deliberately NO data-progress: the poller answers in Radarr download percentages,
+         and letting it repaint this band would replace "how much you have" with "how much
+         is arriving" — two different claims wearing the same stripe. #}
+      <div class="where">
+        <a class="where-chip{% if not card.complete %} where-chip-pending{% endif %}{% if card.band_step is not none %} where-chip-p{{ card.band_step }}{% endif %}"
+           {% if card.sonarr_url %}href="{{ card.sonarr_url }}" target="_blank" rel="noopener noreferrer" title="Open {{ card.title }} on {{ card.connection }} — {{ card.holding }}"{% else %}title="{{ card.connection }} — {{ card.holding }}"{% endif %}>{{ card.connection }}</a>
+      </div>
+    </div>
+    <div class="poster-title">{{ card.title }}</div>
+    {# What you hold, stated as a fact in the green register either way — the same words
+       the series detail and the Discover shelf use, so one series never reads three ways
+       depending on which page you found it on. Wraps rather than widening the card. #}
+    <span class="server-hint" title="{{ card.holding }}">{{ card.holding }}</span>
+    {# Only on a series Sonarr has not finished: the episodes you are missing may already
+       be watchable. Amber stays what it is everywhere else — a guess, asking you to check
+       it — and green stays a fact. #}
+    {% if card.server_state == "yes" %}
+    <span class="server-hint" title="Your {{ server_name }} server holds this series (matched by id)">Already in {{ server_name }}</span>
+    {% elif card.server_state == "probably" %}
+    <span class="guess-hint" title="A {{ server_name }} series of the same name and year — nothing verified it is the same show">Probably in {{ server_name }} — verify</span>
+    {% endif %}
+    <div class="poster-meta">
+      <span class="gross">{% if card.year %}{{ card.year }}{% endif %}</span>
+      <span class="links"></span>
+    </div>
+  </div>

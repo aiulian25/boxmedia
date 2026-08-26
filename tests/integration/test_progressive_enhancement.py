@@ -143,7 +143,7 @@ def test_the_scroll_to_top_control_ships_hidden_on_every_page(harness: AppHarnes
     scroll — and with the script blocked it would never go away again."""
     harness.activate()
 
-    for path in ("/dashboard", "/reports", "/settings"):
+    for path in ("/library", "/reports", "/settings"):
         assert "hidden" in _to_top_tag(harness.client.get(path).text), (
             f"scroll-to-top is not hidden on {path}"
         )
@@ -164,7 +164,7 @@ def test_the_scroll_to_top_control_mutates_nothing(harness: AppHarness) -> None:
     absence costs a shortcut, not a capability.
     """
     harness.activate()
-    tag = _to_top_tag(harness.client.get("/dashboard").text)
+    tag = _to_top_tag(harness.client.get("/library").text)
 
     assert 'type="button"' in tag  # never a submit, even inside a form
     assert "formaction" not in tag

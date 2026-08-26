@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Library{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h2 class="headline-lg">Library</h2>
+  <p class="subtle">Everything you hold — films in Radarr and series in Sonarr, added here or already there. Add films from <a href="{{ url_base }}/reports">Box Office</a> and series from <a href="{{ url_base }}/discover">Discover</a>.</p>
+</section>
+
+{# The sign-in notice renders in base.html's toast region — one transient-message
+   treatment for the whole app. The banner below is NOT transient: an unreachable Radarr
+   is a state that persists until it is fixed, so it stays on the page. #}
+{% if unreachable %}
+<p class="banner-warn" role="alert">Couldn’t reach {{ unreachable | join(', ') }} — showing the last known library status.</p>
+{% endif %}
+
+{# Real links, not a script filter: the chip row is navigation, so it survives with
+   JavaScript off, is bookmarkable, and the back button does what it should. The same
+   three chips Discover and the Calendar offer, in the same two classes — a chip that
+   looked different on one page would read as a different control. #}
+<div class="run-actions">
+  {% for option in media_types %}
+  <a class="{% if option == media_type %}btn-primary{% else %}btn-secondary{% endif %}"
+     href="{{ url_base }}{{ library_path }}?type={{ option }}{% if query %}&amp;q={{ query }}{% endif %}">
+    {% if option == 'all' %}All{% elif option == 'movies' %}Movies{% else %}TV{% endif %}
+    <span class="chip-count">{{ counts[option] }}</span>
+  </a>
+  {% endfor %}
+</div>
+
+<div class="toolbar">
+  <form class="search" method="get" action="{{ url_base }}{{ library_path }}">
+    {# Carried, so searching does not silently drop you back into All. #}
+    {% if media_type != 'all' %}<input type="hidden" name="type" value="{{ media_type }}">{% endif %}
+    <input type="text" name="q" value="{{ query }}" placeholder="Search library…" aria-label="Search library">
+  </form>
+  {# The count the grid can't show while it is paginated — the answer to "I have more
+     than this, where are they?". #}
+  {% if total %}
+  <span class="library-count">{% if query %}{{ total }} match{% if total != 1 %}es{% endif %}{% else %}{{ total }} title{% if total != 1 %}s{% endif %}{% endif %}{% if has_more %} · showing {{ cards | length }}{% endif %}</span>
+  {% endif %}
+</div>
+
+{% if cards %}
+<div class="poster-grid">
+  {% for card in cards %}{% if card.kind == 'movie' %}{% include "_movie_card.html" %}{% else %}{% include "_series_card.html" %}{% endif %}{% endfor %}
+</div>
+
+{% if has_more %}
+<div class="load-more">
+  {# Driven by PAGE_INCREMENT, not spelled out: a hardcoded number silently lies the
+     moment the increment changes. #}
+  <a class="btn-secondary" href="{{ url_base }}{{ library_path }}?limit={{ next_limit }}{% if query %}&amp;q={{ query }}{% endif %}{% if media_type != 'all' %}&amp;type={{ media_type }}{% endif %}">Show {{ page_increment }} More</a>
+</div>
+{% endif %}
+
+{% elif query %}
+<div class="empty-state">Nothing here matches “{{ query }}”.</div>
+{% elif has_any_reports or has_any_series %}
+<div class="empty-state">Nothing in your library yet. Open <a href="{{ url_base }}/reports">Box Office</a> and add the films you want, or <a href="{{ url_base }}/discover">Discover</a> for series.</div>
+{% else %}
+<div class="empty-state">
+  No box-office runs yet. Configure a Radarr connection in Settings, then run a week under <a href="{{ url_base }}/reports">Box Office</a>.
+</div>
+{% endif %}
+{% endblock %}

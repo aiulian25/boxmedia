@@ -156,11 +156,11 @@ def test_a_dead_connection_is_asked_once_not_once_per_page(harness: AppHarness) 
     _add_app(harness)
     library = respx.get(LIBRARY_URL).mock(side_effect=httpx.ConnectError("down"))
 
-    harness.client.get("/dashboard")
+    harness.client.get("/library")
     assert library.call_count == 1
 
-    harness.client.get("/dashboard")
-    harness.client.get("/dashboard")
+    harness.client.get("/library")
+    harness.client.get("/library")
 
     assert library.call_count == 1, "the dead connection was asked again"
 
@@ -173,8 +173,8 @@ def test_the_page_still_says_the_connection_is_unreachable(harness: AppHarness) 
     _add_app(harness)
     respx.get(LIBRARY_URL).mock(side_effect=httpx.ConnectError("down"))
 
-    harness.client.get("/dashboard")
-    page = harness.client.get("/dashboard").text
+    harness.client.get("/library")
+    page = harness.client.get("/library").text
 
     assert "Couldn’t reach" in page or "Couldn't reach" in page
     assert "Radarr" in page
@@ -191,8 +191,8 @@ def test_a_recovering_connection_is_tried_again_after_the_wait(harness: AppHarne
     )
     library = respx.get(LIBRARY_URL).mock(side_effect=httpx.ConnectError("down"))
 
-    harness.client.get("/dashboard")
-    harness.client.get("/dashboard")
+    harness.client.get("/library")
+    harness.client.get("/library")
 
     assert library.call_count == 2
 
@@ -207,7 +207,7 @@ def test_the_health_dots_always_really_try(harness: AppHarness) -> None:
     status = respx.get(STATUS_URL).mock(side_effect=httpx.ConnectError("down"))
     _mock_options(httpx.Response(500))
 
-    harness.client.get("/dashboard")  # arms the backoff
+    harness.client.get("/library")  # arms the backoff
     before = status.call_count
     harness.client.get("/settings")
     harness.client.get("/settings")
@@ -223,7 +223,7 @@ def test_test_connection_always_really_tries(harness: AppHarness) -> None:
     status = respx.get(STATUS_URL).mock(side_effect=httpx.ConnectError("down"))
     app_id = harness.client.app.state.apps.list_apps()[0].id
 
-    harness.client.get("/dashboard")  # arms the backoff
+    harness.client.get("/library")  # arms the backoff
     before = status.call_count
     harness.client.post(f"/settings/apps/{app_id}/test", follow_redirects=False)
 
@@ -239,7 +239,7 @@ def test_editing_a_connection_clears_its_backoff(harness: AppHarness) -> None:
     library = respx.get(LIBRARY_URL).mock(side_effect=httpx.ConnectError("down"))
     app_id = harness.client.app.state.apps.list_apps()[0].id
 
-    harness.client.get("/dashboard")
+    harness.client.get("/library")
     assert library.call_count == 1
 
     harness.client.post(
@@ -247,7 +247,7 @@ def test_editing_a_connection_clears_its_backoff(harness: AppHarness) -> None:
         data={"name": "Radarr", "url": RADARR_URL, "api_key": RADARR_KEY},
         follow_redirects=False,
     )
-    harness.client.get("/dashboard")
+    harness.client.get("/library")
 
     assert library.call_count == 2
 
@@ -260,7 +260,7 @@ def test_a_healthy_connection_is_never_skipped(harness: AppHarness) -> None:
     library = respx.get(LIBRARY_URL).mock(return_value=httpx.Response(200, json=[]))
 
     for _ in range(3):
-        harness.client.get("/dashboard")
+        harness.client.get("/library")
 
     assert library.call_count == 3
 
@@ -276,8 +276,8 @@ def test_one_dead_connection_does_not_silence_a_healthy_one(harness: AppHarness)
     dead = respx.get(LIBRARY_URL).mock(side_effect=httpx.ConnectError("down"))
     alive = respx.get(f"{second}/api/v3/movie").mock(return_value=httpx.Response(200, json=[]))
 
-    harness.client.get("/dashboard")
-    harness.client.get("/dashboard")
+    harness.client.get("/library")
+    harness.client.get("/library")
 
     assert dead.call_count == 1
     assert alive.call_count == 2

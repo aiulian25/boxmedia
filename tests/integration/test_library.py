@@ -1,4 +1,9 @@
-"""Step 16 test: dashboard renders statuses, search, pagination, Run Now."""
+"""Step 16 test: the Library grid renders statuses, search, pagination, Run Now.
+
+Was `test_dashboard.py`. The page it covers became the Library in TV step 16; the
+film half it asserts is unchanged, which is the point — these tests are half of
+ruling 4's regression contract, the golden diff in `test_spine.py` being the other.
+"""
 
 from __future__ import annotations
 
@@ -20,8 +25,8 @@ from app.services.reports import (
     RunStatus,
     RunTrigger,
 )
-from app.web.dashboard import DEFAULT_LIMIT, PAGE_INCREMENT
 from app.web.deps import radarr_url_for
+from app.web.library import DEFAULT_LIMIT, PAGE_INCREMENT
 from tests.conftest import AppHarness
 from tests.integration.conftest import QUEUE_ROUTE, queue_records
 
@@ -61,7 +66,7 @@ def test_dashboard_renders_statuses(harness: AppHarness) -> None:
             _movie(3, "The Iron Claw", MovieStatus.MISSING),
         ],
     )
-    page = harness.client.get("/dashboard")
+    page = harness.client.get("/library")
     assert page.status_code == 200
     # The dashboard is the LIBRARY view: only in-library + wanted titles appear.
     assert "Dune Part Two" in page.text
@@ -81,7 +86,7 @@ def test_dashboard_search_filters(harness: AppHarness) -> None:
             _movie(2, "Neon Rain", MovieStatus.WANTED),
         ],
     )
-    page = harness.client.get("/dashboard", params={"q": "neon"})
+    page = harness.client.get("/library", params={"q": "neon"})
     assert "Neon Rain" in page.text
     assert "Dune Part Two" not in page.text
 
@@ -95,11 +100,11 @@ def test_dashboard_pagination(harness: AppHarness) -> None:
         [_movie(i, f"Movie {i:03d}", MovieStatus.WANTED) for i in range(1, DEFAULT_LIMIT + 6)],
     )
 
-    default_view = harness.client.get("/dashboard").text
+    default_view = harness.client.get("/library").text
     assert default_view.count('class="poster-title"') == DEFAULT_LIMIT
     assert f"Show {PAGE_INCREMENT} More" in default_view
 
-    full = harness.client.get("/dashboard", params={"limit": DEFAULT_LIMIT + PAGE_INCREMENT}).text
+    full = harness.client.get("/library", params={"limit": DEFAULT_LIMIT + PAGE_INCREMENT}).text
     assert "More" not in full.split('class="load-more"')[0][-200:]  # no link left
     assert full.count('class="poster-title"') == DEFAULT_LIMIT + 5
 
@@ -113,7 +118,7 @@ def test_a_library_under_the_cap_shows_everything_without_a_link(
         harness, [_movie(i, f"Movie {i:03d}", MovieStatus.WANTED) for i in range(1, 32)]
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert page.count('class="poster-title"') == 31
     assert "load-more" not in page  # nothing to click — just scroll
@@ -127,7 +132,7 @@ def test_the_load_more_label_matches_the_increment(harness: AppHarness) -> None:
         [_movie(i, f"Movie {i:03d}", MovieStatus.WANTED) for i in range(1, DEFAULT_LIMIT + 3)],
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert f"Show {PAGE_INCREMENT} More" in page
     assert f"limit={DEFAULT_LIMIT + PAGE_INCREMENT}" in page
@@ -135,7 +140,7 @@ def test_the_load_more_label_matches_the_increment(harness: AppHarness) -> None:
 
 def test_empty_dashboard_prompts_setup(harness: AppHarness) -> None:
     harness.activate()
-    page = harness.client.get("/dashboard")
+    page = harness.client.get("/library")
     assert "No box-office runs yet" in page.text
 
 
@@ -155,7 +160,7 @@ def test_dashboard_drops_titles_deleted_from_radarr(harness: AppHarness) -> None
     respx.get(f"{API}/movie").mock(
         return_value=httpx.Response(200, json=[{"tmdbId": 1001, "id": 5, "hasFile": True}])
     )
-    page = harness.client.get("/dashboard")
+    page = harness.client.get("/library")
     assert "Dune Part Two" in page.text  # still in Radarr -> shown
     assert "Neon Rain" not in page.text  # deleted from Radarr -> dropped
 
@@ -181,7 +186,7 @@ def test_library_card_shows_weeks_tracked_and_total(harness: AppHarness) -> None
             movies=[_movie(1, "Dune Part Two", MovieStatus.IN_LIBRARY)],
         ))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert "2 weeks tracked" in page
     assert "$2.0M tracked" in page  # $1.0M charted in each of the two weeks
 
@@ -223,7 +228,7 @@ def test_a_title_on_the_second_box_appears_at_all(harness: AppHarness) -> None:
         return_value=httpx.Response(200, json=[{"tmdbId": 1001, "id": 5, "hasFile": True}])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert "Dune Part Two" in page
     assert _chips(page, "Dune Part Two") == ["Living Room 4K"]
 
@@ -239,7 +244,7 @@ def test_a_queued_title_says_where_it_will_land(harness: AppHarness) -> None:
         return_value=httpx.Response(200, json=[{"tmdbId": 1001, "id": 5, "hasFile": False}])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert "Wanted" in page and "In Library" not in page
     assert _chips(page, "Dune Part Two") == ["↓ Living Room 4K"]
 
@@ -258,7 +263,7 @@ def test_a_title_on_both_boxes_names_both(harness: AppHarness) -> None:
         return_value=httpx.Response(200, json=[{"tmdbId": 1001, "id": 9, "hasFile": False}])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert _chips(page, "Dune Part Two") == ["Main", "↓ Living Room 4K"]
     assert "In Library · Bluray-1080p" in page
 
@@ -277,7 +282,7 @@ def test_two_downloaded_copies_claim_no_single_quality(harness: AppHarness) -> N
         {"tmdbId": 1001, "id": 9, "hasFile": True,
          "movieFile": {"quality": {"quality": {"name": "WEBDL-2160p"}}}}]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert _chips(page, "Dune Part Two") == ["Main", "Living Room 4K"]
     assert "In Library" in page
     assert "Bluray-1080p" not in page and "WEBDL-2160p" not in page
@@ -293,7 +298,7 @@ def test_one_holder_still_names_the_quality(harness: AppHarness) -> None:
          "movieFile": {"quality": {"quality": {"name": "Bluray-1080p"}}}}]))
     respx.get(f"{SECOND_API}/movie").mock(return_value=httpx.Response(200, json=[]))
 
-    assert "In Library · Bluray-1080p" in harness.client.get("/dashboard").text
+    assert "In Library · Bluray-1080p" in harness.client.get("/library").text
 
 
 @respx.mock
@@ -306,7 +311,7 @@ def test_a_silent_box_cannot_evict_its_own_titles(harness: AppHarness) -> None:
     respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[]))  # answers: absent
     respx.get(f"{SECOND_API}/movie").mock(return_value=httpx.Response(500))    # silent
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert "Dune Part Two" in page  # kept — it may well live on the silent box
     assert "Couldn’t reach Living Room 4K" in page
     assert _chips(page, "Dune Part Two") == []
@@ -321,7 +326,7 @@ def test_both_boxes_answering_still_drops_a_deleted_title(harness: AppHarness) -
     respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[]))
     respx.get(f"{SECOND_API}/movie").mock(return_value=httpx.Response(200, json=[]))
 
-    assert "Dune Part Two" not in harness.client.get("/dashboard").text
+    assert "Dune Part Two" not in harness.client.get("/library").text
 
 
 @respx.mock
@@ -338,7 +343,7 @@ def test_a_proxy_login_page_from_radarr_does_not_500_the_dashboard(harness: AppH
         return_value=httpx.Response(200, text="<html><body>Sign in to continue</body></html>")
     )
 
-    page = harness.client.get("/dashboard")
+    page = harness.client.get("/library")
 
     assert page.status_code == 200
     assert "Couldn’t reach Main" in page.text
@@ -385,7 +390,7 @@ def test_a_library_title_no_week_ever_charted_is_still_listed(harness: AppHarnes
         _library_entry(5002, "Alien", has_file=False),
     ]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "Dune Part Two" in page
     assert "The Thing" in page
@@ -404,7 +409,7 @@ def test_a_library_only_title_keeps_its_poster_and_shows_its_year(harness: AppHa
         _library_entry(5001, "The Thing", year=1982),
     ]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     frame = page.split('class="poster-title">The Thing')[0].rsplit('class="poster-card"', 1)[1]
     assert "/posters/" in frame          # a real poster, fetched via the local cache
@@ -426,7 +431,7 @@ def test_a_charted_title_keeps_its_box_office_figures(harness: AppHarness) -> No
         _library_entry(5001, "The Thing"),
     ]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "$1.0M (Wk 1)" in page                       # the charted one, unchanged
     assert page.index("Dune Part Two") < page.index("The Thing")  # charted first
@@ -442,7 +447,7 @@ def test_a_title_both_charted_and_in_the_library_appears_once(harness: AppHarnes
         return_value=httpx.Response(200, json=[_library_entry(1001, "Dune Part Two")])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert page.count('class="poster-title"') == 1
 
@@ -461,7 +466,7 @@ def test_the_same_title_on_two_boxes_is_one_card(harness: AppHarness) -> None:
         return_value=httpx.Response(200, json=[_library_entry(5001, "The Thing")])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert page.count('class="poster-title"') == 1
     assert _chips(page, "The Thing") == ["Main", "Living Room 4K"]
@@ -479,7 +484,7 @@ def test_search_finds_a_library_only_title(harness: AppHarness) -> None:
         _library_entry(5001, "The Thing"), _library_entry(5002, "Alien"),
     ]))
 
-    page = harness.client.get("/dashboard", params={"q": "thing"}).text
+    page = harness.client.get("/library", params={"q": "thing"}).text
 
     assert "The Thing" in page
     assert "Alien" not in page
@@ -498,7 +503,7 @@ def test_the_page_states_how_many_titles_there_are(harness: AppHarness) -> None:
         _library_entry(5002, "Alien"),
     ]))
 
-    assert "3 titles" in harness.client.get("/dashboard").text
+    assert "3 titles" in harness.client.get("/library").text
 
 
 @respx.mock
@@ -511,7 +516,7 @@ def test_one_title_reads_as_singular(harness: AppHarness) -> None:
         return_value=httpx.Response(200, json=[_library_entry(5001, "The Thing")])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert "1 title" in page and "1 titles" not in page
 
 
@@ -530,7 +535,7 @@ def test_search_matches_across_punctuation(harness: AppHarness) -> None:
     harness.activate()
     _seed_spider(harness)
 
-    page = harness.client.get("/dashboard", params={"q": "spider man"}).text
+    page = harness.client.get("/library", params={"q": "spider man"}).text
 
     assert SPIDER in page
 
@@ -539,7 +544,7 @@ def test_search_still_rejects_a_title_that_is_not_there(harness: AppHarness) -> 
     harness.activate()
     _seed_spider(harness)
 
-    page = harness.client.get("/dashboard", params={"q": "zzz"}).text
+    page = harness.client.get("/library", params={"q": "zzz"}).text
 
     assert SPIDER not in page
 
@@ -550,14 +555,14 @@ def test_search_folds_articles_the_way_the_matcher_does(harness: AppHarness) -> 
     _seed_report(harness, [_movie(1, "The Odyssey", MovieStatus.IN_LIBRARY)])
 
     for query in ("the odyssey", "odyssey"):
-        assert "The Odyssey" in harness.client.get("/dashboard", params={"q": query}).text
+        assert "The Odyssey" in harness.client.get("/library", params={"q": query}).text
 
 
 def test_search_folds_numerals_the_way_the_matcher_does(harness: AppHarness) -> None:
     harness.activate()
     _seed_report(harness, [_movie(1, "Toy Story II", MovieStatus.IN_LIBRARY)])
 
-    assert "Toy Story II" in harness.client.get("/dashboard", params={"q": "toy story 2"}).text
+    assert "Toy Story II" in harness.client.get("/library", params={"q": "toy story 2"}).text
 
 
 def test_an_empty_query_still_lists_the_whole_library(harness: AppHarness) -> None:
@@ -566,9 +571,9 @@ def test_an_empty_query_still_lists_the_whole_library(harness: AppHarness) -> No
     harness.activate()
     _seed_spider(harness)
 
-    assert SPIDER in harness.client.get("/dashboard").text
-    assert SPIDER in harness.client.get("/dashboard", params={"q": ""}).text
-    assert SPIDER in harness.client.get("/dashboard", params={"q": "   "}).text
+    assert SPIDER in harness.client.get("/library").text
+    assert SPIDER in harness.client.get("/library", params={"q": ""}).text
+    assert SPIDER in harness.client.get("/library", params={"q": "   "}).text
 
 
 def test_a_query_that_is_only_an_article_narrows_nothing(harness: AppHarness) -> None:
@@ -578,14 +583,14 @@ def test_a_query_that_is_only_an_article_narrows_nothing(harness: AppHarness) ->
     harness.activate()
     _seed_spider(harness)
 
-    assert SPIDER in harness.client.get("/dashboard", params={"q": "the"}).text
+    assert SPIDER in harness.client.get("/library", params={"q": "the"}).text
 
 
 @respx.mock
 def test_search_covers_titles_radarr_holds_that_no_report_charted(
     harness: AppHarness,
 ) -> None:
-    """The library-only cards build their own normalized_title (dashboard.py), so they
+    """The library-only cards build their own normalized_title (library.py), so they
     have to fold the same way as the charted ones or half the grid would be unsearchable.
     """
     harness.activate()
@@ -594,7 +599,7 @@ def test_search_covers_titles_radarr_holds_that_no_report_charted(
         {"tmdbId": 4242, "title": "WALL·E", "year": 2008, "hasFile": True, "id": 7},
     ]))
 
-    page = harness.client.get("/dashboard", params={"q": "wall e"}).text
+    page = harness.client.get("/library", params={"q": "wall e"}).text
 
     assert "WALL" in page
 
@@ -624,7 +629,7 @@ def test_a_card_names_the_tracked_sum_and_the_lifetime_gross(harness: AppHarness
     harness.activate()
     _tracked_weeks(harness, [460_000_000, 473_000_000])
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "2 weeks tracked" in page
     assert "$2.0M tracked" in page
@@ -640,7 +645,7 @@ def test_a_card_with_no_stored_lifetime_shows_only_what_it_tracked(
     harness.activate()
     _tracked_weeks(harness, [None, None])
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "$2.0M tracked" in page
     assert "lifetime" not in page
@@ -662,7 +667,7 @@ def test_a_rerun_of_an_older_week_cannot_shrink_the_lifetime(harness: AppHarness
         run_at=["2026-08-20T10:00:00+00:00", "2026-08-11T10:00:00+00:00"],
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "$473.0M lifetime" in page
     assert "$460.0M" not in page
@@ -679,7 +684,7 @@ def test_a_library_title_no_week_charted_shows_neither_figure(harness: AppHarnes
         return_value=httpx.Response(200, json=[_library_entry(4242, "Old Favourite")])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "Old Favourite" in page
     assert "tracked" not in page
@@ -709,7 +714,7 @@ def test_a_chip_links_to_that_film_on_that_radarr(harness: AppHarness) -> None:
     _seed_report(harness, [_movie(1, "Dune Part Two", MovieStatus.IN_LIBRARY)])
     respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[_held_entry()]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert f'href="{RADARR_URL}/movie/{SLUG}"' in page
     assert 'rel="noopener noreferrer"' in page
@@ -728,7 +733,7 @@ def test_the_link_is_the_stored_address_not_the_one_we_were_asked_on(
     respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[_held_entry()]))
 
     page = harness.client.get(
-        "/dashboard",
+        "/library",
         headers={"Host": "evil.example", "X-Forwarded-Host": "evil.example"},
     ).text
 
@@ -747,7 +752,7 @@ def test_a_radarr_that_names_no_route_leaves_the_chip_as_text(harness: AppHarnes
         return_value=httpx.Response(200, json=[_held_entry(slug=None)])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert _chips(page, "Dune Part Two") == ["Main"]  # the chip is still there
     assert "/movie/" not in page.split('class="where"')[1].split("</div>")[0]
@@ -764,7 +769,7 @@ def test_a_pending_chip_links_too(harness: AppHarness) -> None:
         return_value=httpx.Response(200, json=[_held_entry(has_file=False)])
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "where-chip-pending" in page
     assert f'href="{RADARR_URL}/movie/{SLUG}"' in page
@@ -785,7 +790,7 @@ def test_the_chips_are_not_nested_inside_the_posters_own_link(
     _seed_report(harness, [_movie(1, "Dune Part Two", MovieStatus.IN_LIBRARY)])
     respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[_held_entry()]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     poster_anchor = page.split('class="poster-frame', 1)[1].split("</a>", 1)[0]
 
     assert "where-chip" not in poster_anchor
@@ -849,7 +854,7 @@ def test_a_downloading_chip_carries_a_progress_fill(harness: AppHarness) -> None
     # 580MB left of 1GB = 42%, which draws in the nearest ten-percent step.
     queue_records([{"movieId": 77, "size": 1_000_000_000, "sizeleft": 580_000_000}])
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "where-chip-p40" in page
     assert "42% downloaded" in page  # the exact figure, on the chip as a tooltip
@@ -863,7 +868,7 @@ def test_an_empty_queue_renders_exactly_as_before(harness: AppHarness) -> None:
     _wanted_on_main(harness)
     queue_records([])
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "where-chip-pending" in page  # still a pending chip
     assert not _fill_classes(page)
@@ -878,7 +883,7 @@ def test_a_queue_that_cannot_be_read_renders_exactly_as_before(harness: AppHarne
     _wanted_on_main(harness)
     respx.routes[QUEUE_ROUTE].mock(side_effect=httpx.ConnectError("queue down"))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "where-chip-pending" in page
     assert not _fill_classes(page)
@@ -897,7 +902,7 @@ def test_a_downloaded_title_is_never_asked_about(harness: AppHarness) -> None:
     ]))
     queue_records([{"movieId": 77, "size": 100, "sizeleft": 50}])
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert not _fill_classes(page)
 
@@ -913,11 +918,14 @@ def test_progress_reads_the_queue_inside_the_libraries_gather(harness: AppHarnes
     from pathlib import Path
 
     source = (Path(__file__).resolve().parent.parent.parent / "app" / "web"
-              / "dashboard.py").read_text(encoding="utf-8")
+              / "library.py").read_text(encoding="utf-8")
 
     gather = source.split("await asyncio.gather(")[1].split("\n    )")[0]
     assert "load_all_radarr_libraries(request)" in gather
     assert "load_all_radarr_queues(request)" in gather
+    # And the TV half rides along in the same one, so the merged page costs the film
+    # page's slowest single request rather than that plus a Sonarr round.
+    assert "refresh_stale_series_libraries(request)" in gather
 
 
 # --- sums never add two currencies together (M2) ---
@@ -955,7 +963,7 @@ def test_a_tracked_sum_never_adds_two_currencies(harness: AppHarness) -> None:
          "hasFile": True, "images": []},
     ]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "3 weeks tracked" in page       # the history is still three weeks long
     assert "$3.0M tracked" in page         # ...and the money is only the dollars
@@ -973,7 +981,7 @@ def test_an_all_pound_history_reads_in_pounds(harness: AppHarness) -> None:
          "hasFile": True, "images": []},
     ]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "£3.0M tracked" in page
     assert "£42.0M lifetime" in page
@@ -996,10 +1004,14 @@ def test_a_lifetime_figure_is_never_folded_across_currencies(harness: AppHarness
          "hasFile": True, "images": []},
     ]))
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
 
     assert "$80.0M lifetime" in page   # not the larger pound figure
-    assert "999" not in page
+    # The figure, not the digits: every signed-in page carries a hex CSRF token, so a
+    # bare "999" matches one roughly one run in seventy. Same latent flake as the "32"
+    # that once matched a timestamp — a short substring against a whole document.
+    assert "£999" not in page
+    assert "999.0M" not in page
     assert "$2.0M tracked" in page     # ...and only the dollar week is summed
 
 
@@ -1029,7 +1041,7 @@ def test_a_corrected_film_stays_one_film_across_its_weeks(harness: AppHarness) -
         "miroirs no 3", Correction(tmdb_id=111, title="Mirrors No. 3", year=2025)
     )
 
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert page.count("Mirrors No. 3") >= 1
     assert "Miroirs No. 3" not in page, "the chart's spelling is still on a card"
     assert "3 weeks" in page, "the film's weeks were split across two cards"

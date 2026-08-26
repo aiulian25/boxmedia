@@ -17,7 +17,7 @@ def test_security_headers_present(harness: AppHarness) -> None:
 
 def test_headers_on_redirects_too(harness: AppHarness) -> None:
     # An unauthenticated protected route 303s — headers must still be applied.
-    response = harness.client.get("/dashboard", follow_redirects=False)
+    response = harness.client.get("/library", follow_redirects=False)
     assert response.status_code == 303
     assert "content-security-policy" in response.headers
 

@@ -1,0 +1,73 @@
+{# One film in the Library grid. Lifted out of the page unchanged when the grid became
+   two kinds of card: ruling 4 promises this renders exactly what the dashboard
+   rendered before the merge, and `golden_movies_grid.html` is the diff that proves
+   it. Every byte below is the pre-merge markup, with only the loop variable renamed. #}
+  <div class="poster-card">
+    {# The chips are links out to Radarr, so they cannot sit inside the poster's own
+       anchor: the HTML parser splits an anchor at a nested one and ejects everything
+       after it, which would leave `.where` absolutely positioned against the page. The
+       shell gives it the positioning context `.poster-frame` used to provide. #}
+    <div class="poster-shell">
+      {# A real link, so the detail works with JS off and is linkable; app.js upgrades
+         the click to a modal. Untitled entries Radarr never matched have no id to open. #}
+      <a class="poster-frame{% if not card.tmdb_id %} poster-frame-plain{% endif %}"
+         {% if card.tmdb_id %}href="{{ url_base }}/movies/{{ card.tmdb_id }}" data-movie="{{ card.tmdb_id }}"{% endif %}>
+        {% if card.poster_local %}
+        <img src="{{ card.poster_local }}" alt="{{ card.title }} poster">
+        {% else %}
+        <div class="poster-empty">Poster</div>
+        {% endif %}
+        <div class="badge">
+          {% if card.status == 'in_library' %}
+          <span class="dot dot-in-library"></span><span>In Library{% if card.file_quality %} · {{ card.file_quality }}{% endif %}</span>
+          {% else %}
+          <span class="dot dot-wanted"></span><span>Wanted</span>
+          {% endif %}
+        </div>
+      </a>
+      {# Which box holds it, or is about to. Solid = the file is there; the ↓ chip is
+         still downloading, i.e. where the title is going to land. Each chip opens the
+         film on that Radarr — queue, files and history are its job, not ours. An
+         instance that did not name its own route for the film keeps the plain chip,
+         the same way the poster above omits its href without a tmdb id.
+
+         A pending chip carries how far along that box's download is, as a band along its
+         own bottom edge: per connection, costing no extra width, so a grid of a hundred
+         cards can be scanned for what is nearly here. Drawn in ten-percent steps because a
+         per-film width would have to be an inline style and the CSP forbids one; the exact
+         figure is in the tooltip. No answer from the queue renders exactly as before. #}
+      {% if card.locations %}
+      <div class="where">
+        {% for entry in card.locations %}
+        <a class="where-chip{% if not entry.has_file %} where-chip-pending{% endif %}{% if entry.progress_step is not none %} where-chip-p{{ entry.progress_step }}{% endif %}"
+           {% if not entry.has_file and entry.progress_key %}data-progress="{{ entry.progress_key }}" data-progress-title="Open {{ card.title }} on {{ entry.name }}"{% endif %}
+           {% if entry.radarr_url %}href="{{ entry.radarr_url }}" target="_blank" rel="noopener noreferrer" title="Open {{ card.title }} on {{ entry.name }}{% if entry.progress is not none %} — {{ entry.progress | round | int }}% downloaded{% endif %}"{% else %}title="{{ entry.name }}{% if entry.progress is not none %} — {{ entry.progress | round | int }}% downloaded{% endif %}"{% endif %}>{% if not entry.has_file %}↓ {% endif %}{{ entry.name }}</a>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    <div class="poster-title">{{ card.title }}</div>
+    {# A Wanted title Plex can already play: you are waiting on a download of something
+       your media server has. In-library cards say nothing — Radarr holding the file is
+       the stronger statement. #}
+    {% if card.server_state == "yes" %}
+    <span class="server-hint" title="Your {{ server_name }} server holds this film (matched by id)">Already in {{ server_name }}</span>
+    {% elif card.server_state == "probably" %}
+    <span class="guess-hint" title="A {{ server_name }} title of the same name and year — nothing verified it is the same film">Probably in {{ server_name }} — verify</span>
+    {% endif %}
+    <div class="poster-meta">
+      {# Box-office figures exist only for titles a stored week actually charted. For
+         everything else Radarr holds, the release year is what we honestly know. #}
+      <span class="gross">{% if card.gross_display %}{{ card.gross_display }} (Wk {{ card.weeks_in_release }}){% elif card.year %}{{ card.year }}{% endif %}</span>
+      <span class="links">
+        {% if card.imdb_url %}<a href="{{ card.imdb_url }}" target="_blank" rel="noopener noreferrer">IMDB</a>{% endif %}
+        {% if card.wiki_url %}<a href="{{ card.wiki_url }}" target="_blank" rel="noopener noreferrer">Wiki</a>{% endif %}
+      </span>
+    </div>
+    {# Two different measurements, so both are named. The tracked sum covers only the
+       weeks this install holds; lifetime is the film's whole run as Mojo reports it, and
+       appears only when a stored report actually carries one. #}
+    {% if card.weeks_tracked > 1 %}
+    <span class="trend">{{ card.weeks_tracked }} weeks tracked · {{ card.gross_total_display }} tracked{% if card.lifetime_display %} · {{ card.lifetime_display }} lifetime{% endif %}</span>
+    {% endif %}
+  </div>

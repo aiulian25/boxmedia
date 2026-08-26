@@ -1,26 +1,56 @@
-"""Box Office dashboard — the library view.
+"""Library — everything you hold, films and series together (TV step 16).
 
-Shows only titles that are actually in Radarr: In Library (downloaded) or Wanted
-(added, awaiting download) — whether added via BoxMedia's weekly view or already
-sitting in Radarr. Adding new titles is a deliberate action on the weekly report,
-not here. Status is recomputed against a live Radarr snapshot, with the stored
-status as fallback. Posters are served locally so the CSP can stay `img-src 'self'`.
+Was the Box Office dashboard, and the film half is unchanged: only titles actually in
+Radarr appear (In Library, or Wanted and awaiting a download), status recomputed against
+a live snapshot with the stored status as fallback, posters served locally so the CSP can
+stay `img-src \'self\'`. Adding new titles is still a deliberate action on the weekly
+report, not here.
+
+## The Movies chip is a regression contract
+
+Ruling 4 of the TV plan: the Movies chip renders exactly what this page rendered before
+the merge. `tests/integration/golden_movies_grid.html` is that render, captured against
+the old page before a line of this step was written, and a test diffs the two — which is
+why the film pipeline below is untouched rather than tidied on the way past.
+
+## Two kinds, one grid, and the ordering that follows
+
+Films arrive in first-sighting order — newest week first, chart rank within it — which is
+meaningful and which the Movies chip preserves. Series arrive from a cache with no such
+history. So the merged view orders by TITLE, the one key both kinds share honestly, and
+each single-kind chip keeps whatever order that kind actually has. Ordering the merged
+view by "recency" would mean inventing a date for one half of it.
+
+## What a series card can and cannot say
+
+Everything comes from the snapshot on disk (TV step 8) — no live Sonarr read, on the page
+most likely to hold a thousand cards. So the band on a series\' SONARR chip is how much of
+it is on disk, not how much is downloading: completeness is in the snapshot and a queue is
+not. That also means the chip is deliberately inert to the progress poller, which speaks
+in Radarr download percentages and would otherwise repaint a completeness band with one.
 """
 
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request
-from fastapi.responses import FileResponse, Response
+from fastapi import status as http_status
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from app.core.sessions import COOKIE_NAME
-from app.services.apps import ExternalApp
+from app.services.apps import KIND_SONARR, ExternalApp
 from app.services.boxoffice import DEFAULT_CURRENCY_SYMBOL, format_gross
 from app.services.matcher import normalize_title
+from app.services.posters import SERIES_POSTER_WIDTH
 from app.services.radarr import RadarrMovie
 from app.services.reports import MovieStatus, Report, RunStatus, imdb_url, wiki_url
+from app.services.series import CachedSeries
 from app.web.deps import (
+    MEDIA_TYPES,
+    TYPE_MOVIES,
+    TYPE_TV,
     cache_posters,
     current_user,
     format_timestamp,
@@ -29,13 +59,24 @@ from app.web.deps import (
     load_media_server_snapshot,
     parse_timestamp,
     radarr_locations,
+    refresh_stale_series_libraries,
     render,
+    safe_external_url,
+    validated_media_type,
 )
 
 router = APIRouter()
 
-NAV_KEY = "dashboard"
+NAV_KEY = "library"
+LIBRARY_PATH = "/library"
+# Kept as a permanent redirect rather than deleted: it is what a bookmark, a reverse-proxy
+# rule and every sign-in before this release point at.
 DASHBOARD_PATH = "/dashboard"
+KIND_MOVIE = "movie"
+KIND_SERIES = "series"
+# The completeness band is drawn in the same ten-percent steps the download band uses —
+# a per-card width would have to be an inline style, and the CSP forbids one.
+BAND_STEP = 10
 # The page is a scrollable grid, so paging every 10 made the reader click for something
 # scrolling already gives them. The cap exists only to bound the poster fetches and the
 # markup for a very large library — most libraries never reach it and never see the link.
@@ -203,18 +244,129 @@ def _apply_tracking(
         )
 
 
+def _completeness_step(series: CachedSeries) -> int | None:
+    """How much of a series is on disk, in ten-percent steps, or None when unknowable.
+
+    None rather than 0 for a series Sonarr reports no episodes for: an empty band would
+    say "you have none of this", and "we do not know how long this is" is a different
+    thing. A series with everything reads 100 and the chip fills.
+    """
+    if series.episode_count <= 0:
+        return None
+    ratio = series.episode_file_count / series.episode_count
+    return min(100, round(ratio * 100 / BAND_STEP) * BAND_STEP)
+
+
+def _holding_line(series: CachedSeries) -> str:
+    """The one line under a series card. A fact either way, in the same words the series
+    detail and the Discover shelf already use."""
+    if series.complete:
+        return f"Complete — {series.episode_count} episodes"
+    missing = series.missing_episode_count
+    return f"Missing {missing} episode{'s' if missing != 1 else ''}"
+
+
+def _sonarr_url_for(app: ExternalApp, series: CachedSeries) -> str | None:
+    """That series\' page on that Sonarr, or None when it cannot be addressed.
+
+    `radarr_url_for`\'s twin, and the same reasoning: `titleSlug` is what Sonarr\'s own UI
+    routes on, the base is the admin-configured address rather than anything
+    request-derived, and a record without a slug yields no link instead of a guessed one.
+    """
+    if not series.title_slug:
+        return None
+    base = safe_external_url(app.url)
+    return f"{base}/series/{quote(series.title_slug, safe='')}" if base else None
+
+
+def _series_views(request: Request) -> list[dict]:
+    """Every series your Sonarr connections hold, from the snapshot on disk.
+
+    No live read: this page can carry a thousand cards, and the snapshot is exactly what
+    the Discover shelf and the series detail already judge against — so a card here says
+    the same thing they do, without a round trip per render.
+    """
+    apps_by_id = {app.id: app for app in request.app.state.apps.list_apps(KIND_SONARR)}
+    libraries = request.app.state.series_cache.load_all()
+    views: list[dict] = []
+    seen: set[int] = set()
+    for app_id, library in libraries.items():
+        app = apps_by_id.get(app_id)
+        if app is None:
+            continue  # a connection removed since the snapshot was written
+        for series in library:
+            if series.tvdb_id in seen:
+                # Two connections holding the same series is one entry on this page, on
+                # the first that answered — the same rule the film half applies to a title
+                # sitting on both a 1080p and a 4K box.
+                continue
+            seen.add(series.tvdb_id)
+            views.append({
+                "kind": KIND_SERIES,
+                "title": series.title,
+                "normalized_title": normalize_title(series.title),
+                "year": series.year,
+                "tmdb_id": series.tmdb_id,
+                "tvdb_id": series.tvdb_id,
+                "poster_url": series.poster_url,
+                "connection": app.name,
+                "sonarr_url": _sonarr_url_for(app, series),
+                "complete": series.complete,
+                "holding": _holding_line(series),
+                "band_step": _completeness_step(series),
+            })
+    return views
+
+
+def _mark_series_on_server(views: list[dict], snapshot: object) -> None:
+    """The media-server hint, for a series Sonarr has not finished.
+
+    Only where it changes what you would do: a complete series is complete, and saying
+    "your Plex also has it" adds nothing. An incomplete one is worth knowing about,
+    because the episodes you are missing may already be watchable.
+    """
+    if snapshot is None:
+        return
+    for view in views:
+        if view["complete"]:
+            continue
+        view["server_state"] = snapshot.holds_series(
+            view["tvdb_id"], view["tmdb_id"], None, view["title"], view["year"]
+        )
+
+
 @router.get(DASHBOARD_PATH)
-async def dashboard(request: Request, q: str = "", limit: int = DEFAULT_LIMIT) -> object:
+def dashboard(request: Request) -> RedirectResponse:
+    """Where this page used to live. 308, not 302: permanent, and it preserves the method
+    so a bookmark, a proxy rule and every link written before the merge all still land —
+    behind the same session gate, which the middleware applies to the destination."""
+    base = request.app.state.settings.url_base
+    query = request.url.query
+    return RedirectResponse(
+        f"{base}{LIBRARY_PATH}{'?' + query if query else ''}",
+        status_code=http_status.HTTP_308_PERMANENT_REDIRECT,
+    )
+
+
+@router.get(LIBRARY_PATH)
+async def library(
+    request: Request, q: str = "", limit: int = DEFAULT_LIMIT, type: str = ""  # noqa: A002
+) -> object:
     current_user(request)
     sign_in_notice = _sign_in_notice_view(request)
+    media_type = validated_media_type(type)
     reports = request.app.state.reports.list_reports()
 
     movies = _merge_history(reports)
     # Every connection, not just the primary: a title sent to the 4K box belongs on this
     # page as much as one on the main instance. The queues ride along in the same gather,
     # so live progress costs the slowest single request rather than a second round.
-    libraries, queues = await asyncio.gather(
-        load_all_radarr_libraries(request), load_all_radarr_queues(request)
+    libraries, queues, _ = await asyncio.gather(
+        load_all_radarr_libraries(request),
+        load_all_radarr_queues(request),
+        # Top up whichever Sonarr snapshots have aged out, in the same gather, so the TV
+        # half costs nothing the film half was not already waiting for.
+        refresh_stale_series_libraries(request),
     )
     apps_by_id = {app.id: app for app in request.app.state.apps.list_apps()}
     answered = {app_id: lib for app_id, lib in libraries.items() if lib is not None}
@@ -234,6 +386,10 @@ async def dashboard(request: Request, q: str = "", limit: int = DEFAULT_LIMIT) -
     # Library view: only titles that are actually in Radarr (stored-status fallback
     # when Radarr is unreachable and the live snapshot above was skipped).
     movies = [movie for movie in movies if movie["status"] in LIBRARY_STATUSES]
+    for movie in movies:
+        movie["kind"] = KIND_MOVIE
+    series = _series_views(request)
+
     # A WANTED title Plex already holds is worth a chip here: you are waiting on a
     # download of something your media server can already play. In-library titles get
     # nothing — Radarr holding the file is the stronger, more specific statement.
@@ -245,6 +401,7 @@ async def dashboard(request: Request, q: str = "", limit: int = DEFAULT_LIMIT) -
             movie["server_state"] = server_snapshot.holds(
                 movie["tmdb_id"], None, movie["title"], movie.get("year")
             )
+    _mark_series_on_server(series, server_snapshot)
 
     # Matched on the normalized title, the same folding of punctuation, diacritics,
     # numerals and articles the weekly search and the pipeline's own matcher use — so
@@ -257,17 +414,37 @@ async def dashboard(request: Request, q: str = "", limit: int = DEFAULT_LIMIT) -
     wanted = normalize_title(q)
     if wanted:
         movies = [movie for movie in movies if wanted in movie["normalized_title"]]
+        series = [show for show in series if wanted in show["normalized_title"]]
 
-    total = len(movies)
+    cards = _chosen(movies, series, media_type)
+    total = len(cards)
     limit = max(PAGE_INCREMENT, limit)
-    page = movies[:limit]
-    await cache_posters(request, page)
+    page = cards[:limit]
+    # Two passes at two widths — a series poster is a different shape of image and the
+    # cache keys on the sized URL. Concurrent within each, as every other page does it.
+    await cache_posters(request, [card for card in page if card["kind"] == KIND_MOVIE])
+    await cache_posters(
+        request,
+        [card for card in page if card["kind"] == KIND_SERIES],
+        width=SERIES_POSTER_WIDTH,
+    )
 
     return render(
         request,
-        "dashboard.html",
+        "library.html",
         active_nav=NAV_KEY,
-        movies=page,
+        cards=page,
+        # Counts of what the SEARCH left, not of the whole library: with a query in the
+        # box, the chips answer "how many of each kind matched", which is what a person
+        # about to press one of them wants to know.
+        counts={
+            "all": len(movies) + len(series),
+            TYPE_MOVIES: len(movies),
+            TYPE_TV: len(series),
+        },
+        media_type=media_type,
+        media_types=MEDIA_TYPES,
+        library_path=LIBRARY_PATH,
         query=q,
         total=total,
         limit=limit,
@@ -278,8 +455,23 @@ async def dashboard(request: Request, q: str = "", limit: int = DEFAULT_LIMIT) -
             apps_by_id[app_id].name for app_id in libraries if app_id not in answered
         ],
         has_any_reports=bool(reports),
+        has_any_series=bool(series),
         sign_in_notice=sign_in_notice,
     )
+
+
+def _chosen(movies: list[dict], series: list[dict], media_type: str) -> list[dict]:
+    """The cards this chip shows, in the order that chip can honestly claim.
+
+    Films carry a meaningful order — newest week first, chart rank within it — and the
+    Movies chip keeps it exactly (ruling 4). Nothing merges the two orders honestly, so
+    the combined view sorts by the one key both kinds share: the title.
+    """
+    if media_type == TYPE_MOVIES:
+        return movies
+    if media_type == TYPE_TV:
+        return sorted(series, key=lambda card: card["title"].casefold())
+    return sorted(movies + series, key=lambda card: card["title"].casefold())
 
 
 @router.get("/posters/{name}")

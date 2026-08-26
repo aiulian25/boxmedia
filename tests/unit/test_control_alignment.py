@@ -370,11 +370,15 @@ def test_the_progress_fill_classes_live_outside_the_layers() -> None:
             f".where-chip-p{step} is inside @layer — Tailwind will purge it"
         )
 
-    template = (
-        Path(__file__).resolve().parent.parent.parent / "app" / "templates" / "dashboard.html"
-    ).read_text(encoding="utf-8")
-    # The composed form is the whole reason the rules sit out there.
-    assert "where-chip-p{{" in template
+    templates = Path(__file__).resolve().parent.parent.parent / "app" / "templates"
+    # The composed form is the whole reason the rules sit out there — and there are two
+    # of them now: a film's download band and a series' completeness band, which fill the
+    # same eleven classes with two different meanings.
+    composed = [
+        name for name in ("_movie_card.html", "_series_card.html")
+        if "where-chip-p{{" in (templates / name).read_text(encoding="utf-8")
+    ]
+    assert composed == ["_movie_card.html", "_series_card.html"]
 
 
 def test_the_scroll_to_top_button_is_a_thumb_sized_target_clear_of_the_notch() -> None:

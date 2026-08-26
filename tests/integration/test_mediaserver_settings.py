@@ -335,10 +335,10 @@ def test_the_dashboard_hints_only_on_wanted_titles(harness: AppHarness) -> None:
     _connect(harness)
 
     _dashboard_card(harness, MovieStatus.WANTED)
-    assert "Already in Plex" in harness.client.get("/dashboard").text
+    assert "Already in Plex" in harness.client.get("/library").text
 
     _dashboard_card(harness, MovieStatus.IN_LIBRARY)
-    assert "in Plex" not in harness.client.get("/dashboard").text
+    assert "in Plex" not in harness.client.get("/library").text
 
 
 # --- testing before saving, the way the Radarr card always has ---

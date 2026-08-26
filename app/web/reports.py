@@ -60,7 +60,7 @@ from app.web.movies import MOVIE_PATH
 
 router = APIRouter()
 
-NAV_KEY = "reports"
+NAV_KEY = "boxoffice"
 REPORTS_PATH = "/reports"
 RUN_PATH = "/run"
 DISPLAY_TIME_LENGTH = 16  # "YYYY-MM-DDTHH:MM"

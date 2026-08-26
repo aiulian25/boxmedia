@@ -20,7 +20,7 @@ router = APIRouter()
 
 LOGIN_PATH = "/login"
 CHANGE_PASSWORD_PATH = "/change-password"  # noqa: S105 — URL path, not a secret
-DASHBOARD_PATH = "/dashboard"
+LIBRARY_PATH = "/library"
 SETTINGS_PATH = "/settings"
 # How far back to look for the previous sign-in when building the post-login notice.
 SIGN_IN_HISTORY_LIMIT = 500
@@ -76,7 +76,7 @@ def _set_session_cookie(request: Request, response: RedirectResponse, session_id
 @router.get(LOGIN_PATH)
 def login_form(request: Request) -> object:
     if getattr(request.state, "user", None) is not None:
-        return _redirect(request, DASHBOARD_PATH)
+        return _redirect(request, LIBRARY_PATH)
     # First-run hint: while the account still holds the bootstrap password, tell the
     # admin where to find the credentials. Cleared automatically after they change it.
     users = request.app.state.users
@@ -127,7 +127,7 @@ def login_submit(
     notice = _sign_in_notice(audit)
     session_id = request.app.state.sessions.create(username, notice=notice)
     audit.record(AuditAction.LOGIN_SUCCESS, actor=username, source_ip=ip)
-    response = _redirect(request, DASHBOARD_PATH)
+    response = _redirect(request, LIBRARY_PATH)
     _set_session_cookie(request, response, session_id)
     return response
 
@@ -179,7 +179,7 @@ def change_password_submit(
         AuditAction.PASSWORD_CHANGED, actor=user.username, source_ip=client_ip(request)
     )
     # First-run mini-wizard: with no Radarr connection yet, send the admin straight
-    # to Settings to add one rather than to an empty dashboard.
+    # to Settings to add one rather than to an empty library.
     if not request.app.state.apps.list_apps():
         return _redirect(request, SETTINGS_PATH)
-    return _redirect(request, DASHBOARD_PATH)
+    return _redirect(request, LIBRARY_PATH)

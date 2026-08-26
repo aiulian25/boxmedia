@@ -24,7 +24,7 @@ def test_favicon_probe_is_not_redirected_to_login(harness: AppHarness) -> None:
 
 def test_pages_link_the_icon_set(harness: AppHarness) -> None:
     harness.activate()
-    page = harness.client.get("/dashboard").text
+    page = harness.client.get("/library").text
     assert 'href="/favicon.ico' in page
     assert "/static/logo.png" in page
     assert "favicon.svg" not in page  # the placeholder mark is gone

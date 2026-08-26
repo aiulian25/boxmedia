@@ -46,9 +46,9 @@ from app.services.users import UserStore
 from app.web import (
     auth,
     calendar,
-    dashboard,
     deps,
     discover,
+    library,
     movies,
     profile,
     reports,
@@ -236,7 +236,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(profile.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(settings_routes.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(reports.router, prefix=settings.url_base, dependencies=csrf)
-    app.include_router(dashboard.router, prefix=settings.url_base, dependencies=csrf)
+    app.include_router(library.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(discover.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(calendar.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(movies.router, prefix=settings.url_base, dependencies=csrf)
@@ -263,7 +263,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get(f"{settings.url_base}/" if settings.url_base else "/")
     def root() -> RedirectResponse:
         return RedirectResponse(
-            url=f"{settings.url_base}{dashboard.DASHBOARD_PATH}",
+            url=f"{settings.url_base}{library.LIBRARY_PATH}",
             status_code=SEE_OTHER,
         )
 

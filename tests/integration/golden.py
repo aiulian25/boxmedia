@@ -42,13 +42,28 @@ API = f"{RADARR_URL}/api/v3"
 # The grid, and only the grid: the page around it legitimately differs (its title, its
 # header, its nav, its search form's action), while a card inside it must not.
 _GRID = re.compile(r'<div class="poster-grid">.*?\n</div>', re.S)
+# A connection id is `secrets.token_hex(4)`, minted when the seed adds the Radarr, so it
+# differs on every run. It is not a rendering difference and must not read as one.
+_APP_ID = re.compile(r"app-[0-9a-f]{8}")
+APP_ID_MASK = "app-XXXXXXXX"
 
 
 def grid_of(page: str) -> str:
-    """The card grid out of a rendered page, for comparing one render against another."""
+    """The card grid out of a rendered page, normalised for comparing two renders.
+
+    Two normalisations, both stated rather than assumed:
+
+    * the random connection id is masked — it changes every run and says nothing;
+    * blank lines are dropped, because a Jinja branch necessarily shifts them and
+      indentation is not what ruling 4 promises.
+
+    Everything else is compared byte for byte: every class, every attribute, every label
+    and the order they appear in.
+    """
     found = _GRID.search(page)
     assert found is not None, "no poster grid in the rendered page"
-    return found.group(0)
+    masked = _APP_ID.sub(APP_ID_MASK, found.group(0))
+    return "\n".join(line for line in masked.splitlines() if line.strip())
 
 
 def _charted(

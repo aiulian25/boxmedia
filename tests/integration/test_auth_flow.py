@@ -7,7 +7,8 @@ import pytest
 from tests.conftest import AppHarness, CsrfClient
 
 STRONG_PASSWORD = "brandnew9password"
-DASHBOARD = "/dashboard"
+# The Library is where a session lands and what the gate is tested against.
+LIBRARY = "/library"
 RADARR_KEY = "0123456789abcdef0123456789abcdef"  # noqa: S105 — the suite's dummy key
 LOGIN = "/login"
 CHANGE_PW = "/change-password"
@@ -28,7 +29,7 @@ def test_health_is_public(harness: AppHarness) -> None:
 
 
 def test_unauthenticated_is_redirected_to_login(harness: AppHarness) -> None:
-    response = harness.client.get(DASHBOARD, follow_redirects=False)
+    response = harness.client.get(LIBRARY, follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"].endswith(LOGIN)
 
@@ -43,10 +44,10 @@ def test_forced_change_gate_blocks_until_password_changed(harness: AppHarness) -
     # 1. Login with the bootstrap password succeeds.
     login = _login(harness, harness.bootstrap_password)
     assert login.status_code == 303
-    assert login.headers["location"].endswith(DASHBOARD)
+    assert login.headers["location"].endswith(LIBRARY)
 
     # 2. But every real route now redirects to the forced-change page.
-    blocked = harness.client.get(DASHBOARD, follow_redirects=False)
+    blocked = harness.client.get(LIBRARY, follow_redirects=False)
     assert blocked.status_code == 303
     assert blocked.headers["location"].endswith(CHANGE_PW)
 
@@ -77,7 +78,7 @@ def test_forced_change_gate_blocks_until_password_changed(harness: AppHarness) -
     assert changed.status_code == 303
     assert changed.headers["location"].endswith("/settings")
 
-    unlocked = harness.client.get(DASHBOARD, follow_redirects=False)
+    unlocked = harness.client.get(LIBRARY, follow_redirects=False)
     assert unlocked.status_code == 200
     assert "login_success" in "\n".join(harness.audit_lines())
     assert "password_changed" in "\n".join(harness.audit_lines())
@@ -105,7 +106,7 @@ def test_logout_invalidates_session(harness: AppHarness) -> None:
     # (root here; the shared _cookie_path keeps them matched under a url_base).
     assert "path=/" in logout.headers.get("set-cookie", "").lower()
 
-    after = harness.client.get(DASHBOARD, follow_redirects=False)
+    after = harness.client.get(LIBRARY, follow_redirects=False)
     assert after.headers["location"].endswith(LOGIN)
 
 
@@ -115,21 +116,21 @@ def test_logout_all_invalidates_other_sessions(harness: AppHarness) -> None:
     second = CsrfClient(harness.client.app)
     second.post("/login", data={"username": "admin", "password": active},
                 follow_redirects=False)
-    assert second.get(DASHBOARD, follow_redirects=False).status_code == 200
+    assert second.get(LIBRARY, follow_redirects=False).status_code == 200
 
     cleared = harness.client.post("/account/logout-all", follow_redirects=False)
     assert cleared.status_code == 303
     assert cleared.headers["location"].endswith(LOGIN)
 
     # Both the other client and the caller are signed out.
-    assert second.get(DASHBOARD, follow_redirects=False).headers["location"].endswith(LOGIN)
-    assert harness.client.get(DASHBOARD, follow_redirects=False).headers["location"].endswith(LOGIN)
+    assert second.get(LIBRARY, follow_redirects=False).headers["location"].endswith(LOGIN)
+    assert harness.client.get(LIBRARY, follow_redirects=False).headers["location"].endswith(LOGIN)
     assert "sessions_cleared" in "\n".join(harness.audit_lines())
 
 
 def test_sign_in_notice_reports_previous_login_and_failures(harness: AppHarness) -> None:
     active = harness.activate()  # first sign-in: nothing to compare against yet
-    assert "Last sign-in:" not in harness.client.get(DASHBOARD).text
+    assert "Last sign-in:" not in harness.client.get(LIBRARY).text
 
     harness.client.post("/logout", follow_redirects=False)
     for _ in range(2):
@@ -139,7 +140,7 @@ def test_sign_in_notice_reports_previous_login_and_failures(harness: AppHarness)
     harness.client.post(LOGIN, data={"username": "admin", "password": active},
                         follow_redirects=False)
 
-    page = harness.client.get(DASHBOARD).text
+    page = harness.client.get(LIBRARY).text
     assert "Last sign-in:" in page
     assert "2 failed sign-in attempt(s) since then" in page
     assert "banner-error" in page  # failures make it the alert style
@@ -151,10 +152,10 @@ def test_sign_in_notice_shows_once(harness: AppHarness) -> None:
     harness.client.post(LOGIN, data={"username": "admin", "password": active},
                         follow_redirects=False)
 
-    first = harness.client.get(DASHBOARD).text
+    first = harness.client.get(LIBRARY).text
     assert "Last sign-in:" in first
     assert "banner-success" in first  # no failures -> not an alert
-    assert "Last sign-in:" not in harness.client.get(DASHBOARD).text  # one-shot
+    assert "Last sign-in:" not in harness.client.get(LIBRARY).text  # one-shot
 
 
 def test_sign_in_notice_is_not_carried_in_the_url(harness: AppHarness) -> None:
@@ -167,7 +168,7 @@ def test_sign_in_notice_is_not_carried_in_the_url(harness: AppHarness) -> None:
     )
     assert "?" not in response.headers["location"]
 
-    forged = harness.client.get(f"{DASHBOARD}?last=1999-01-01&last_ip=evil.example&failed=99")
+    forged = harness.client.get(f"{LIBRARY}?last=1999-01-01&last_ip=evil.example&failed=99")
     assert "evil.example" not in forged.text
 
 
@@ -231,7 +232,7 @@ def test_static_requests_never_touch_the_account_file(
         harness.client.get(path)
     assert calls[0] == 0
 
-    harness.client.get("/dashboard")
+    harness.client.get(LIBRARY)
     assert calls[0] == 1  # a real page still resolves the account, exactly once
 
 
@@ -291,7 +292,7 @@ def test_the_sign_in_notice_is_a_toast_not_a_page_banner(harness: AppHarness) ->
     harness.client.post(LOGIN, data={"username": "admin", "password": active},
                         follow_redirects=False)
 
-    page = harness.client.get(DASHBOARD).text
+    page = harness.client.get(LIBRARY).text
 
     toast = _toast_markup(page)
     assert "Last sign-in:" in toast          # inside the region, not the content flow
@@ -306,7 +307,7 @@ def test_the_notice_is_the_only_thing_outside_the_toast_region(harness: AppHarne
     harness.client.post(LOGIN, data={"username": "admin", "password": active},
                         follow_redirects=False)
 
-    page = harness.client.get(DASHBOARD).text
+    page = harness.client.get(LIBRARY).text
 
     assert page.count("Last sign-in:") == 1
 
@@ -321,7 +322,7 @@ def test_the_failed_attempt_link_survives_the_move(harness: AppHarness) -> None:
     harness.client.post(LOGIN, data={"username": "admin", "password": active},
                         follow_redirects=False)
 
-    toast = _toast_markup(harness.client.get(DASHBOARD).text)
+    toast = _toast_markup(harness.client.get(LIBRARY).text)
 
     assert "banner-error" in toast
     assert '/security">security activity</a>' in toast
@@ -335,7 +336,7 @@ def test_an_unreachable_radarr_stays_a_page_banner(harness: AppHarness) -> None:
         name="Main", url="http://127.0.0.1:1", api_key=RADARR_KEY
     )
 
-    page = harness.client.get(DASHBOARD).text
+    page = harness.client.get(LIBRARY).text
 
     assert "Couldn’t reach Main" in page
     assert "Couldn’t reach Main" not in _toast_markup(page)

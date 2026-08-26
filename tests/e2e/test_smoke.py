@@ -64,7 +64,7 @@ def test_full_stack_smoke() -> None:
     # First-run wizard: with no Radarr connection yet, the forced change lands on Settings
     # (app/web/auth.py change_password_submit), not the dashboard.
     assert changed.headers["location"].endswith("/settings"), changed.headers.get("location")
-    assert client.get("/dashboard").status_code == 200
+    assert client.get("/library").status_code == 200
 
     # 2. Connect the (mock) Radarr and test the connection.
     _post(
@@ -91,7 +91,7 @@ def test_full_stack_smoke() -> None:
 
     # 5. The run only REPORTS. The library view shows the pre-owned title, and
     #    NOTHING was auto-added — no missing chart title appears as Wanted yet.
-    dashboard = client.get("/dashboard").text
+    dashboard = client.get("/library").text
     assert "Dune: Part Two" in dashboard
     assert "In Library" in dashboard
     assert "Wanted" not in dashboard
@@ -116,7 +116,7 @@ def test_full_stack_smoke() -> None:
     assert "status=added" in added.headers["location"]
 
     # After the manual add, the title now appears in the library view as Wanted.
-    assert "Wanted" in client.get("/dashboard").text
+    assert "Wanted" in client.get("/library").text
 
     # 7. Create a backup.
     created = _post(client, "/settings/backups/create")

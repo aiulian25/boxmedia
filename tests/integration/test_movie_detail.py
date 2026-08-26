@@ -226,7 +226,7 @@ def test_an_unmatched_title_has_no_dead_link(harness: AppHarness) -> None:
 
 def test_every_page_carries_the_dialog(harness: AppHarness) -> None:
     harness.activate()
-    for path in ("/dashboard", "/reports", "/settings"):
+    for path in ("/library", "/reports", "/settings"):
         assert 'id="movie-dialog"' in harness.client.get(path).text, path
 
 
@@ -954,4 +954,4 @@ def test_the_page_tells_the_script_where_to_ask(harness: AppHarness) -> None:
     assert "data-progress-url" not in harness.client.get("/login").text
 
     harness.activate()
-    assert 'data-progress-url="/progress"' in harness.client.get("/dashboard").text
+    assert 'data-progress-url="/progress"' in harness.client.get("/library").text
