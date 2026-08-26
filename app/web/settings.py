@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from app.core.audit import AuditAction
 from app.core.filestore import dir_size_bytes
 from app.services import boxoffice
-from app.services.apps import MAX_APP_NAME_LENGTH, InvalidAppError
+from app.services.apps import APP_KINDS, KIND_RADARR, MAX_APP_NAME_LENGTH, InvalidAppError
 from app.services.backup import (
     MAX_UPLOAD_BYTES,
     BackupCorruptError,
@@ -299,15 +299,18 @@ async def settings_page(request: Request) -> object:
     user = current_user(request)
     # Mark the EFFECTIVE primary, not just an explicitly flagged one: with no flag set
     # (a fresh install, or an apps.yml from before this existed) the first connection is
-    # still the one in charge, and the badge has to say so.
-    primary_id = request.app.state.apps.primary_id()
+    # still the one in charge, and the badge has to say so. One per kind — which Radarr
+    # the weekly run talks to and which Sonarr takes a series are separate answers.
+    primary_by_kind = {kind: request.app.state.apps.primary_id(kind) for kind in APP_KINDS}
     # Each connection's own profiles/folders — Radarr assigns profile ids per database,
     # so one shared list would offer the wrong quality for the other instance.
     options_by_app = await load_all_radarr_options(request)
     apps = []
-    for app in request.app.state.apps.list_apps():
+    # The one caller that wants every kind: this page is where connections are managed,
+    # so one invisible here would be one nobody could edit or remove.
+    for app in request.app.state.apps.list_apps(kind=None):
         view = app.public()
-        view["primary"] = app.id == primary_id
+        view["primary"] = app.id == primary_by_kind.get(app.kind)
         view["options"] = options_by_app.get(app.id, RadarrOptions())
         apps.append(view)
     filters = request.app.state.filters.load()
@@ -319,7 +322,9 @@ async def settings_page(request: Request) -> object:
         request.app.state.reports.completed_weeks(),
     )
     health = await _connection_health(request, apps)
-    options = options_by_app.get(primary_id) or RadarrOptions()
+    # The global Radarr Defaults block: the RADARR primary's own profiles and folders,
+    # never a Sonarr's — its profile ids come from a different database.
+    options = options_by_app.get(primary_by_kind[KIND_RADARR]) or RadarrOptions()
     banner = STATUS_MESSAGES.get(request.query_params.get(STATUS_QUERY_KEY, ""))
     return render(
         request,
