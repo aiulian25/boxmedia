@@ -139,7 +139,7 @@
            "film". One label, two words, rather than two near-identical cards. #}
         <label for="dq-{{ app.id }}">Adds {{ 'series' if app.kind == 'sonarr' else 'films' }} as</label>
         {% if app.options.profiles %}
-        <select id="dq-{{ app.id }}" name="quality_profile_id" class="select-field">
+        <select id="dq-{{ app.id }}" name="quality_profile_id">
           {% for profile in app.options.profiles %}
           <option value="{{ profile.id }}" {% if profile.id == app.quality_profile_id %}selected{% endif %}>{{ profile.name }}</option>
           {% endfor %}
@@ -151,7 +151,7 @@
       <div>
         <label for="df-{{ app.id }}">into</label>
         {% if app.options.root_folders %}
-        <select id="df-{{ app.id }}" name="root_folder" class="select-field">
+        <select id="df-{{ app.id }}" name="root_folder">
           {% for folder in app.options.root_folders %}
           <option value="{{ folder }}" {% if folder == app.root_folder %}selected{% endif %}>{{ folder }}</option>
           {% endfor %}
@@ -167,7 +167,7 @@
       {% if app.kind == 'sonarr' %}
       <div>
         <label for="st-{{ app.id }}">Series type</label>
-        <select id="st-{{ app.id }}" name="series_type" class="select-field">
+        <select id="st-{{ app.id }}" name="series_type">
           {% for value in series_types %}
           <option value="{{ value }}" {% if value == (app.series_type or 'standard') %}selected{% endif %}>{{ value | capitalize }}</option>
           {% endfor %}
@@ -495,7 +495,7 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="boxoffice_region">Chart</label>
-        <select id="boxoffice_region" name="boxoffice_region" class="select-field">
+        <select id="boxoffice_region" name="boxoffice_region">
           {% for code, label in regions.items() %}
           <option value="{{ code }}" {% if code == filters.boxoffice_region %}selected{% endif %}>{{ label }}</option>
           {% endfor %}
