@@ -285,7 +285,13 @@ def test_the_add_control_exists_in_exactly_one_template() -> None:
         path.name for path in templates.glob("*.html") if "split-add" in path.read_text("utf-8")
     )
 
-    assert carriers == ["_add_control.html"], f"the Add control is duplicated in {carriers}"
+    # One DEDICATED partial per medium, and never pasted into a page template. Television
+    # added a second Add control — its own form, its own route, its own one question —
+    # and the rule that matters is unchanged: the split button carries the per-connection
+    # menu and the CSRF token, so a copy inside a page is a place to forget one of them.
+    assert carriers == ["_add_control.html", "_add_series_control.html"], (
+        f"the Add control is duplicated in {carriers}"
+    )
     # Every page that offers an add reaches it through the include, not a copy.
     including = sorted(
         path.name

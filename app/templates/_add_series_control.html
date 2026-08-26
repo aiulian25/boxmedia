@@ -1,0 +1,44 @@
+{# The Add-a-series control, in one place — `_add_control.html`'s twin.
+
+   Its own partial for that file's reason, which an existing invariant test enforces:
+   the split-button markup carries the per-connection menu AND the CSRF token, and a
+   second copy pasted into a page template is a second place to forget one of them.
+
+   Monitor is the ONLY per-show choice. Quality, folder, series type and season folders
+   are that connection's own, set once in Settings — asking them per title would break
+   the rule the film add already keeps and turn one decision into five.
+
+   Expects `show`, `targets`, `show_targets`, `monitor_choices` and `default_monitor`
+   from the caller; `csrf_token` and `url_base` come from the page context. #}
+<form method="post" action="{{ url_base }}{{ add_series_path }}" class="add-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="tmdb_id" value="{{ show.tmdb_id }}">
+  <input type="hidden" name="title" value="{{ show.title }}">
+  {# Posted when we already have it — a Trakt row carries the TVDB id for free, and
+     sending it saves the bridging call. Absent, the server resolves it itself. #}
+  <input type="hidden" name="tvdb_id" value="{{ show.tvdb_id if show.tvdb_id }}">
+  <label class="add-label" for="monitor-{{ show.tmdb_id }}">Monitor</label>
+  <select id="monitor-{{ show.tmdb_id }}" name="monitor" class="select-sm">
+    {% for value, label in monitor_choices %}
+    <option value="{{ value }}" {% if value == default_monitor %}selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  {% if show_targets %}
+  <div class="split-add">
+    <button type="submit" class="btn-add" name="target" value="">Add to Sonarr</button>
+    <details class="split-more">
+      <summary aria-label="Choose which Sonarr">▾</summary>
+      <div class="target-menu">
+        {% for entry in targets %}
+        <button type="submit" class="target-option" name="target" value="{{ entry.id }}"{% if not entry.ready %} disabled{% endif %}>
+          <span class="target-name">{{ entry.name }}</span>
+          {% if not entry.ready %}<span class="target-detail">Pick a quality &amp; folder in Settings</span>{% endif %}
+        </button>
+        {% endfor %}
+      </div>
+    </details>
+  </div>
+  {% else %}
+  <button type="submit" class="btn-add">Add to Sonarr</button>
+  {% endif %}
+</form>

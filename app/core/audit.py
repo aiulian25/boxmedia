@@ -57,6 +57,7 @@ class AuditAction:
     FILTERS_UPDATED = "filters_updated"
     PIPELINE_RUN = "pipeline_run"
     MOVIE_ADDED_MANUAL = "movie_added_manual"
+    SERIES_ADDED = "series_added"
     MATCH_CORRECTED = "match_corrected"
     REPORT_DELETED = "report_deleted"
     BACKUP_CREATED = "backup_created"

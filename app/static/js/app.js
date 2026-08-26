@@ -123,7 +123,10 @@
           event.shiftKey || event.altKey) {
         return;
       }
-      var link = event.target.closest("a[data-movie]");
+      // Both hooks, one handler. A series opens in the same dialog as a film because it
+      // is the same gesture — the only difference is which route renders the fragment,
+      // and that is already in the link's own href.
+      var link = event.target.closest("a[data-movie], a[data-show]");
       if (!link || !link.getAttribute("href")) {
         return;
       }

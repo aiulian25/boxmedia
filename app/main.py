@@ -40,7 +40,17 @@ from app.services.scheduler import BoxMediaScheduler
 from app.services.series import SeriesLibraryCache
 from app.services.sonarr_options import SonarrOptionsCache
 from app.services.users import UserStore
-from app.web import auth, dashboard, deps, discover, movies, profile, reports, security_page
+from app.web import (
+    auth,
+    dashboard,
+    deps,
+    discover,
+    movies,
+    profile,
+    reports,
+    security_page,
+    shows,
+)
 from app.web import settings as settings_routes
 
 HEALTH_PATH = "/health"
@@ -212,6 +222,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(dashboard.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(discover.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(movies.router, prefix=settings.url_base, dependencies=csrf)
+    app.include_router(shows.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(security_page.router, prefix=settings.url_base, dependencies=csrf)
 
     # HEAD as well as GET, same reason as the favicon below: uptime monitors commonly

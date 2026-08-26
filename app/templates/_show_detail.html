@@ -1,0 +1,136 @@
+{# One series' record — rendered standalone into the modal, and inside show_detail.html
+   as a page. One source so the two can never drift, exactly as _movie_detail.html does.
+
+   The film detail's anatomy, class for class: .movie-head, .movie-poster,
+   .movie-headline, .rating-row, .genre-row, .fact-row, .movie-links, .credits. A series
+   is a different thing to look at, not a different kind of page, so nothing new was
+   invented for it and nothing here can be purged out of the stylesheet. #}
+{% if error %}
+<p class="banner-warn" role="alert">{{ error }}</p>
+{% elif show %}
+<article class="movie-detail">
+  <header class="movie-head">
+    <div class="movie-poster">
+      {% if show.poster_local %}
+      <img src="{{ show.poster_local }}" alt="{{ show.title }} poster">
+      {% else %}
+      <div class="poster-empty">Poster</div>
+      {% endif %}
+    </div>
+    <div class="movie-headline">
+      <h2 class="headline-md">{{ show.title }}{% if show.year %} <span class="movie-year">{{ show.year }}</span>{% endif %}</h2>
+
+      {% if show.rating or show.certification %}
+      <div class="rating-row">
+        {% if show.rating %}<span class="rating"><span class="rating-source">TMDB</span> {{ "%.1f"|format(show.rating) }}</span>{% endif %}
+        {% if show.certification %}<span class="rating"><span class="rating-source">Rated</span> {{ show.certification }}</span>{% endif %}
+      </div>
+      {% endif %}
+
+      {% if show.genres %}
+      <div class="genre-row">
+        {% for genre in show.genres %}<span class="tag">{{ genre }}</span>{% endfor %}
+      </div>
+      {% endif %}
+
+      <dl class="fact-row">
+        {% if show.networks %}<div class="fact"><dt>Network</dt><dd>{{ show.networks | join(", ") }}</dd></div>{% endif %}
+        {% if show.status %}<div class="fact"><dt>Status</dt><dd>{{ show.status }}</dd></div>{% endif %}
+        {% if show.first_air_date %}<div class="fact"><dt>First aired</dt><dd>{{ show.first_air_date }}</dd></div>{% endif %}
+        {% if show.runtime %}<div class="fact"><dt>Runtime</dt><dd>{{ show.runtime }} min</dd></div>{% endif %}
+        {% if show.tvdb_id %}<div class="fact"><dt>TVDB id</dt><dd>{{ show.tvdb_id }}</dd></div>{% endif %}
+      </dl>
+
+      <div class="movie-links">
+        {% if show.imdb_url %}<a href="{{ show.imdb_url }}" target="_blank" rel="noopener noreferrer">IMDb</a>{% endif %}
+        {% if show.trailer_url %}<a href="{{ show.trailer_url }}" target="_blank" rel="noopener noreferrer">Trailer</a>{% endif %}
+      </div>
+
+      {# The two registers, unchanged from everywhere else in the app: green states a
+         fact, amber states a guess and asks you to check it. #}
+      {% if held %}
+      <span class="server-hint">In {{ held.series.title }}{% if held.series.complete %} — complete, {{ held.series.episode_count }} episodes{% else %} — missing {{ held.series.missing_episode_count }} episode{% if held.series.missing_episode_count != 1 %}s{% endif %}{% endif %}</span>
+      {% elif server_state == 'yes' %}
+      <span class="server-hint" title="Your {{ server_name }} holds this series (matched by id) — Sonarr does not">Already on {{ server_name }} — Sonarr does not have it</span>
+      {% elif server_state == 'probably' %}
+      <span class="guess-hint" title="A {{ server_name }} series of the same name and year — nothing verified it is the same show">Probably on {{ server_name }} — verify</span>
+      {% endif %}
+
+      {# The add block. It asks ONE question, and says in words why it asks no more. #}
+      <div class="movie-actions">
+        {% if held %}
+        <span class="field-note">Already in Sonarr — open it there to change what is monitored.</span>
+        {% elif not show.addable %}
+        {# An honest refusal beats an Add that could not work: Sonarr identifies series
+           by TVDB id and TMDB has none for this one. #}
+        <span class="guess-hint">No TVDB id — Sonarr cannot identify this series</span>
+        <a class="btn-secondary" href="https://www.thetvdb.com/search?query={{ show.title | urlencode }}" target="_blank" rel="noopener noreferrer">Find it on TheTVDB</a>
+        {% elif not targets %}
+        <span class="field-note">Add a Sonarr connection in <a href="{{ url_base }}/settings">Settings</a> to add series.</span>
+        {% else %}
+        {% include "_add_series_control.html" %}
+        {% endif %}
+
+        <form method="post" action="{{ url_base }}{{ ignore_series_path }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="tmdb_id" value="{{ show.tmdb_id }}">
+          <input type="hidden" name="title" value="{{ show.title }}">
+          {% if ignored %}<input type="hidden" name="undo" value="1">{% endif %}
+          <button type="submit" class="btn-ignore">{% if ignored %}Un-ignore{% else %}Ignore{% endif %}</button>
+        </form>
+      </div>
+
+      {# Said once, in words, rather than as four more controls. The rule is the film
+         add's rule, and stating it is what stops someone hunting for a quality picker. #}
+      {% if targets and not held and show.addable %}
+      <p class="field-note">Quality, folder, series type and season folders come from that connection, set once in <a href="{{ url_base }}/settings">Settings</a> — they are per connection, not per show.</p>
+      {% endif %}
+    </div>
+  </header>
+
+  {% if show.overview %}
+  <p class="movie-overview">{{ show.overview }}</p>
+  {% endif %}
+
+  {% if show.seasons %}
+  <section class="credits">
+    <h3 class="section-subtitle">Seasons</h3>
+    <table class="detail-table">
+      <thead>
+        <tr><th>Season</th><th>Episodes</th><th>First aired</th></tr>
+      </thead>
+      <tbody>
+        {% for season in show.seasons %}
+        <tr>
+          <td>{{ season.name }}</td>
+          <td>{{ season.episode_count }}</td>
+          {# Day first, never American — and a season with no announced date says so
+             rather than rendering an empty cell. #}
+          <td>{% if season.air_date %}{{ season.air_date.day }}/{{ season.air_date.month }}/{{ season.air_date.year }}{% else %}Not announced{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="field-note">Nothing on this table is sent to Sonarr until you press Add.</p>
+  </section>
+  {% endif %}
+
+  {% if show.cast %}
+  <section class="credits">
+    <h3 class="section-subtitle">Cast</h3>
+    <div class="credit-row">
+      {% for person in show.cast %}
+      <figure class="credit">
+        {% if person.headshot %}
+        <img src="{{ person.headshot }}" alt="" loading="lazy">
+        {% else %}
+        <div class="credit-empty" aria-hidden="true">{{ person.name[:1] }}</div>
+        {% endif %}
+        <figcaption><span class="credit-name">{{ person.name }}</span>{% if person.role %}<span class="credit-role">{{ person.role }}</span>{% endif %}</figcaption>
+      </figure>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+</article>
+{% endif %}

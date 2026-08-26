@@ -257,6 +257,12 @@ html.light {
 
   .page-header { @apply mb-8; }
   .headline-lg { @apply text-headline-lg text-primary; }
+  /* The detail pages' title. It has been ASKED FOR since the movie modal shipped —
+     both _movie_detail.html and _show_detail.html carry class="headline-md" — but was
+     never defined, so preflight's `h2 { font-size: inherit }` left that title rendering
+     at body size and unbolded. Defined here rather than swapped for headline-lg in the
+     templates: they were already right about what they wanted. */
+  .headline-md { @apply text-headline-md text-primary; }
   .subtle { @apply text-body-md text-outline; }
 
   .auth-card { @apply max-w-sm mx-auto mt-24 bg-surface-container-low border border-surface-container-highest p-8; }

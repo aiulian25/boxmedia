@@ -93,7 +93,11 @@
   <div class="gross-strip">
     {% for show in row.cards %}
     <div class="poster-card">
-      <div class="poster-frame poster-frame-plain">
+      {# A real link, so the detail works with the script blocked and is linkable;
+         app.js upgrades the click to the same dialog a film opens in. Deciding — Add,
+         Monitor, Ignore — lives there rather than being duplicated onto every card. #}
+      <a class="poster-frame{% if not show.tmdb_id %} poster-frame-plain{% endif %}"
+         {% if show.tmdb_id %}href="{{ url_base }}/shows/{{ show.tmdb_id }}" data-show="{{ show.tmdb_id }}"{% endif %}>
         {% if show.poster_local %}
         <img src="{{ show.poster_local }}" alt="{{ show.title }} poster">
         {% else %}
@@ -110,7 +114,7 @@
           <span class="dot dot-wanted"></span><span>Wanted</span>
           {% endif %}
         </div>
-      </div>
+      </a>
       <div class="poster-title">{{ show.title }}</div>
       <div class="poster-meta">
         <span class="gross">{{ show.meta }}</span>
