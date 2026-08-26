@@ -26,6 +26,7 @@ from app.core.sessions import COOKIE_NAME, SessionStore
 from app.services.apps import AppsStore
 from app.services.backfill import BackfillRunner
 from app.services.backup import BackupService
+from app.services.calendar import CalendarCache
 from app.services.corrections import CorrectionStore
 from app.services.discovery import DiscoverCache, DiscoveryStore
 from app.services.filters import FiltersStore
@@ -168,6 +169,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.media_server_cache = MediaServerLibraryCache(settings.cache_dir)
     # The two Trakt shelves. The Discover page renders from here and only from here.
     app.state.discover_cache = DiscoverCache(settings.cache_dir)
+    # One week, both media. Merged rather than per connection: a day column shows
+    # everything arriving that day, whichever server it came from.
+    app.state.calendar_cache = CalendarCache(settings.cache_dir)
     # What each Sonarr holds, so a Discover card never waits on a live round trip.
     app.state.series_cache = SeriesLibraryCache(settings.cache_dir)
     app.state.media_server_backoff = deps.RadarrBackoff()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ssl
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import httpx
 
@@ -88,6 +89,44 @@ class MovieDetail:
     crew: tuple[CreditPerson, ...] = ()
 
 
+# A film's three possible release moments, in the order they normally happen. Kept as
+# separate entries rather than one "release date" because they are different events a
+# person plans around differently — and Radarr grabs on the digital one.
+RELEASE_IN_CINEMAS = "inCinemas"
+RELEASE_PHYSICAL = "physicalRelease"
+RELEASE_DIGITAL = "digitalRelease"
+RELEASE_KINDS = (RELEASE_IN_CINEMAS, RELEASE_PHYSICAL, RELEASE_DIGITAL)
+# What each is called where a person reads it.
+RELEASE_NAMES = {
+    RELEASE_IN_CINEMAS: "In cinemas",
+    RELEASE_PHYSICAL: "Physical release",
+    RELEASE_DIGITAL: "Digital release",
+}
+
+
+@dataclass(frozen=True)
+class RadarrRelease:
+    """One film's one release moment, as the calendar shows it.
+
+    A film with a cinema date, a physical date and a digital date inside the window
+    produces THREE of these. That is correct: they are three different things to know
+    about, and collapsing them would silently pick one and hide the others.
+    """
+
+    radarr_id: int
+    tmdb_id: int | None
+    title: str
+    year: int | None
+    release_kind: str
+    when: datetime
+    has_file: bool
+    monitored: bool
+
+    @property
+    def release_name(self) -> str:
+        return RELEASE_NAMES.get(self.release_kind, self.release_kind)
+
+
 @dataclass(frozen=True)
 class RadarrLookupResult:
     tmdb_id: int
@@ -141,6 +180,24 @@ def _ratings_from(ratings: dict) -> tuple[tuple[str, str], ...]:
 # deeper than this has a tail nobody is looking at, and an unbounded page is a request
 # whose size Radarr decides.
 QUEUE_PAGE_SIZE = 200
+
+
+def _release_date(value: object) -> datetime | None:
+    """Radarr's ISO date, or None.
+
+    A film with no date for a given release kind is the common case, not an error — most
+    have no physical date until long after release. Unparseable is also None: one bad
+    field must not blank a week of calendar.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # Radarr sends some dates without a timezone. Treating a naive one as UTC keeps every
+    # comparison in this module against one clock rather than crashing on the mix.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _library_movie(item: dict) -> RadarrMovie:
@@ -446,6 +503,48 @@ class RadarrClient:
             has_file=bool(item.get("hasFile", False)),
             imdb_id=item.get("imdbId"),
         )
+
+    async def calendar(self, start: datetime, end: datetime) -> list[RadarrRelease]:
+        """Films with a release date between two instants.
+
+        `unmonitored=false` so the calendar shows what this Radarr is actually working
+        towards. One film can yield several entries — see RadarrRelease.
+        """
+        response = await self._request(
+            "GET",
+            "/calendar",
+            params={
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "unmonitored": "false",
+            },
+        )
+        releases: list[RadarrRelease] = []
+        for item in self._json_list(response):
+            if not isinstance(item, dict):
+                continue
+            radarr_id = item.get("id")
+            if not isinstance(radarr_id, int) or isinstance(radarr_id, bool):
+                continue
+            for release_kind in RELEASE_KINDS:
+                when = _release_date(item.get(release_kind))
+                if when is None or not (start <= when <= end):
+                    # Radarr answers on whichever date matched; the others may sit
+                    # outside the window entirely and are not this week's news.
+                    continue
+                releases.append(
+                    RadarrRelease(
+                        radarr_id=radarr_id,
+                        tmdb_id=item.get("tmdbId") if isinstance(item.get("tmdbId"), int) else None,
+                        title=item.get("title") or "",
+                        year=item.get("year") if isinstance(item.get("year"), int) else None,
+                        release_kind=release_kind,
+                        when=when,
+                        has_file=bool(item.get("hasFile", False)),
+                        monitored=bool(item.get("monitored", False)),
+                    )
+                )
+        return releases
 
     async def quality_profiles(self) -> list[tuple[int, str]]:
         response = await self._request("GET", "/qualityprofile")
