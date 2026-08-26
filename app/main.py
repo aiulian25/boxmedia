@@ -37,6 +37,7 @@ from app.services.radarr_options import RadarrOptionsCache
 from app.services.release_ids import ReleaseIdCache
 from app.services.reports import ReportsStore
 from app.services.scheduler import BoxMediaScheduler
+from app.services.series import SeriesLibraryCache
 from app.services.sonarr_options import SonarrOptionsCache
 from app.services.users import UserStore
 from app.web import auth, dashboard, deps, movies, profile, reports, security_page
@@ -155,6 +156,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.media_server = MediaServerStore(settings.config_dir, key=encryption_key, audit=audit)
     app.state.media_server_cache = MediaServerLibraryCache(settings.cache_dir)
+    # What each Sonarr holds, so a Discover card never waits on a live round trip.
+    app.state.series_cache = SeriesLibraryCache(settings.cache_dir)
     app.state.media_server_backoff = deps.RadarrBackoff()
     app.state.backups = BackupService(
         settings.data_dir, settings.backups_dir, key=encryption_key, audit=audit

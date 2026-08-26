@@ -444,6 +444,15 @@ SONARR_KEY = "fedcba9876543210fedcba9876543210"
 SONARR_STATUS_URL = f"{SONARR_URL}/api/v3/system/status"
 SONARR_PROFILES_URL = f"{SONARR_URL}/api/v3/qualityprofile"
 SONARR_FOLDERS_URL = f"{SONARR_URL}/api/v3/rootfolder"
+SONARR_SERIES_URL = f"{SONARR_URL}/api/v3/series"
+
+
+def _mock_sonarr_series(rows: list | None = None) -> None:
+    """Adding or testing a Sonarr that ANSWERS now reads its library straight away, so
+    Discover can say what you already own without waiting for the morning job."""
+    respx.get(SONARR_SERIES_URL).mock(
+        return_value=httpx.Response(200, json=rows if rows is not None else [])
+    )
 
 
 def _add_sonarr(harness: AppHarness) -> str:
@@ -544,6 +553,7 @@ def test_only_a_sonarr_card_carries_the_series_fields(harness: AppHarness) -> No
 
 @respx.mock
 def test_saving_a_sonarr_card_stores_its_series_options(harness: AppHarness) -> None:
+    _mock_sonarr_series()
     respx.get(SONARR_STATUS_URL).mock(
         return_value=httpx.Response(200, json={"appName": "Sonarr", "version": "4.0.1"})
     )
@@ -580,6 +590,7 @@ def test_saving_a_sonarr_card_stores_its_series_options(harness: AppHarness) -> 
 
 @respx.mock
 def test_sonarr_options_are_fetched_and_cached_in_their_own_file(harness: AppHarness) -> None:
+    _mock_sonarr_series()
     respx.get(SONARR_STATUS_URL).mock(
         return_value=httpx.Response(200, json={"appName": "Sonarr", "version": "4.0.1"})
     )
@@ -755,6 +766,7 @@ def test_removing_a_sonarr_forgets_its_cached_options(harness: AppHarness) -> No
 
 @respx.mock
 def test_a_sonarr_health_dot_is_probed_with_a_sonarr_client(harness: AppHarness) -> None:
+    _mock_sonarr_series()
     """Probing a Sonarr with a Radarr client is refused by the store, so the dot would
     read Unreachable for a server that is answering perfectly well — and the person would
     go looking for a network fault that is not there."""
@@ -1025,3 +1037,137 @@ def test_the_shared_test_handler_sends_the_pressed_buttons_value() -> None:
 
     script = (Path(__file__).resolve().parents[2] / "app/static/js/app.js").read_text()
     assert "body.append(testButton.name, testButton.value)" in script
+
+
+# --- the Sonarr library snapshot (TV step 8) ---
+
+SERIES_ROW = {
+    "id": 14, "tvdbId": 121361, "title": "The Hollow Coast", "year": 2023,
+    "monitored": True, "ended": False,
+    "statistics": {"episodeCount": 34, "episodeFileCount": 26},
+}
+
+
+@respx.mock
+def test_testing_a_saved_sonarr_card_does_not_500(harness: AppHarness) -> None:
+    """It did. `build_client` refuses a non-Radarr connection with InvalidAppError,
+    which is a ValueError and matched none of the route's excepts, so pressing Test on a
+    Sonarr card raised rather than testing anything."""
+    respx.get(SONARR_STATUS_URL).mock(
+        return_value=httpx.Response(200, json={"appName": "Sonarr", "version": "4.0.1"})
+    )
+    _mock_sonarr_series()
+    harness.activate()
+    app_id = _add_sonarr(harness)
+
+    response = harness.client.post(
+        f"/settings/apps/{app_id}/test", follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert SettingsStatus.TEST_OK in response.headers["location"]
+
+
+@respx.mock
+def test_a_saved_radarr_card_still_tests_exactly_as_before(harness: AppHarness) -> None:
+    """The regression half: making the route kind-aware must not change the Radarr path."""
+    respx.get(STATUS_URL).mock(
+        return_value=httpx.Response(200, json={"appName": "Radarr", "version": "5.2.0"})
+    )
+    harness.activate()
+    _add_app(harness)
+    app_id = harness.client.app.state.apps.list_apps()[0].id
+
+    response = harness.client.post(
+        f"/settings/apps/{app_id}/test", follow_redirects=False
+    )
+    assert SettingsStatus.TEST_OK in response.headers["location"]
+
+
+@respx.mock
+def test_adding_a_sonarr_that_answers_reads_its_library_at_once(
+    harness: AppHarness,
+) -> None:
+    """Waiting for the morning job would leave Discover unable to say what you already
+    own until tomorrow."""
+    respx.get(SONARR_STATUS_URL).mock(
+        return_value=httpx.Response(200, json={"appName": "Sonarr", "version": "4.0.1"})
+    )
+    _mock_sonarr_series([SERIES_ROW])
+    harness.activate()
+    app_id = _add_sonarr(harness)
+
+    cached = harness.client.app.state.series_cache.load(app_id)
+    assert cached is not None
+    assert [item.title for item in cached[0]] == ["The Hollow Coast"]
+    assert cached[0][0].missing_episode_count == 8
+
+
+def test_adding_a_sonarr_that_is_down_caches_nothing_rather_than_emptiness(
+    harness: AppHarness,
+) -> None:
+    """"We could not look" and "you own nothing" are different claims, and only one of
+    them is true. No respx mock here: nothing is listening, which is the point."""
+    harness.activate()
+    app_id = _add_sonarr(harness)
+
+    assert harness.client.app.state.series_cache.load(app_id) is None
+
+
+@respx.mock
+def test_testing_a_sonarr_refreshes_what_it_holds(harness: AppHarness) -> None:
+    """Pressing Test is the admin saying "try again now", so a library fixed since the
+    last failure shows up immediately rather than at the next scheduled refresh."""
+    respx.get(SONARR_STATUS_URL).mock(
+        return_value=httpx.Response(200, json={"appName": "Sonarr", "version": "4.0.1"})
+    )
+    _mock_sonarr_series()
+    harness.activate()
+    app_id = _add_sonarr(harness)
+    assert harness.client.app.state.series_cache.load(app_id)[0] == ()
+
+    _mock_sonarr_series([SERIES_ROW])
+    harness.client.post(f"/settings/apps/{app_id}/test", follow_redirects=False)
+
+    assert len(harness.client.app.state.series_cache.load(app_id)[0]) == 1
+
+
+@respx.mock
+def test_removing_a_sonarr_forgets_what_it_held(harness: AppHarness) -> None:
+    """A library nobody is connected to must not keep decorating cards."""
+    respx.get(SONARR_STATUS_URL).mock(
+        return_value=httpx.Response(200, json={"appName": "Sonarr", "version": "4.0.1"})
+    )
+    _mock_sonarr_series([SERIES_ROW])
+    harness.activate()
+    app_id = _add_sonarr(harness)
+    assert harness.client.app.state.series_cache.load(app_id) is not None
+
+    harness.client.post(f"/settings/apps/{app_id}/delete", follow_redirects=False)
+
+    assert harness.client.app.state.series_cache.load(app_id) is None
+
+
+@respx.mock
+def test_a_refresh_that_fails_keeps_the_last_known_library(harness: AppHarness) -> None:
+    """The claim that matters. "We could not look" and "you own nothing" are different
+    things, and only one of them is true — so a Sonarr that stops answering must leave
+    its last snapshot in place rather than blanking every card that quoted it.
+
+    Reached by letting the status probe succeed while the library read fails, which is
+    exactly what a Sonarr mid-restart looks like.
+    """
+    respx.get(SONARR_STATUS_URL).mock(
+        return_value=httpx.Response(200, json={"appName": "Sonarr", "version": "4.0.1"})
+    )
+    _mock_sonarr_series([SERIES_ROW])
+    harness.activate()
+    app_id = _add_sonarr(harness)
+    assert len(harness.client.app.state.series_cache.load(app_id)[0]) == 1
+
+    respx.get(SONARR_SERIES_URL).mock(side_effect=httpx.ConnectError("gone"))
+    harness.client.post(f"/settings/apps/{app_id}/test", follow_redirects=False)
+
+    cached = harness.client.app.state.series_cache.load(app_id)
+    assert cached is not None, "a failed refresh wiped the cache"
+    assert [item.title for item in cached[0]] == ["The Hollow Coast"]

@@ -106,6 +106,7 @@ from app.web.deps import (
     radarr_backoff,
     radarr_client_for,
     radarr_client_for_credentials,
+    refresh_series_library,
     render,
     sonarr_client_for,
     sonarr_client_for_credentials_dep,
@@ -661,7 +662,12 @@ async def add_app(
     # A brand-new id cannot be backed off, but clearing is what keeps that true if an id
     # is ever reused — and it costs nothing.
     radarr_backoff(request).note_success(app.id)
-    return _redirect(request, _ADDED_STATUS[await _probe(request, app.id, app.kind)])
+    health = await _probe(request, app.id, app.kind)
+    # A Sonarr that answered is worth reading now: waiting for the morning job would
+    # leave Discover unable to say what you already own until tomorrow.
+    if app.kind == KIND_SONARR and health == AppHealth.OK:
+        await refresh_series_library(request, app.id)
+    return _redirect(request, _ADDED_STATUS[health])
 
 
 @router.post("/settings/apps/{app_id}")
@@ -786,6 +792,7 @@ def delete_app(request: Request, app_id: str) -> RedirectResponse:
         # removed connection's profiles on disk forever.
         request.app.state.radarr_options.forget(app_id)
         request.app.state.sonarr_options.forget(app_id)
+        request.app.state.series_cache.forget(app_id)
         radarr_backoff(request).forget(app_id)
     except KeyError:
         return _redirect(request, SettingsStatus.APP_INVALID)
@@ -805,22 +812,37 @@ def make_primary(request: Request, app_id: str) -> RedirectResponse:
 
 @router.post("/settings/apps/{app_id}/test")
 async def test_app(request: Request, app_id: str) -> RedirectResponse:
+    """Probe a SAVED connection. Kind-aware, like the on-load health dots.
+
+    It was not, and that was a real bug: `build_client` refuses a non-Radarr connection
+    with InvalidAppError, which is a ValueError and matched none of the excepts below —
+    so pressing Test on a Sonarr card raised a 500 instead of testing anything.
+    """
     user = current_user(request)
+    kind = _kind_of(request, app_id)
+    build = sonarr_client_for if kind == KIND_SONARR else radarr_client_for
     try:
-        client = radarr_client_for(request, app_id, timeout=HEALTH_TIMEOUT_SECONDS)
+        client = build(request, app_id, timeout=HEALTH_TIMEOUT_SECONDS)
         # Same hard wall-time bound as the on-load probes: httpx's timeout does not cover
         # name resolution, so an unresolvable host would otherwise hold this request for
         # the OS resolver's timeout rather than for HEALTH_TIMEOUT_SECONDS.
         await asyncio.wait_for(client.system_status(), timeout=HEALTH_TIMEOUT_SECONDS)
-    except KeyError:
+    except (KeyError, InvalidAppError):
         return _redirect(request, SettingsStatus.APP_INVALID)
-    except RadarrAuthError:
+    except (RadarrAuthError, SonarrAuthError):
         _audit_test(request, user.username, app_id, "auth_failed")
         return _redirect(request, SettingsStatus.TEST_AUTH)
-    except (RadarrConnectionError, RadarrError, TimeoutError):
+    except (
+        RadarrConnectionError, RadarrError, SonarrConnectionError, SonarrError, TimeoutError
+    ):
         _audit_test(request, user.username, app_id, "unreachable")
         return _redirect(request, SettingsStatus.TEST_CONN)
     _audit_test(request, user.username, app_id, "ok")
+    # Pressing Test is the admin saying "try again now". A Sonarr that just answered is
+    # worth re-reading, so a library fixed since the last failure shows up immediately
+    # rather than at the next scheduled refresh.
+    if kind == KIND_SONARR:
+        await refresh_series_library(request, app_id)
     return _redirect(request, SettingsStatus.TEST_OK)
 
 

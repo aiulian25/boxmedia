@@ -463,6 +463,46 @@ async def load_sonarr_options(request: Request, app_id: str) -> RadarrOptions:
     return options
 
 
+async def refresh_series_library(request: Request, app_id: str) -> bool:
+    """Re-read one Sonarr's library into the cache. True when it answered.
+
+    Best-effort and bounded, like every other read a page depends on: a Sonarr that is
+    switched off leaves the previous snapshot in place rather than emptying it, because
+    "we could not look" and "you own nothing" are different claims and only one of them
+    is true.
+    """
+    try:
+        client = sonarr_client_for(request, app_id, timeout=RADARR_LIBRARY_TIMEOUT_SECONDS)
+        series = await asyncio.wait_for(
+            client.list_series(), timeout=RADARR_LIBRARY_TIMEOUT_SECONDS
+        )
+    except (SonarrError, TimeoutError, KeyError, InvalidAppError):
+        radarr_backoff(request).note_failure(app_id)
+        return False
+    radarr_backoff(request).note_success(app_id)
+    request.app.state.series_cache.save(app_id, tuple(series))
+    return True
+
+
+async def refresh_stale_series_libraries(request: Request) -> None:
+    """Top up whichever Sonarr snapshots have aged out, all at once.
+
+    Skips the ones still inside their TTL and the ones already known to be down, so an
+    offline connection costs one probe a minute rather than one per page view — the
+    backoff's whole reason. Concurrent, so one slow server costs the timeout and not the
+    sum of them.
+    """
+    cache = request.app.state.series_cache
+    stale = [
+        app.id
+        for app in request.app.state.apps.list_apps(KIND_SONARR)
+        if cache.is_stale(app.id) and not radarr_backoff(request).should_skip(app.id)
+    ]
+    if not stale:
+        return
+    await asyncio.gather(*[refresh_series_library(request, app_id) for app_id in stale])
+
+
 async def load_all_sonarr_options(request: Request) -> dict[str, RadarrOptions]:
     """Every Sonarr connection's options, fetched concurrently.
 
