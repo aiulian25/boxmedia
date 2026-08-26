@@ -60,6 +60,14 @@ CALENDAR_TIMEOUT_SECONDS = 6.0
 # library it could have had. Long enough that a dead box costs one timeout a minute
 # rather than one per page view.
 RADARR_RETRY_AFTER_SECONDS = 60.0
+# The three chips both Discover and the Calendar offer. Shared for the reason the banner
+# messages below are shared: two pages now ask the reader the same question, and a chip
+# labelled differently on one of them would read as a different filter. `all` first
+# because it is the default and the widest answer.
+TYPE_ALL = "all"
+TYPE_MOVIES = "movies"
+TYPE_TV = "tv"
+MEDIA_TYPES = (TYPE_ALL, TYPE_MOVIES, TYPE_TV)
 LOGIN_PATH = "/login"  # exempt from the CSRF check — no session exists yet
 CSRF_REJECTED_DETAIL = "cross-origin request rejected"
 # What each action reports back to the page it returns to. Shared, because more
@@ -241,6 +249,15 @@ def current_user(request: Request) -> User:
 
 def client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
+
+
+def validated_media_type(raw: str | None) -> str:
+    """Which chip is active. Anything unrecognised is All.
+
+    Read-tolerant for the reason every other read in this app is: a bookmarked or
+    hand-edited `?type=` should show the widest view, not an error page.
+    """
+    return raw if raw in MEDIA_TYPES else TYPE_ALL
 
 
 def format_timestamp(moment: datetime | None) -> str:

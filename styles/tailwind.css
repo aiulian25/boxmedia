@@ -651,4 +651,71 @@ html.light {
   /* Holds a 56px thumbnail in a table row: top-aligned so it does not drift against a
      long overview, and never squeezed by the text columns beside it. */
   .fix-poster-cell { @apply w-14 align-top; }
+
+  /* Calendar (TV step 14). Seven equal columns that never overflow: minmax(0,1fr) is
+     what lets a long series title truncate INSIDE its day instead of widening the grid,
+     since a grid track's default min-width is auto. Two columns on a phone, four on a
+     tablet — a seven-across week at 375px would be seven unreadable slivers. */
+  .week { @apply grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2; }
+  .week > * { @apply min-w-0; }
+  /* min-height, not height: a day with eight episodes grows, and the grid's own row
+     stretch keeps the rest of that row level with it. */
+  .day { @apply bg-surface-container-lowest border border-surface-container-highest flex flex-col min-h-[16rem]; }
+  .day-today { @apply border-primary; }
+  .day-head { @apply px-2.5 pt-2.5 pb-2 border-b border-surface-container-highest; }
+  .day-name { @apply block text-label-sm uppercase tracking-widest text-outline; }
+  .day-today .day-name { @apply text-primary; }
+  .day-date { @apply block text-headline-sm text-primary tabular-nums mt-1; }
+  .ep-list { @apply flex flex-col gap-1.5 p-2; }
+  /* The state is carried by a 2px left edge as well as by the words, so a column can be
+     scanned without reading it. Colour is never the only signal — the label says the same
+     thing in text, which is what a colour-blind reader and a screen reader get. */
+  .entry { @apply bg-surface-container-low border-l-2 p-2 flex flex-col gap-1.5 min-w-0; }
+  /* The one visual difference between a film and an episode in the same column. Its
+     muted lines take the BRIGHTER of the two muted tokens, because the heavier ground
+     costs contrast: --bm-outline reads 4.44:1 on it in the light theme, just under AA.
+     The pairing is what stays consistent across the app, never the literal token — the
+     same reason the state colours differ per theme. */
+  .entry-film { @apply bg-surface-container-high; }
+  .entry-film .entry-kind,
+  .entry-film .entry-sub { @apply text-on-surface-variant; }
+  .entry-ok { @apply border-l-ok; }
+  .entry-ok .entry-state { @apply text-ok; }
+  .entry-warn { @apply border-l-warn; }
+  .entry-warn .entry-state { @apply text-warn; }
+  .entry-now { @apply border-l-primary; }
+  .entry-now .entry-state { @apply text-primary; }
+  .entry-idle { @apply border-l-outline-variant; }
+  .entry-idle .entry-state { @apply text-outline; }
+  .entry-kind { @apply text-label-sm uppercase tracking-widest text-outline; }
+  /* Truncates rather than wraps: a longer translation shortens the line instead of making
+     one day taller than the six beside it. The full title is on the title=. */
+  .entry-title { @apply text-label-md leading-snug text-primary font-semibold truncate; }
+  .entry-sub { @apply text-label-sm text-outline tabular-nums truncate; }
+  .entry-state { @apply text-label-sm; }
+  /* text-outline, not outline-variant: the mockup's grey reads 1.7:1 on a light day,
+     and "nothing on this day" is a fact the page states, not a decoration. */
+  .day-empty { @apply text-label-sm uppercase tracking-widest text-outline px-2.5 py-4; }
+
+  .legend { @apply flex flex-wrap items-center gap-x-5 gap-y-2 mt-6 pt-4 border-t border-surface-container-highest; }
+  .legend span { @apply flex items-center gap-2 text-label-sm uppercase tracking-widest text-outline; }
+  .legend i { @apply block w-3 h-0.5; }
+  .legend-ok { @apply bg-ok; }
+  .legend-warn { @apply bg-warn; }
+  .legend-now { @apply bg-primary; }
+  .legend-idle { @apply bg-outline-variant; }
+  /* The sentence at the end of the row, not another key: normal-case because it is prose,
+     and pushed right only once the row is wide enough to hold it on one line. */
+  .legend-note { @apply normal-case tracking-normal lg:ml-auto; }
+
+  /* The fortnight list under the grid, where a long episode title finally has the width
+     to be read. The table is `.detail-table` — the same object the series detail uses. */
+  .calendar-soon-title { @apply mt-12; }
+  .soon-when { @apply text-label-md text-outline tabular-nums whitespace-nowrap; }
+  .soon-title { @apply text-primary font-semibold; }
+  .soon-sub { @apply text-on-surface-variant tabular-nums; }
+  .soon-state { @apply text-label-sm uppercase tracking-wide whitespace-nowrap; }
+  /* The week nav sits at the right end of the chip row and drops to its own line before
+     the chips do — same rule, same reason, as `.run-search` on the reports page. */
+  .week-nav { @apply flex flex-wrap items-center gap-3 ml-auto; }
 }

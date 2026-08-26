@@ -43,6 +43,7 @@ from app.services.sonarr_options import SonarrOptionsCache
 from app.services.users import UserStore
 from app.web import (
     auth,
+    calendar,
     dashboard,
     deps,
     discover,
@@ -225,6 +226,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(reports.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(dashboard.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(discover.router, prefix=settings.url_base, dependencies=csrf)
+    app.include_router(calendar.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(movies.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(shows.router, prefix=settings.url_base, dependencies=csrf)
     app.include_router(security_page.router, prefix=settings.url_base, dependencies=csrf)

@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Calendar{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h2 class="headline-lg">Calendar</h2>
+  {# The track record beside the promise, exactly as the weekly page states it — and for
+     the same reason: a line that only ever shows a confident next time is how a schedule
+     that had never fired stayed invisible. Wraps as a paragraph, so a longer date format
+     or a translated label takes a second line instead of overflowing. #}
+  <p class="subtle">Episodes from Sonarr and releases from Radarr, on one week. Last fetch: {{ last_fetch }} · {% if next_fetch %}Next automatic fetch: {{ next_fetch }}{% else %}Refreshed when you open this page and it is more than fifteen minutes old{% endif %}</p>
+</section>
+
+{# Real links, not a script filter: the chips and the week nav are navigation, so they
+   survive with JavaScript off, are bookmarkable, and the back button does what it should.
+   Every class name here is written out in full — Tailwind scans templates for literal
+   names and never sees one built from a variable, which is the trap that once purged this
+   app's connection-health colours. #}
+<div class="run-actions">
+  {% for option in media_types %}
+  <a class="{% if option == media_type %}btn-primary{% else %}btn-secondary{% endif %}"
+     href="{{ url_base }}{{ calendar_path }}?type={{ option }}{% if not this_week %}&amp;{{ week_key }}={{ week_value }}{% endif %}">
+    {% if option == 'all' %}All{% elif option == 'movies' %}Movies{% else %}TV{% endif %}
+  </a>
+  {% endfor %}
+  <span class="week-nav">
+    {# Absent, not disabled, at the edge of what the cache covers: a link to a week with
+       no data would render an empty grid, which reads as "nothing is on". #}
+    {% if previous_week %}
+    <a class="btn-secondary" href="{{ url_base }}{{ calendar_path }}?type={{ media_type }}&amp;{{ week_key }}={{ previous_week }}">← {{ previous_label }}</a>
+    {% endif %}
+    <a class="{% if this_week %}btn-primary{% else %}btn-secondary{% endif %}" href="{{ url_base }}{{ calendar_path }}?type={{ media_type }}">This week</a>
+    {% if next_week %}
+    <a class="btn-secondary" href="{{ url_base }}{{ calendar_path }}?type={{ media_type }}&amp;{{ week_key }}={{ next_week }}">{{ next_label }} →</a>
+    {% endif %}
+  </span>
+</div>
+
+{# Persistent, not a toast: "we could not look" is a state that lasts until the box comes
+   back, and the entries below are older than the page claims because of exactly this. #}
+{% if incomplete_notice %}
+<p class="banner-warn" role="status">{{ incomplete_notice }}</p>
+{% endif %}
+
+{# Above the grid rather than under it: seven columns of "Nothing" answer the question
+   wrongly, and this is the one empty state with something to do about it. #}
+{% if not configured %}
+<p class="banner-warn" role="status">No Sonarr or Radarr connection yet — add one under <strong>Connections</strong> in <a href="{{ url_base }}/settings">Settings</a> and this week fills itself in.</p>
+{% endif %}
+
+<div class="week">
+  {% for day in days %}
+  <div class="day{% if day.today %} day-today{% endif %}">
+    <div class="day-head">
+      <span class="day-name">{{ day.name }}{% if day.today %} · Today{% endif %}</span>
+      <span class="day-date">{{ day.date }}</span>
+    </div>
+    {% if day.entries %}
+    <div class="ep-list">
+      {% for entry in day.entries %}
+      {# The one visual difference between a film and an episode in the same column: the
+         film carries the type mark and a heavier ground, because a release happens once
+         and an episode is one of a run. #}
+      <div class="entry{% if entry.kind == 'movie' %} entry-film{% endif %} {% if entry.state == 'downloaded' or entry.state == 'downloading' %}entry-ok{% elif entry.state == 'missing' %}entry-warn{% elif entry.state == 'today' %}entry-now{% else %}entry-idle{% endif %}" title="{{ entry.connection }}">
+        <span class="entry-kind">{{ entry.kind_label }}</span>
+        <span class="entry-title" title="{{ entry.title }}">{{ entry.title }}</span>
+        <span class="entry-sub">{{ entry.sub }}</span>
+        <span class="entry-state">{{ entry.state_text }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    {# An empty day is a fact, not a broken column — it keeps its head, its height and
+       its border so the week never loses a stripe. #}
+    <div class="day-empty">Nothing</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+<div class="legend">
+  <span><i class="legend-ok"></i>On disk or downloading</span>
+  <span><i class="legend-warn"></i>Due, still missing</span>
+  <span><i class="legend-now"></i>Airs today</span>
+  <span><i class="legend-idle"></i>Monitored, not yet due</span>
+  <span class="legend-note">Films carry a heavier ground — a release happens once, an episode is one of a run</span>
+</div>
+
+<h3 class="section-title calendar-soon-title">The next {{ look_ahead_days }} days</h3>
+{% if look_ahead %}
+{# The same table the series detail uses for seasons: a row here has the width a long
+   episode title needs, which a day column never will. #}
+<table class="detail-table">
+  <thead>
+    <tr><th>When</th><th>Title</th><th>Detail</th><th>State</th></tr>
+  </thead>
+  <tbody>
+    {% for entry in look_ahead %}
+    <tr>
+      <td class="soon-when">{{ entry.when }}</td>
+      <td class="soon-title" title="{{ entry.title }}">{{ entry.title }}</td>
+      <td class="soon-sub">{{ entry.sub }}</td>
+      <td class="soon-state {% if entry.state == 'downloaded' or entry.state == 'downloading' %}text-ok{% elif entry.state == 'missing' %}text-warn{% elif entry.state == 'today' %}text-primary{% else %}text-outline{% endif %}">{{ entry.state_text }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty-state">Nothing due in the next {{ look_ahead_days }} days.</div>
+{% endif %}
+{% endblock %}

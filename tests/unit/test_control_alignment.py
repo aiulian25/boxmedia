@@ -216,6 +216,17 @@ _CONTRAST_PAIRS = (
     ("--bm-danger-banner", "--bm-surface-container-low"),
     ("--bm-background", "--bm-primary"),           # .btn-primary, label on the fill
     ("--bm-warn", "--bm-surface-container-low"),   # .guess-hint on a weekly card
+    # The calendar. A day sits on -lowest and a film entry on -high, so the muted and
+    # state colours are read against two grounds the pairs above never covered — and
+    # --bm-outline on -high is 4.44:1 in the light theme, which is how the film entry
+    # came to use the brighter muted token.
+    ("--bm-outline", "--bm-surface-container-lowest"),   # a day head, and an empty day
+    ("--bm-primary", "--bm-surface-container-lowest"),   # the day's date
+    ("--bm-ok", "--bm-surface-container-high"),          # a film entry's state line
+    ("--bm-warn", "--bm-surface-container-high"),
+    ("--bm-primary", "--bm-surface-container-high"),
+    ("--bm-on-surface-variant", "--bm-surface-container-high"),
+    ("--bm-on-surface-variant", "--bm-background"),      # the fortnight list
 )
 _AA_NORMAL_TEXT = 4.5
 

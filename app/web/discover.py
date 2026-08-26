@@ -48,10 +48,15 @@ from app.services.posters import SERIES_POSTER_WIDTH
 from app.services.reports import MovieStatus, RunStatus
 from app.services.trakt import TraktClient, TraktError
 from app.web.deps import (
+    MEDIA_TYPES,
+    TYPE_ALL,
+    TYPE_MOVIES,
+    TYPE_TV,
     cache_posters,
     client_ip,
     current_user,
     render,
+    validated_media_type,
 )
 from app.web.profile import STATUS_QUERY_KEY
 
@@ -60,12 +65,6 @@ router = APIRouter()
 NAV_KEY = "discover"
 DISCOVER_PATH = "/discover"
 REFRESH_PATH = "/discover/refresh"
-
-# What the chip row offers. `all` first because it is the default and the widest answer.
-TYPE_ALL = "all"
-TYPE_MOVIES = "movies"
-TYPE_TV = "tv"
-MEDIA_TYPES = (TYPE_ALL, TYPE_MOVIES, TYPE_TV)
 
 # How long the Refresh action may hold the request open. Past this the answer is "that
 # took too long", which is true and actionable, rather than a spinner nobody can cancel.
@@ -78,15 +77,6 @@ STATE_ON_SERVER = "on_server"
 STATE_MAYBE_ON_SERVER = "maybe_on_server"
 STATE_WANTED = "wanted"
 STATE_NO_TVDB = "no_tvdb"
-
-
-def _validated_type(raw: str | None) -> str:
-    """Which chip is active. Anything unrecognised is All.
-
-    Read-tolerant for the reason every other read in this app is: a bookmarked or
-    hand-edited `?type=` should show the widest view, not an error page.
-    """
-    return raw if raw in MEDIA_TYPES else TYPE_ALL
 
 
 def _film_views(request: Request) -> tuple[list[dict], str | None]:
@@ -231,7 +221,7 @@ def _show_state(show: DiscoverShow, held: object, on_server: str | None) -> dict
 async def discover(request: Request, type: str = TYPE_ALL) -> object:  # noqa: A002
     """The page. Renders from disk; makes no outbound request of any kind."""
     current_user(request)
-    media_type = _validated_type(type)
+    media_type = validated_media_type(type)
     keys = request.app.state.discovery.load()
     cache = request.app.state.discover_cache
     rows = cache.load()
