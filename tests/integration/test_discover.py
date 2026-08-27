@@ -26,6 +26,7 @@ from app.services.reports import (
     RunTrigger,
 )
 from app.services.sonarr import SonarrSeries
+from app.services.tmdb import TMDB_BASE_URL
 from app.web.discover import DiscoverStatus
 from tests.conftest import AppHarness
 
@@ -65,6 +66,15 @@ def _seed_shelves(harness: AppHarness, trending=None, anticipated=None) -> None:
                   watchers=None, list_count=5127),
         ),
     })
+
+
+def _mock_tv_detail(tmdb_id: int, *, poster_path: str | None) -> None:
+    """What TMDB answers for one show. Trakt returns ids and titles and never artwork,
+    so this is where a Discover card's picture comes from."""
+    respx.get(f"{TMDB_BASE_URL}/tv/{tmdb_id}").mock(return_value=httpx.Response(200, json={
+        "id": tmdb_id, "name": "Meridian Fault", "poster_path": poster_path,
+        "external_ids": {"tvdb_id": 7},
+    }))
 
 
 def _seed_report(harness: AppHarness) -> None:
@@ -307,6 +317,7 @@ def test_refresh_fills_both_shelves_and_audits(harness: AppHarness) -> None:
         "list_count": 4000,
         "show": {"title": "Nightjar", "year": 2026, "ids": {"trakt": 2, "tvdb": 8}},
     }]))
+    _mock_tv_detail(5, poster_path="/meridian.jpg")
     harness.activate()
     _keys(harness)
 
@@ -318,6 +329,8 @@ def test_refresh_fills_both_shelves_and_audits(harness: AppHarness) -> None:
     assert [show.title for show in rows[ANTICIPATED_KEY]] == ["Nightjar"]
     # The four ids a Trakt row carries for free — the reason to rank by Trakt at all.
     assert rows[TRENDING_KEY][0].tvdb_id == 7
+    # And the half Trakt cannot answer, filled in on the way past.
+    assert "meridian.jpg" in rows[TRENDING_KEY][0].poster_url
 
     log = (harness.settings.logs_dir / "audit.jsonl").read_text(encoding="utf-8")
     assert "discover_refreshed" in log
@@ -464,3 +477,78 @@ def test_the_tv_tab_does_not_fetch_film_posters(harness: AppHarness) -> None:
 
     assert "The Hollow Coast" in page
     assert "Neon Rain" not in page
+
+
+# --- the artwork Trakt cannot answer (found by the step 19 bring-up) ---
+
+
+@respx.mock
+def test_a_show_tmdb_has_never_heard_of_costs_only_its_own_picture(
+    harness: AppHarness,
+) -> None:
+    """Every poster lookup is its own. One 404 must not empty a shelf of twenty."""
+    respx.get(TRAKT_TRENDING).mock(return_value=httpx.Response(200, json=[
+        {"watchers": 900, "show": {"title": "Meridian Fault", "year": 2026,
+                                   "ids": {"trakt": 1, "tmdb": 5, "tvdb": 7}}},
+        {"watchers": 800, "show": {"title": "Nightjar", "year": 2026,
+                                   "ids": {"trakt": 2, "tmdb": 6, "tvdb": 8}}},
+    ]))
+    respx.get(TRAKT_ANTICIPATED).mock(return_value=httpx.Response(200, json=[]))
+    _mock_tv_detail(5, poster_path="/meridian.jpg")
+    respx.get(f"{TMDB_BASE_URL}/tv/6").mock(return_value=httpx.Response(404, json={}))
+    harness.activate()
+    _keys(harness)
+
+    harness.client.post("/discover/refresh", follow_redirects=False)
+
+    rows = harness.client.app.state.discover_cache.load()[TRENDING_KEY]
+    assert len(rows) == 2
+    assert "meridian.jpg" in rows[0].poster_url
+    assert rows[1].poster_url is None  # no picture, still on the shelf
+
+
+@respx.mock
+def test_a_shelf_without_a_tmdb_key_is_titles_and_states(harness: AppHarness) -> None:
+    """The two credentials do different jobs: Trakt ranks, TMDB illustrates. With only
+    the first, a refresh still works and the cards still say what you hold."""
+    respx.get(TRAKT_TRENDING).mock(return_value=httpx.Response(200, json=[
+        {"watchers": 900, "show": {"title": "Meridian Fault", "year": 2026,
+                                   "ids": {"trakt": 1, "tmdb": 5, "tvdb": 7}}},
+    ]))
+    respx.get(TRAKT_ANTICIPATED).mock(return_value=httpx.Response(200, json=[]))
+    harness.activate()
+    harness.client.app.state.discovery.save("trakt", TRAKT_ID)  # Trakt only
+
+    response = harness.client.post("/discover/refresh", follow_redirects=False)
+
+    assert DiscoverStatus.REFRESHED in response.headers["location"]
+    rows = harness.client.app.state.discover_cache.load()[TRENDING_KEY]
+    assert [show.title for show in rows] == ["Meridian Fault"]
+    assert rows[0].poster_url is None
+
+
+@respx.mock
+def test_one_lookup_per_show_even_when_both_shelves_carry_it(
+    harness: AppHarness,
+) -> None:
+    """The shelves overlap — a show can be trending AND anticipated — and forty cards
+    must not become forty-plus requests on one button press."""
+    row = {"watchers": 900, "show": {"title": "Meridian Fault", "year": 2026,
+                                     "ids": {"trakt": 1, "tmdb": 5, "tvdb": 7}}}
+    respx.get(TRAKT_TRENDING).mock(return_value=httpx.Response(200, json=[row]))
+    respx.get(TRAKT_ANTICIPATED).mock(return_value=httpx.Response(200, json=[
+        {"list_count": 10, "show": row["show"]},
+    ]))
+    detail = respx.get(f"{TMDB_BASE_URL}/tv/5").mock(
+        return_value=httpx.Response(200, json={"id": 5, "name": "Meridian Fault",
+                                               "poster_path": "/meridian.jpg"})
+    )
+    harness.activate()
+    _keys(harness)
+
+    harness.client.post("/discover/refresh", follow_redirects=False)
+
+    assert detail.call_count == 1
+    cache = harness.client.app.state.discover_cache.load()
+    assert "meridian.jpg" in cache[TRENDING_KEY][0].poster_url
+    assert "meridian.jpg" in cache[ANTICIPATED_KEY][0].poster_url

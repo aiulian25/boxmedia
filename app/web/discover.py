@@ -29,6 +29,7 @@ hours later.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 from fastapi import APIRouter, Request
 from fastapi import status as http_status
@@ -39,6 +40,7 @@ from app.services.boxoffice import week_start
 from app.services.discovery import (
     ANTICIPATED_KEY,
     DISCOVER_ROW_SIZE,
+    PROVIDER_TMDB,
     PROVIDER_TRAKT,
     TRENDING_KEY,
     DiscoverShow,
@@ -46,6 +48,7 @@ from app.services.discovery import (
 from app.services.mediaserver import HOLDS_PROBABLY, HOLDS_YES
 from app.services.posters import SERIES_POSTER_WIDTH
 from app.services.reports import MovieStatus, RunStatus
+from app.services.tmdb import TmdbClient, TmdbError
 from app.services.trakt import TraktClient, TraktError
 from app.web.deps import (
     MEDIA_TYPES,
@@ -297,14 +300,17 @@ async def refresh(request: Request) -> RedirectResponse:
     nothing" are different claims, and only one of them is true.
     """
     user = current_user(request)
-    client_id = request.app.state.discovery.decrypt(PROVIDER_TRAKT)
+    keys = request.app.state.discovery
+    client_id = keys.decrypt(PROVIDER_TRAKT)
     if not client_id:
         return _redirect(request, DiscoverStatus.NO_KEYS)
+    tmdb_key = keys.decrypt(PROVIDER_TMDB)
+    tmdb = TmdbClient(tmdb_key) if tmdb_key else None
     try:
         rows = await asyncio.wait_for(
-            _fetch_rows(client_id), timeout=REFRESH_TIMEOUT_SECONDS
+            _fetch_rows(client_id, tmdb), timeout=REFRESH_TIMEOUT_SECONDS
         )
-    except (TraktError, TimeoutError):
+    except (TraktError, TmdbError, TimeoutError):
         return _redirect(request, DiscoverStatus.REFRESH_FAILED)
     request.app.state.discover_cache.save(rows)
     request.app.state.audit.record(
@@ -317,17 +323,58 @@ async def refresh(request: Request) -> RedirectResponse:
     return _redirect(request, DiscoverStatus.REFRESHED)
 
 
-async def _fetch_rows(client_id: str) -> dict[str, tuple[DiscoverShow, ...]]:
-    """Both shelves, concurrently — one slow row costs the timeout, not the sum."""
+async def _fetch_rows(
+    client_id: str, tmdb: TmdbClient | None
+) -> dict[str, tuple[DiscoverShow, ...]]:
+    """Both shelves, concurrently — one slow row costs the timeout, not the sum.
+
+    Then the artwork, which is the half Trakt cannot answer: it returns ids and titles
+    and never an image. Enriched HERE rather than at render, because the page's whole
+    contract is that opening it reaches nothing — and stored on the row, so a shelf
+    keeps its pictures for the cache's whole six hours.
+    """
     client = TraktClient(client_id)
     trending, anticipated = await asyncio.gather(
         client.trending_shows(DISCOVER_ROW_SIZE),
         client.anticipated_shows(DISCOVER_ROW_SIZE),
     )
-    return {
+    rows = {
         TRENDING_KEY: tuple(_from_trakt(show) for show in trending),
         ANTICIPATED_KEY: tuple(_from_trakt(show) for show in anticipated),
     }
+    if tmdb is None:
+        return rows  # no TMDB key: titles and states, no pictures — still a usable shelf
+    posters = await _posters_for(tmdb, rows)
+    return {
+        key: tuple(
+            show
+            if show.tmdb_id not in posters
+            else replace(show, poster_url=posters[show.tmdb_id])
+            for show in shelf
+        )
+        for key, shelf in rows.items()
+    }
+
+
+async def _posters_for(
+    tmdb: TmdbClient, rows: dict[str, tuple[DiscoverShow, ...]]
+) -> dict[int, str]:
+    """One poster per show, by TMDB id, for whichever answer.
+
+    Asked once per DISTINCT id — the two shelves overlap — and every failure is its own:
+    a show TMDB has never heard of costs that one card its picture, not the shelf.
+    """
+    wanted = {show.tmdb_id for shelf in rows.values() for show in shelf if show.tmdb_id}
+
+    async def poster(tmdb_id: int) -> tuple[int, str | None]:
+        try:
+            detail = await tmdb.tv_detail(tmdb_id)
+        except (TmdbError, TimeoutError, KeyError):
+            return tmdb_id, None
+        return tmdb_id, detail.poster_url
+
+    found = await asyncio.gather(*[poster(tmdb_id) for tmdb_id in sorted(wanted)])
+    return {tmdb_id: url for tmdb_id, url in found if url}
 
 
 def _from_trakt(show: object) -> DiscoverShow:
