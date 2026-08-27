@@ -626,3 +626,49 @@ def test_a_hostile_chip_or_week_renders_neither(harness: AppHarness) -> None:
         page = harness.client.get(path)
         assert page.status_code == 200, path
         assert "onerror" not in page.text, path
+
+
+# --- nothing unattended ever adds anything ---
+
+
+SERVICES = ROOT / "app" / "services"
+
+
+def test_the_only_write_to_sonarr_is_the_add_a_person_presses() -> None:
+    """A badge saying "Wanted" is a statement about your library, never an intention to
+    fetch — and this is what keeps it that way.
+
+    One write exists in the whole client, and it has one caller: the CSRF-guarded form
+    on a show's own page. If a second appears, or the first is reached from anywhere
+    else, this fails.
+    """
+    client = (SERVICES / "sonarr.py").read_text("utf-8")
+    writes = re.findall(r'_request\(\s*"(POST|PUT|DELETE|PATCH)"', client)
+
+    assert writes == ["POST"], f"Sonarr client writes: {writes}"
+
+    callers = {
+        module.name
+        for module in (ROOT / "app").rglob("*.py")
+        if "add_series(" in module.read_text("utf-8") and module.name != "sonarr.py"
+    }
+    assert callers == {"shows.py"}, callers
+
+
+def test_no_unattended_job_can_reach_an_add() -> None:
+    """The scheduler's two morning jobs re-read your own servers into a local cache.
+    Every method they touch is a read; a write would have to be added here first."""
+    refresher = (SERVICES / "refresh.py").read_text("utf-8")
+
+    called = set(re.findall(r"\bclient\.([a-z_]+)\(", refresher))
+
+    assert called == {"calendar", "queue", "list_series"}, called
+
+    # Executable lines only — the prose above them says "a deleted Radarr" and means it.
+    executable = "".join(
+        "\n".join(
+            line for line in refresher.splitlines() if not line.strip().startswith("#")
+        ).split('"""')[::2]
+    )
+    for forbidden in ("add_series", "add_movie", "delete(", "monitor("):
+        assert forbidden not in executable, f"refresh.py calls {forbidden}"
