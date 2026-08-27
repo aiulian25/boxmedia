@@ -2,17 +2,20 @@
 # over plain HTTP for local testing. For production, front it with a reverse proxy
 # (nginx/Traefik/Caddy/Pangolin/Cloudflare) that terminates TLS and bind 127.0.0.1.
 #
-# THIS IS THE TV COPY, not main. Everything that names something is deliberately
-# distinct from /home/iulian/projects/BoxMedia so the two stacks cannot touch each
-# other: project name, container names, image tag, host port, and the data and secrets
-# directories under this checkout. Container names are GLOBAL in Docker — not scoped to
-# a compose project — so an inherited `container_name: boxmedia` is all it would take
-# for this stack to adopt and recreate main's container.
-name: boxmedia-tv
+# Named for what it IS — the development stack — rather than for the project, and that
+# is not cosmetic. A container name is GLOBAL to the Docker daemon, not scoped to a
+# compose project, so a dev file saying `container_name: boxmedia` adopts and recreates
+# the PRODUCTION container on the same host. That has happened here once already, which
+# is why `test_the_dev_stack_cannot_adopt_the_published_stacks_container` now refuses
+# any overlap between this file and docker-compose.yml: not the container names, not the
+# image tag, not the host port.
+name: boxmedia-dev
 
 # The one place the image tag is written. Both services take it from here, so they
-# cannot run different builds of the same app.
-x-image: &image boxmedia:tv-dev
+# cannot run different builds of the same app. Deliberately not a version number: a tag
+# like `boxmedia:0.1.0` goes stale the first time the app is released and then names an
+# image nobody has, which is how the gate came to scan a tag that did not exist.
+x-image: &image boxmedia:dev
 
 x-data: &data ${BM_DATA_PATH:-./data}:/data
 
@@ -26,7 +29,7 @@ services:
   init:
     build: .
     image: *image
-    container_name: boxmedia-tv-init
+    container_name: boxmedia-dev-init
     user: "0:0"
     entrypoint: ["/usr/bin/python3.11", "-m", "app.core.provision"]
     # The same .env, so it prepares whatever BM_DATA_DIR and BM_ENCRYPTION_KEY_FILE
@@ -52,7 +55,7 @@ services:
   boxmedia:
     build: .
     image: *image
-    container_name: boxmedia-tv
+    container_name: boxmedia-dev
     depends_on:
       init:
         condition: service_completed_successfully
@@ -64,7 +67,7 @@ services:
     ports:
       # Host port from .env (ruling #10); container-internal port is fixed at 8686.
       # DEV: bound to 0.0.0.0 so other machines on the LAN can reach it directly.
-      # 58547 here, one past main's 58546, so both dev stacks can run at once.
+      # 58547, one past the published stack's 58546, so both can run at once.
       - "0.0.0.0:${BM_HOST_PORT:-58547}:8686"
     volumes:
       - *data

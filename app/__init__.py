@@ -10,4 +10,4 @@ and never pip-installs the project as a distribution, so `importlib.metadata` wo
 raise there.
 """
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"

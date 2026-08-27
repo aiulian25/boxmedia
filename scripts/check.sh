@@ -4,7 +4,9 @@
 set -euo pipefail
 
 VENV_PYTHON="${VENV_PYTHON:-.venv/bin/python}"
-IMAGE="${IMAGE:-boxmedia:0.1.0}"
+# Matches docker-compose.dev.yml's tag. Not a version: a versioned default
+# names an image nobody has the moment the app is released.
+IMAGE="${IMAGE:-boxmedia:dev}"
 
 echo "==> ruff (lint)"
 # The whole repo, not just app/: test and script files drifted because the gate never
