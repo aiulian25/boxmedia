@@ -82,6 +82,13 @@ def prepare_key(key_file: Path = KEY_FILE, data_dir: Path = DATA_DIR) -> bool:
         shutil.rmtree(key_file)
 
     if key_file.exists():
+        # Present, but not necessarily READABLE by the app: a key generated on the host
+        # (a manual setup, a restored backup, a file copied between checkouts) is owned
+        # by whoever made it, and the app runs as 65532 against a read-only mount. It
+        # died on a bare `PermissionError: /secrets/boxmedia.key` with none of the
+        # guidance the missing-key path gives — a first `up -d` that fails for a reason
+        # the init service exists to prevent. Root here, so it is simply fixed.
+        _own(key_file)
         return False
     if has_existing_install(data_dir):
         raise SystemExit(

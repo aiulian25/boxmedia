@@ -81,7 +81,8 @@ def test_a_first_run_gets_a_usable_key(tmp_path: Path, owned) -> None:
     assert key in owned
 
 
-def test_an_existing_key_is_never_touched(tmp_path: Path, owned) -> None:
+def test_an_existing_key_is_never_rewritten(tmp_path: Path, owned) -> None:
+    """The bytes are the one thing here nobody can reissue."""
     key = tmp_path / "secrets" / "boxmedia.key"
     key.parent.mkdir(parents=True)
     key.write_bytes(base64.urlsafe_b64encode(b"k" * KEY_LENGTH_BYTES))
@@ -89,6 +90,23 @@ def test_an_existing_key_is_never_touched(tmp_path: Path, owned) -> None:
 
     assert provision.prepare_key(key, tmp_path / "data") is False
     assert key.read_bytes() == before
+
+
+def test_an_existing_key_is_handed_to_the_app_even_so(tmp_path: Path, owned) -> None:
+    """Present is not the same as readable, and the app cannot fix it.
+
+    A key generated on the host — a manual setup, a restored backup, a file copied
+    between checkouts — belongs to whoever made it, while the app runs as uid 65532
+    against a read-only mount. It died on a bare `PermissionError` with none of the
+    guidance the missing-key path gives, which is a first `up -d` failing for exactly
+    the reason this service exists to prevent. Init is root; it simply fixes it.
+    """
+    key = tmp_path / "secrets" / "boxmedia.key"
+    key.parent.mkdir(parents=True)
+    key.write_bytes(base64.urlsafe_b64encode(b"k" * KEY_LENGTH_BYTES))
+
+    assert provision.prepare_key(key, tmp_path / "data") is False
+    assert key in owned
 
 
 @pytest.mark.parametrize("marker", provision.EXISTING_INSTALL_MARKERS)
