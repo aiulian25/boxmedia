@@ -281,14 +281,39 @@ def test_a_show_with_no_tvdb_id_is_honestly_unaddable(harness: AppHarness) -> No
     assert "No TVDB id — search Sonarr by name" in page
 
 
-def test_a_wanted_series_carries_neither_hint(harness: AppHarness) -> None:
+def test_a_series_you_do_not_have_says_missing_not_wanted(harness: AppHarness) -> None:
+    """The bottom rung, and the word it must not use.
+
+    Sonarr's "wanted" means a series you ALREADY added, waiting on a release. On this
+    shelf the same badge meant the opposite — nothing you own has it — which reads as a
+    promise the app never made. `missing` is the word this app already uses for that.
+    """
     harness.activate()
     _keys(harness)
     _seed_shelves(harness, trending=(_show(),), anticipated=())
 
     page = harness.client.get("/discover").text
-    assert "Wanted" in page
-    assert "Missing" not in page
+
+    assert ">Missing<" in page
+    assert ">Wanted<" not in page
+    # And nothing that would claim you hold it.
+    assert "In Sonarr" not in page
+    assert "on Plex" not in page
+
+
+def test_the_film_shelf_keeps_radarrs_own_word(harness: AppHarness) -> None:
+    """Only television changed. On the film shelf "Wanted" is Radarr's meaning — the
+    title is in your library, awaiting a release — so renaming it there would break the
+    vocabulary the Library page and the movie modal both use."""
+    harness.activate()
+    _keys(harness)
+    _seed_report(harness)
+    _seed_shelves(harness, trending=(), anticipated=())
+
+    page = harness.client.get("/discover?type=movies").text
+
+    assert ">Wanted<" in page or ">In Library<" in page
+    assert ">Missing<" not in page
 
 
 def test_the_two_counts_are_labelled_for_what_they_measure(harness: AppHarness) -> None:

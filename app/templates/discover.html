@@ -111,7 +111,12 @@
           {% elif show.state == 'no_tvdb' %}
           <span class="dot dot-wanted"></span><span>No id</span>
           {% else %}
-          <span class="dot dot-wanted"></span><span>Wanted</span>
+          {# "Missing", not "Wanted": on this shelf the bottom rung means nothing you own
+             has it, while Sonarr's "wanted" means the opposite — already added, waiting
+             on a release. The dot keeps its class because the class names the SHAPE (a
+             hollow ring, the film card's too), and a red one would read as an error when
+             not-yet-added is not one. #}
+          <span class="dot dot-wanted"></span><span>Missing</span>
           {% endif %}
         </div>
       </a>

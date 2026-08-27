@@ -78,7 +78,15 @@ REFRESH_TIMEOUT_SECONDS = 12.0
 STATE_IN_SONARR = "in_sonarr"
 STATE_ON_SERVER = "on_server"
 STATE_MAYBE_ON_SERVER = "maybe_on_server"
+# The film shelf's bottom rung. "Wanted" is Radarr's own word for a title that IS in
+# your library and awaiting a release, which is what it means here too.
 STATE_WANTED = "wanted"
+# The TELEVISION shelf's bottom rung, and a different claim: not in your library at all.
+# It read "Wanted" until someone pointed out that on a Discover card that says the
+# opposite of what Sonarr means by it — a show nobody has added, labelled as one already
+# queued. `missing` is the word this app already uses for "not in your library"
+# (reports.MovieStatus.MISSING), so it is borrowed rather than invented.
+STATE_MISSING = "missing"
 STATE_NO_TVDB = "no_tvdb"
 
 
@@ -217,7 +225,7 @@ def _show_state(show: DiscoverShow, held: object, on_server: str | None) -> dict
             "state_text": "No TVDB id — search Sonarr by name",
             "guess": False,
         }
-    return {"state": STATE_WANTED, "state_text": None, "guess": False}
+    return {"state": STATE_MISSING, "state_text": None, "guess": False}
 
 
 @router.get(DISCOVER_PATH)
