@@ -21,8 +21,13 @@ home server. It never downloads anything itself — it tells Radarr what to fetc
   title, BoxMedia reads the IMDb id off Mojo's own release page and matches on
   that. What it still cannot identify says **"Best guess — verify"** and offers a
   one-click fix, which then applies to every week that title charted.
+- **Television, on the same terms.** Connect Sonarr and BoxMedia does for series
+  what it does for films: what is trending, what you already hold, what airs this
+  week. See [Television](#television) — including the short list of things it
+  never does.
 - **Tells you what you already have.** Connect **Plex or Jellyfin** (read-only)
-  and a title already on your media server says so before you add a second copy.
+  and a title already on your media server says so before you add a second copy —
+  films and series alike.
 - **Several Radarrs, honestly.** Add to whichever instance you choose, see which
   one holds each film, upgrade a copy in place, and watch real download progress
   on every page it appears.
@@ -32,14 +37,80 @@ home server. It never downloads anything itself — it tells Radarr what to fetc
 
 ## What it looks like
 
-*All screenshots use fictional sample data.*
+*All screenshots use fictional sample data — invented titles, an invented person,
+addresses from the documentation-only range, and cover art this repo draws rather
+than reproduces. Regenerate them with
+[`scripts/screenshots.py`](scripts/screenshots.py).*
 
 | | |
 |---|---|
-| ![Weekly report — the chart matched against your library](docs/screenshots/weekly-report.png) | ![Library view](docs/screenshots/dashboard.png) |
-| ![Weekly reports and the month's leaderboard](docs/screenshots/reports.png) | ![Settings](docs/screenshots/settings.png) |
+| ![Library — films and series in one grid, with All / Movies / TV chips](docs/screenshots/library.png) | ![Calendar — episodes and releases on one week](docs/screenshots/calendar.png) |
+| ![Weekly report — the chart matched against your library](docs/screenshots/weekly-report.png) | ![Weekly reports and the month's leaderboard](docs/screenshots/reports.png) |
+
+![Discover — the box office and what is trending on television, matched against what you hold](docs/screenshots/discover.png)
+
+| | |
+|---|---|
+| ![Settings — a Sonarr connection and what it adds series as](docs/screenshots/settings-sonarr.png) | ![Settings — your own TMDB key and Trakt client ID, masked once saved](docs/screenshots/settings-discovery.png) |
 
 ![Media Server — connect Plex or Jellyfin, read-only](docs/screenshots/media-server.png)
+
+## Television
+
+Add a **Sonarr** connection under Settings and three pages start answering for
+series what the film half already answers for films. It is the same app, not a
+second one bolted on: the same cards, the same two colour registers, the same
+"nothing leaves this machine until you press Add".
+
+- **Library** holds both. Films from Radarr and series from Sonarr in one grid,
+  with **All / Movies / TV** chips and one search across both. A series card says
+  which Sonarr holds it and how much of it is on disk — *Complete — 34 episodes*
+  or *Missing 8 episodes* — as a band along the connection chip.
+- **Discover** shows what is doing well this week. Films are ranked by what they
+  took at the box office; series by how many people are watching them on Trakt
+  right now. The page says so, because there is no television box office and
+  pretending otherwise would be a made-up ranking.
+- **Calendar** is one week, both media. Episodes from Sonarr and release dates
+  from Radarr in the same day column, today's column marked, and a fortnight's
+  look-ahead underneath where a long episode title has room to be read.
+
+### What it never does
+
+- **No Trakt account.** No sign-in, no OAuth, no device pairing, nothing stored
+  on your behalf. Trending is the public global list; your client ID travels as a
+  request header, never in a URL where a proxy log would keep it.
+- **Read-only, still.** The media-server integration gained series and gained no
+  write: it reads, and that is the whole of it.
+- **Nothing is sent anywhere until you press Add.** Every one of the three pages
+  renders from a local cache. Opening one costs no third-party request — Discover
+  fetches only when you press **Refresh**, and the Calendar only when its cache is
+  more than fifteen minutes old.
+- **No unattended traffic to Trakt or TMDB.** The morning job at **06:00 UTC**
+  re-reads *your own* Sonarr and Radarr and nothing else. Discover has no job at
+  all, deliberately: its six-hour cache and its Refresh button are enough.
+
+### Your own keys
+
+Television needs two credentials, and **BoxMedia ships neither** — not in the
+code, not in `.env.example`, not in the image. Both are free, take a minute, and
+are yours to edit or delete at any time under **Settings → Discovery**:
+
+1. **TMDB API key** — sign up at [themoviedb.org](https://www.themoviedb.org/),
+   then Settings → API → request an API key (v3 auth). This provides artwork,
+   overviews and the TVDB id Sonarr identifies a series by.
+2. **Trakt client ID** — create an application at
+   [trakt.tv/oauth/applications](https://trakt.tv/oauth/applications). Only the
+   **client ID** is used; the secret is never asked for, because nothing here
+   signs in.
+
+Both are encrypted at rest with the same AES‑256‑GCM key as every other stored
+credential, masked once saved, and **Test** each one before saving. Without them
+the television pages render honestly empty and say which key is missing; the film
+half is unaffected either way.
+
+> **The "Requirements & resource use" figures below still describe the film-only
+> release.** They are re-measured before this is merged, the same way the current
+> ones were — no estimates in the meantime.
 
 ## Requirements & resource use
 
@@ -178,25 +249,28 @@ Then point a reverse proxy (nginx/Traefik/Caddy/Pangolin/Cloudflare) at
    press **Test Connection** to check it before saving, then choose what that
    connection adds as (a quality profile and a root folder). Add as many Radarrs
    as you run; one is the **primary** the weekly check reads.
-4. Optionally connect a **media server** under Media Server — pick Plex or
+4. Optionally add a **Sonarr** connection the same way, and your own **TMDB key**
+   and **Trakt client ID** under Discovery — that is what turns on Library's TV
+   chip, Discover and the Calendar. See [Television](#television).
+5. Optionally connect a **media server** under Media Server — pick Plex or
    Jellyfin, paste the address and its token/API key, and Test it. BoxMedia only
    ever reads it.
-5. The weekly check runs on its own to build a review report; hit **Run current
-   week** to build one immediately. Titles are added to Radarr only when you
-   click **Add**.
+6. The weekly check runs on its own to build a review report; hit **Run current
+   week** to build one immediately. Titles are added to Radarr — or series to
+   Sonarr — only when you click **Add**.
 
 Settings has one **Save Changes** bar for the whole page — edit any cards, then
 save them together (or discard).
 
 Configuration lives entirely in [`.env.example`](.env.example) (app-level
-secrets/infra). Radarr and media-server credentials are managed in the UI and
-encrypted at rest — they never go in `.env`.
+secrets/infra). Radarr, Sonarr, media-server and discovery credentials are all
+managed in the UI and encrypted at rest — they never go in `.env`.
 
 ## Backups & disaster recovery
 
 A backup is a **complete, encrypted snapshot of BoxMedia's state**: the admin
-account, settings, encrypted Radarr connections, filters, the full weekly
-report/chart history, audit logs, and the poster cache. A restore is
+account, settings, encrypted Radarr, Sonarr and discovery credentials, filters,
+the full weekly report/chart history, audit logs, and the poster cache. A restore is
 indistinguishable from the app never having been lost — you log in with your
 previous password and find every report and setting exactly as before.
 
@@ -294,11 +368,22 @@ Afterwards, verify with Settings → **Test Connection**.
   capabilities dropped, `no-new-privileges`, no shell or package manager, base
   images pinned by digest, dependencies hash-pinned.
 - TLS certificate validation on all outbound calls; point `BM_TLS_CA_FILE` at a
-  CA bundle for a self-signed home Radarr or media server rather than disabling
-  verification.
-- The media server integration is **read-only**: two GET endpoints and no others,
-  and its credential travels as a header, never in a URL where proxy logs would
-  keep it.
+  CA bundle for a self-signed home Radarr, Sonarr or media server rather than
+  disabling verification. That escape hatch is for **your own servers** — the
+  public endpoints below are always verified.
+- **Every host BoxMedia can contact**, and nothing else: `boxofficemojo.com`
+  (the weekly chart), `api.themoviedb.org` and `image.tmdb.org` (artwork and
+  metadata, only once you add a TMDB key), `api.trakt.tv` (trending series, only
+  once you add a client ID), plus the Radarr, Sonarr and media-server addresses
+  you configure yourself.
+- **The one rule deviation, stated rather than buried.** A TMDB v3 key travels as
+  a query parameter because that is TMDB's API contract, not a choice. Request
+  URLs are never logged, and every error message or captured failure that could
+  carry one is redacted before it is stored — with a test that drives real
+  failures and then greps the entire data directory for both key shapes.
+- The media server integration is **read-only**: GET endpoints and no others, and
+  its credential travels as a header, never in a URL where proxy logs would keep
+  it. The same is true of the Trakt client ID.
 
 ## Development
 
