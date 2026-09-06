@@ -827,18 +827,30 @@ async def run_now(
         resolved = _resolve_week(week, week_date)
     except ValueError:
         return _redirect_reports(request, "bad_week")
-    # Which reports existed before the run. Getting one of them back is precisely what
-    # "nothing had changed" means, and it saves threading an outcome type through the
-    # scheduler and every caller of pipeline.run for the sake of one message.
-    known = {stored.id for stored in request.app.state.reports.list_reports()}
+    # When each stored report last ran, before this one. Getting the same report back
+    # with the same timestamp is precisely what "nothing had changed" means, and reading
+    # it here saves threading an outcome type through the scheduler and every caller of
+    # pipeline.run for the sake of one message.
+    #
+    # The id alone will not do. A week KEEPS its report id when it is fetched again — on
+    # purpose, so every link to it survives — so a re-fetch that found revised figures
+    # comes back under the same id and was being called "unchanged" over a page showing
+    # the new numbers.
+    run_at_before = {
+        stored.id: stored.run_at for stored in request.app.state.reports.list_reports()
+    }
     scheduler = request.app.state.scheduler
     if resolved is None and scheduler is not None:
         report = await scheduler.run_now()
     else:
         report = await request.app.state.pipeline.run(trigger=RunTrigger.MANUAL, week=resolved)
+    # An unchanged run hands back the STORED report object, its old timestamp included;
+    # a run that recorded anything stamps a fresh `run_at`. A first sighting of a week is
+    # not in the map at all, so it is not unchanged either.
+    unchanged = run_at_before.get(report.id) == report.run_at
     # Land on the report itself so the week's chart is what the user sees — the Box
     # Office dashboard is the library view and looks the same whatever week you run.
-    return _redirect_detail(request, report.id, "unchanged" if report.id in known else "")
+    return _redirect_detail(request, report.id, "unchanged" if unchanged else "")
 
 
 async def _lookup_candidates(request: Request, term: str) -> list[RadarrLookupResult]:

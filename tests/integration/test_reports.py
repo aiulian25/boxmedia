@@ -1057,6 +1057,87 @@ def test_the_unchanged_message_reaches_the_page(harness: AppHarness) -> None:
     assert "Already up to date" in page
 
 
+class _RevisableChart:
+    """A chart whose gross the test can move between runs.
+
+    Mojo publishes an estimate and settles it over the following days, which is the whole
+    reason Re-run exists — so "the same week, different numbers" is the case that matters,
+    not an exotic one.
+    """
+
+    def __init__(self, week: str) -> None:
+        self.week = week
+        self.gross_amount = 1_000_000
+
+    async def __call__(
+        self, _week: str | None = None
+    ) -> tuple[str, list[BoxOfficeEntry]]:
+        return (
+            self.week,
+            [
+                BoxOfficeEntry(
+                    rank=1,
+                    title="Neon Rain",
+                    gross_amount=self.gross_amount,
+                    weeks_in_release=1,
+                )
+            ],
+        )
+
+
+def _wire_revisable_chart(harness: AppHarness, week: str = "2026W02") -> _RevisableChart:
+    """`_wire_stable_chart`'s twin, for the week that does move."""
+    harness.client.post(
+        "/settings/apps",
+        data={"name": "Radarr", "url": RADARR_URL, "api_key": RADARR_KEY},
+        follow_redirects=False,
+    )
+    pipeline = harness.client.app.state.pipeline
+    pipeline._make_radarr = lambda _app_id: _NonAddingRadarr()  # noqa: SLF001
+    chart = _RevisableChart(week)
+    pipeline._fetch_chart = chart  # noqa: SLF001
+    return chart
+
+
+def test_a_re_run_that_found_revised_figures_is_not_called_unchanged(
+    harness: AppHarness,
+) -> None:
+    """A week keeps its report id when it is re-fetched, deliberately, so every link to
+    it survives. Identity of the id therefore cannot mean identity of the chart — and
+    comparing ids alone told an admin nothing had changed over a page of new numbers."""
+    harness.activate()
+    chart = _wire_revisable_chart(harness)
+    first = harness.client.post("/run", follow_redirects=False)
+    before = harness.client.app.state.reports.list_reports()[0]
+
+    chart.gross_amount = 2_000_000  # Mojo settles the week
+    again = harness.client.post("/run", follow_redirects=False)
+
+    after = harness.client.app.state.reports.list_reports()[0]
+    # Still one card under one link: that part is the point and must not change.
+    assert again.headers["location"].split("?")[0] == first.headers["location"]
+    assert after.id == before.id
+    # But the figures moved, so the banner must not say otherwise.
+    assert after.run_at != before.run_at
+    assert after.movies[0].gross_amount == 2_000_000
+    assert "status=unchanged" not in again.headers["location"]
+
+
+def test_the_unchanged_message_stays_off_a_page_whose_figures_moved(
+    harness: AppHarness,
+) -> None:
+    """The end of the same claim: what the admin actually reads."""
+    harness.activate()
+    chart = _wire_revisable_chart(harness)
+    harness.client.post("/run", follow_redirects=False)
+
+    chart.gross_amount = 2_000_000
+    page = harness.client.post("/run", follow_redirects=True).text
+
+    assert "Already up to date" not in page
+    assert "$2.0M" in page  # the revised figure the banner would have denied
+
+
 def test_a_first_run_carries_no_unchanged_message(harness: AppHarness) -> None:
     # The banner must mean something: it cannot appear on a week being stored for the
     # first time.
