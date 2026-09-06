@@ -1,0 +1,27 @@
+# Documented waivers for the gitleaks pre-push scan (release runbook, step 2b).
+#
+# Every entry is a reviewed finding in the TEST SUITE. None is a credential: each
+# was checked against the real `.env`, `secrets/` and `data/` on the release host
+# and appears in none of them. Real secrets cannot reach this file's scope — they
+# live only in those three git-ignored paths, and the staged-file gate refuses to
+# stage any of them.
+#
+# Fingerprints are commit-scoped on purpose. If one of these lines is edited again
+# the waiver stops matching and the finding comes back for review, which is what a
+# waiver should do.
+#
+# --- False positives: no literal at all ---
+# `generic-api-key` matches the text after `api_key=` and captures the NEXT keyword
+# argument. The flagged "secret" is the constant name KIND_SONARR; the api_key value
+# is RADARR_KEY, itself a named constant holding the suite's documented dummy key.
+310877328a310906088e0625f97dd8281b997a29:tests/unit/test_apps.py:generic-api-key:139
+310877328a310906088e0625f97dd8281b997a29:tests/integration/test_library.py:generic-api-key:1100
+310877328a310906088e0625f97dd8281b997a29:tests/integration/test_library.py:generic-api-key:1123
+#
+# --- Synthetic fixtures, of the class the runbook already names benign ---
+# "sk-plex-0123456789abcdef" — sequential hex, annotated `noqa: S105 — a fixture
+# value, not a real token`. Used only to prove the rotation re-encrypts a Plex token.
+310877328a310906088e0625f97dd8281b997a29:tests/unit/test_crypto.py:generic-api-key:115
+# "a1b2c3d4e5f60718293a4b5c6d7e8f90" — keyboard-pattern hex, already public on
+# origin/main since 0a2111c; flagged here only because step 1 moved the line.
+310877328a310906088e0625f97dd8281b997a29:tests/unit/test_crypto.py:generic-api-key:116
