@@ -254,6 +254,75 @@ def _host_port(compose: dict) -> str:
     return mapping.rsplit(":", 2)[-2]
 
 
+# The pairing every compose file has to get right: a loopback bind may trust every peer,
+# because every peer is then a process on the host; any wider bind may not.
+LOOPBACK_BIND = "127.0.0.1"
+TRUST_EVERY_PEER = "*"
+
+
+def _bind_address(compose: dict) -> str:
+    """The interface the app's port is published on.
+
+    Everything before the first colon: the mapping is `<interface>:<host>:<container>`,
+    and the host part carries a `${VAR:-default}` whose own colon defeats an rsplit. A
+    mapping that names no interface yields its port number here, which matches no
+    loopback address — so the rule below then demands the narrow default, which is the
+    safe direction to fail in.
+    """
+    return compose["services"]["boxmedia"]["ports"][0].split(":", 1)[0]
+
+
+def _forwarded_allow_ips_default(compose: dict) -> str:
+    """What uvicorn is given when BM_FORWARDED_ALLOW_IPS is unset."""
+    setting = compose["services"]["boxmedia"]["environment"]["FORWARDED_ALLOW_IPS"]
+    variable, separator, default = setting.partition(":-")
+    assert variable == "${BM_FORWARDED_ALLOW_IPS", setting
+    assert separator, f"no default to fall back on: {setting}"
+    return default.rstrip("}")
+
+
+def test_the_published_stack_trusts_its_loopback_proxy() -> None:
+    """Trust follows the bind, and the two are asserted TOGETHER so that changing either
+    one forces a look at the other.
+
+    On a loopback bind the only peers are processes on this host — the reverse proxy — so
+    `*` is what lets login lockout and the audit log see real client addresses. A
+    `127.0.0.1` default trusted NOTHING there: the proxy reaches the container through
+    Docker's NAT, so inside it the peer is the bridge gateway, and uvicorn ignored the
+    header and keyed every visitor in the world to one bucket.
+
+    On any wider bind the port is reachable off-host, so `*` would let anyone forge
+    X-Forwarded-For and take a fresh rate-limit bucket per request — an unbounded brute
+    force against the one admin account. That is why the dev stack, which publishes on
+    0.0.0.0 with nothing in front of it, must NOT carry the published stack's default.
+    """
+    # Both branches below are genuinely exercised: these two files bind differently.
+    assert _bind_address(_compose()) == LOOPBACK_BIND
+    assert _bind_address(_dev_compose()) != LOOPBACK_BIND
+
+    for name, compose in (("published", _compose()), ("dev", _dev_compose())):
+        trusted = _forwarded_allow_ips_default(compose)
+        if _bind_address(compose) == LOOPBACK_BIND:
+            assert trusted == TRUST_EVERY_PEER, (
+                f"{name}: a loopback bind reaches the app only through the proxy, and a"
+                " narrower default trusts nothing at all"
+            )
+            continue
+        assert trusted != TRUST_EVERY_PEER, (
+            f"{name}: the port is reachable off-host, so trusting every peer would let"
+            " anyone forge X-Forwarded-For and evade the login lockout"
+        )
+
+
+def test_the_reported_policy_matches_the_compose_that_applies_it() -> None:
+    """`python -m app.core.config` exists to prove the deployed policy is the intended
+    one, so its default mirrors the file that actually hands the value to uvicorn — and
+    is pinned equal here, the way every other deliberate mirror in this app is."""
+    from app.core.config import DEFAULT_FORWARDED_ALLOW_IPS
+
+    assert DEFAULT_FORWARDED_ALLOW_IPS == _forwarded_allow_ips_default(_compose())
+
+
 def test_the_dev_services_cannot_be_pointed_at_different_directories() -> None:
     """The same desync the published file is pinned against, on the file the dev stack
     actually runs from — init preparing one path while the app mounts another fails

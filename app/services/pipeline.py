@@ -149,8 +149,7 @@ class Pipeline:
     def _default_make_radarr(self, app_id: str) -> object:
         return self._apps.build_client(
             app_id,
-            tls_verify=self._settings.outbound_tls_verify,
-            ca_file=str(self._settings.tls_ca_file) if self._settings.tls_ca_file else None,
+            **self._settings.outbound_tls(),
         )
 
     def _default_select_app_id(self) -> str | None:

@@ -59,9 +59,20 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
-      # uvicorn trusts X-Forwarded-* from these proxy IPs, so login rate-limiting
-      # sees the real client address instead of the proxy's.
-      FORWARDED_ALLOW_IPS: ${BM_FORWARDED_ALLOW_IPS:-127.0.0.1}
+      # The app port is published on the host's LOOPBACK only (below), so every peer
+      # this container can be reached by is a process on this host — the reverse proxy.
+      # `*` trusts its X-Forwarded-For, which is what lets login lockout and the audit
+      # log record the real client address.
+      #
+      # A loopback default silently trusted NOTHING: the proxy reaches the container
+      # through Docker's NAT, so inside it the peer is the bridge gateway (172.x.x.1),
+      # never 127.0.0.1. uvicorn then ignored the header and keyed every visitor in the
+      # world to one address — five bad guesses from a stranger locked the admin out.
+      #
+      # If you change the bind below to 0.0.0.0, set BM_FORWARDED_ALLOW_IPS to your
+      # proxy's address: with the port reachable off-host, `*` would let anyone forge
+      # the header and give themselves a fresh rate-limit bucket per request.
+      FORWARDED_ALLOW_IPS: ${BM_FORWARDED_ALLOW_IPS:-*}
     ports:
       - "127.0.0.1:${BM_HOST_PORT:-58546}:8686"
     volumes:

@@ -38,6 +38,7 @@ from datetime import datetime
 
 import httpx
 
+from app.core.values import int_or_none
 from app.services.radarr import build_verify
 
 API_PREFIX = "/api/v3"
@@ -186,15 +187,10 @@ def _image_url(images: object, cover_type: str) -> str | None:
     return None
 
 
-def _int_or_none(value: object) -> int | None:
-    """A real integer, or None. `bool` is an int in Python and would silently become 0/1."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
 def _season(item: object) -> SonarrSeason | None:
     if not isinstance(item, dict):
         return None
-    number = _int_or_none(item.get("seasonNumber"))
+    number = int_or_none(item.get("seasonNumber"))
     if number is None:
         return None
     statistics = item.get("statistics")
@@ -202,9 +198,9 @@ def _season(item: object) -> SonarrSeason | None:
     return SonarrSeason(
         season_number=number,
         monitored=bool(item.get("monitored", False)),
-        episode_count=_int_or_none(stats.get("episodeCount")) or 0,
-        episode_file_count=_int_or_none(stats.get("episodeFileCount")) or 0,
-        size_on_disk=_int_or_none(stats.get("sizeOnDisk")) or 0,
+        episode_count=int_or_none(stats.get("episodeCount")) or 0,
+        episode_file_count=int_or_none(stats.get("episodeFileCount")) or 0,
+        size_on_disk=int_or_none(stats.get("sizeOnDisk")) or 0,
     )
 
 
@@ -231,20 +227,20 @@ def _library_series(item: dict) -> SonarrSeries:
     raw_seasons = item.get("seasons")
     seasons = [_season(entry) for entry in raw_seasons] if isinstance(raw_seasons, list) else []
     return SonarrSeries(
-        sonarr_id=_int_or_none(item.get("id")) or 0,
-        tvdb_id=_int_or_none(item.get("tvdbId")) or 0,
+        sonarr_id=int_or_none(item.get("id")) or 0,
+        tvdb_id=int_or_none(item.get("tvdbId")) or 0,
         title=item.get("title") or "",
-        year=_int_or_none(item.get("year")),
+        year=int_or_none(item.get("year")),
         monitored=bool(item.get("monitored", False)),
         ended=_ended(item),
-        episode_count=_int_or_none(stats.get("episodeCount")) or 0,
-        episode_file_count=_int_or_none(stats.get("episodeFileCount")) or 0,
+        episode_count=int_or_none(stats.get("episodeCount")) or 0,
+        episode_file_count=int_or_none(stats.get("episodeFileCount")) or 0,
         imdb_id=item.get("imdbId") or None,
-        tmdb_id=_int_or_none(item.get("tmdbId")),
+        tmdb_id=int_or_none(item.get("tmdbId")),
         path=item.get("path") or None,
         title_slug=item.get("titleSlug") or None,
         poster_url=_image_url(item.get("images"), "poster"),
-        quality_profile_id=_int_or_none(item.get("qualityProfileId")),
+        quality_profile_id=int_or_none(item.get("qualityProfileId")),
         seasons=tuple(season for season in seasons if season is not None),
     )
 
@@ -422,7 +418,7 @@ class SonarrClient:
         for record in payload["records"]:
             if not isinstance(record, dict):
                 continue
-            series_id = _int_or_none(record.get("seriesId"))
+            series_id = int_or_none(record.get("seriesId"))
             size, left = record.get("size"), record.get("sizeleft")
             if series_id is None:
                 continue
@@ -450,15 +446,15 @@ class SonarrClient:
                 continue
             results.append(
                 SonarrLookupResult(
-                    tvdb_id=_int_or_none(item.get("tvdbId")) or 0,
+                    tvdb_id=int_or_none(item.get("tvdbId")) or 0,
                     title=item.get("title") or "",
-                    year=_int_or_none(item.get("year")),
+                    year=int_or_none(item.get("year")),
                     overview=item.get("overview") or None,
                     poster_url=_image_url(item.get("images"), "poster"),
                     status=item.get("status") or None,
                     network=item.get("network") or None,
                     imdb_id=item.get("imdbId") or None,
-                    tmdb_id=_int_or_none(item.get("tmdbId")),
+                    tmdb_id=int_or_none(item.get("tmdbId")),
                 )
             )
         return results
@@ -543,17 +539,17 @@ class SonarrClient:
                 continue
             series = item.get("series")
             series = series if isinstance(series, dict) else {}
-            episode_id = _int_or_none(item.get("id"))
-            season_number = _int_or_none(item.get("seasonNumber"))
-            episode_number = _int_or_none(item.get("episodeNumber"))
+            episode_id = int_or_none(item.get("id"))
+            season_number = int_or_none(item.get("seasonNumber"))
+            episode_number = int_or_none(item.get("episodeNumber"))
             if episode_id is None or season_number is None or episode_number is None:
                 continue
             episodes.append(
                 SonarrCalendarEpisode(
                     episode_id=episode_id,
-                    series_id=_int_or_none(item.get("seriesId")) or 0,
+                    series_id=int_or_none(item.get("seriesId")) or 0,
                     series_title=series.get("title") or "",
-                    tvdb_id=_int_or_none(series.get("tvdbId")),
+                    tvdb_id=int_or_none(series.get("tvdbId")),
                     season_number=season_number,
                     episode_number=episode_number,
                     title=item.get("title") or None,

@@ -61,8 +61,19 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
-      # uvicorn reads FORWARDED_ALLOW_IPS to trust the proxy's X-Forwarded-* headers,
-      # so login rate-limiting sees the real client IP (ruling: BM_FORWARDED_ALLOW_IPS).
+      # DELIBERATELY NARROW, and the opposite of the published stack's `*`. The rule is
+      # the same in both files — trust follows the bind — and these two files bind
+      # differently: the published one publishes on loopback behind a proxy, while this
+      # one publishes on 0.0.0.0 for LAN access with NOTHING in front of it.
+      #
+      # So there is no proxy here whose X-Forwarded-For could be believed, and trusting
+      # the header would let any machine on the LAN forge one. That does not merely
+      # mis-attribute a request: it hands the sender a fresh login-lockout bucket per
+      # request, which turns a bounded brute force into an unbounded one.
+      #
+      # The cost is the one this stack already had — the peer is Docker's bridge
+      # gateway, so LAN clients share a single lockout bucket. Correct for a dev box on
+      # a trusted network; do not copy it to anything exposed.
       FORWARDED_ALLOW_IPS: ${BM_FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
       # Host port from .env (ruling #10); container-internal port is fixed at 8686.

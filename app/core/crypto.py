@@ -1,9 +1,14 @@
-"""AES-256-GCM encryption for stored Radarr API keys and backup archives.
+"""AES-256-GCM encryption for every stored credential, and for backup archives.
 
 Chosen over age/gpg because the distroless runtime has no shell or package
 manager to invoke external binaries (Step 4 rationale). The key is loaded from
 `BM_ENCRYPTION_KEY_FILE`, which lives outside the data directory so a backup of
 `/data` can never contain the key that decrypts it.
+
+Three stores hold ciphertext under that key — the Radarr/Sonarr API keys, the
+media-server token, and the discovery credentials — and `rotate` moves all three
+together. Rotating only some of them would leave an install half under each key,
+and the half that moved could no longer be rotated back with the old one.
 
 Field format:  gcm:v1:<b64url(nonce)>:<b64url(ciphertext+tag)>
 File format:   4-byte magic | 1-byte version | 12-byte nonce | ciphertext+tag
@@ -33,12 +38,37 @@ APPS_SCHEMA_VERSION = 1
 APPS_LIST_KEY = "apps"
 APPS_KEY_FIELD = "api_key_encrypted"
 
+# The other two stores this key encrypts, mirrored for the same reason and pinned by the
+# same test. Rotation reached only apps.yml until now, so these two stayed under the old
+# key — and every page that read them raised instead of rendering.
+MEDIA_SERVER_CONFIG_PATH = ("config", "mediaserver.yml")
+# What 1.1.0 wrote, when Plex was the only kind. Rotated as well: an install that has not
+# re-saved its connection since still reads this file, and skipping it would strand it.
+LEGACY_PLEX_CONFIG_PATH = ("config", "plex.yml")
+MEDIA_SERVER_SCHEMA_VERSION = 1
+MEDIA_SERVER_KEY = "server"
+MEDIA_SERVER_TOKEN_FIELD = "token_encrypted"  # noqa: S105 — field name, not a secret
+DISCOVERY_CONFIG_PATH = ("config", "discovery.yml")
+DISCOVERY_SCHEMA_VERSION = 1
+DISCOVERY_FIELDS = ("tmdb_key_encrypted", "trakt_client_id_encrypted")
+# Every stored credential field ends with it; stripped to name one in an error.
+ENCRYPTED_FIELD_SUFFIX = "_encrypted"
+
+# What a store says when its ciphertext will not open with the key this build is holding.
+# One sentence in one place: three stores raise it as three different typed errors, and
+# the advice is identical every time — the file and the key have come apart.
+UNREADABLE_CREDENTIAL_MESSAGE = (
+    "the stored credential cannot be decrypted with the current encryption key — "
+    "restore the key file, or re-encrypt with `python -m app.core.crypto rotate`"
+)
+
 USAGE = (
     "usage:\n"
     "  python -m app.core.crypto genkey <key-file>\n"
     "  python -m app.core.crypto rotate <old-key-file> <new-key-file> <data-dir>\n"
     "\n"
-    "rotate re-encrypts the stored Radarr API keys. Stop BoxMedia first."
+    "rotate re-encrypts the stored Radarr/Sonarr API keys, the media-server token and\n"
+    "the discovery keys. Stop BoxMedia first."
 )
 
 
@@ -134,13 +164,98 @@ def _genkey(key_file: Path) -> int:
     return 0
 
 
+# One file's rewritten contents, held until every store has decrypted: the path, the
+# document to write, and the schema version to stamp it with.
+_PendingWrite = tuple[Path, dict, int]
+
+
+class _RotationAborted(Exception):
+    """A stored field would not decrypt, so no file may be written.
+
+    Carries the sentence naming which credential failed; `_rotate` prints it and stops.
+    """
+
+
+def _rotated_field(token: object, label: str, old_key: bytes, new_key: bytes) -> str:
+    """One credential moved from the old key to the new one, or an abort naming it."""
+    if not isinstance(token, str):
+        raise _RotationAborted(f"{label} is missing or is not an encrypted field")
+    try:
+        plaintext = decrypt_field(token, old_key)
+    except DecryptionError as exc:
+        raise _RotationAborted(f"could not decrypt {label}: {exc}") from exc
+    return encrypt_field(plaintext, new_key)
+
+
+def _rotated_apps(document: dict, old_key: bytes, new_key: bytes) -> list[dict]:
+    """Every connection's API key, re-encrypted, in the order the file stores them."""
+    rotated: list[dict] = []
+    for item in document.get(APPS_LIST_KEY, []):
+        entry = dict(item)
+        label = entry.get("name") or entry.get("id") or "?"
+        entry[APPS_KEY_FIELD] = _rotated_field(
+            entry.get(APPS_KEY_FIELD), f"the API key for {label!r}", old_key, new_key
+        )
+        rotated.append(entry)
+    return rotated
+
+
+def _rotated_media_server(
+    document: dict, source: str, old_key: bytes, new_key: bytes
+) -> dict | None:
+    """The stored connection with its token re-encrypted, or None when it holds none.
+
+    None rather than an abort for a record with no token: that is a hand-edited or
+    emptied file, not a credential this key failed to open.
+    """
+    server = document.get(MEDIA_SERVER_KEY)
+    if not isinstance(server, dict) or not server.get(MEDIA_SERVER_TOKEN_FIELD):
+        return None
+    rotated = dict(server)
+    rotated[MEDIA_SERVER_TOKEN_FIELD] = _rotated_field(
+        server.get(MEDIA_SERVER_TOKEN_FIELD),
+        f"the media-server token in {source}",
+        old_key,
+        new_key,
+    )
+    return rotated
+
+
+def _rotated_discovery(
+    document: dict, source: str, old_key: bytes, new_key: bytes
+) -> dict:
+    """The discovery document, with whichever of its two keys are stored re-encrypted."""
+    rotated = dict(document)
+    for field in DISCOVERY_FIELDS:
+        if not rotated.get(field):
+            continue
+        credential = field.removesuffix(ENCRYPTED_FIELD_SUFFIX).replace("_", " ")
+        rotated[field] = _rotated_field(
+            rotated[field], f"the {credential} in {source}", old_key, new_key
+        )
+    return rotated
+
+
+def _existing(data_dir: Path, *relative_paths: tuple[str, ...]) -> list[Path]:
+    """Whichever of those files this install actually has."""
+    candidates = (data_dir.joinpath(*relative) for relative in relative_paths)
+    return [path for path in candidates if path.exists()]
+
+
 def _rotate(old_key_file: Path, new_key_file: Path, data_dir: Path) -> int:
-    """Re-encrypt every stored Radarr API key from the old key to the new one.
+    """Re-encrypt every stored credential from the old key to the new one.
 
     Stop BoxMedia first: a running instance holds the old key in memory and would write
-    old-key ciphertext back over the rotated file. Every key is decrypted and re-encrypted
-    in memory before anything is written, so a single bad field aborts with the file
-    untouched (all-or-nothing).
+    old-key ciphertext back over the rotated files.
+
+    Every field in all three stores is decrypted and re-encrypted in memory before ANY
+    file is written, so one bad field aborts with every file untouched. See the module
+    docstring for why a partial rotation is worse than none.
+
+    The writes themselves are atomic per file but not as a group. The app is stopped for
+    the whole operation and the files are small, so the window is a few milliseconds
+    across three renames; a crash inside it is recovered by re-running with whichever key
+    each remaining file still holds.
     """
     import sys
 
@@ -158,27 +273,55 @@ def _rotate(old_key_file: Path, new_key_file: Path, data_dir: Path) -> int:
         print(f"error: no connections file at {apps_path}", file=sys.stderr)
         return 1
 
-    document = filestore.read_yaml(apps_path, expected_version=APPS_SCHEMA_VERSION)
-    rotated: list[dict] = []
-    for item in document.get(APPS_LIST_KEY, []):
-        entry = dict(item)
-        label = entry.get("name") or entry.get("id") or "?"
-        try:
-            plaintext = decrypt_field(entry[APPS_KEY_FIELD], old_key)
-        except (DecryptionError, KeyError) as exc:
-            print(
-                f"error: could not decrypt the API key for {label!r} with {old_key_file}: "
-                f"{exc}\nnothing was written — {apps_path} is unchanged.",
-                file=sys.stderr,
-            )
-            return 1
-        entry[APPS_KEY_FIELD] = encrypt_field(plaintext, new_key)
-        rotated.append(entry)
+    pending: list[_PendingWrite] = []
+    try:
+        apps_document = filestore.read_yaml(
+            apps_path, expected_version=APPS_SCHEMA_VERSION
+        )
+        rotated_apps = _rotated_apps(apps_document, old_key, new_key)
+        pending.append((apps_path, {APPS_LIST_KEY: rotated_apps}, APPS_SCHEMA_VERSION))
 
-    filestore.write_yaml(
-        apps_path, {APPS_LIST_KEY: rotated}, schema_version=APPS_SCHEMA_VERSION
-    )
-    print(f"re-encrypted {len(rotated)} Radarr API key(s) in {apps_path}")
+        for path in _existing(
+            data_dir, MEDIA_SERVER_CONFIG_PATH, LEGACY_PLEX_CONFIG_PATH
+        ):
+            document = filestore.read_yaml(
+                path, expected_version=MEDIA_SERVER_SCHEMA_VERSION
+            )
+            server = _rotated_media_server(document, path.name, old_key, new_key)
+            if server is None:
+                continue
+            pending.append(
+                (path, {MEDIA_SERVER_KEY: server}, MEDIA_SERVER_SCHEMA_VERSION)
+            )
+
+        for path in _existing(data_dir, DISCOVERY_CONFIG_PATH):
+            document = filestore.read_yaml(
+                path, expected_version=DISCOVERY_SCHEMA_VERSION
+            )
+            document.pop(filestore.SCHEMA_VERSION_KEY, None)
+            pending.append(
+                (
+                    path,
+                    _rotated_discovery(document, path.name, old_key, new_key),
+                    DISCOVERY_SCHEMA_VERSION,
+                )
+            )
+    except (_RotationAborted, filestore.SchemaVersionError) as failure:
+        print(
+            f"error: {failure}\n"
+            f"  old key: {old_key_file}\n"
+            f"nothing was written — {data_dir} is unchanged.",
+            file=sys.stderr,
+        )
+        return 1
+
+    for path, document, schema_version in pending:
+        filestore.write_yaml(path, document, schema_version=schema_version)
+
+    print(f"re-encrypted {len(rotated_apps)} connection API key(s) in {apps_path}")
+    for path, _document, _schema_version in pending:
+        if path != apps_path:
+            print(f"re-encrypted the stored credentials in {path}")
     print(f"next: point BM_ENCRYPTION_KEY_FILE at {new_key_file} and start BoxMedia again.")
     print(
         "keep the old key until every backup taken with it is gone — existing .backup "

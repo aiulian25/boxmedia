@@ -9,6 +9,7 @@ exception, because losing it costs one refetch and refusing to render costs the 
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -312,3 +313,36 @@ def test_the_cache_holds_no_secret(tmp_path: Path) -> None:
     raw = (tmp_path / SERIES_CACHE_FILENAME).read_text(encoding="utf-8")
     for forbidden in ("api_key", "apikey", "token", "gcm:"):
         assert forbidden not in raw.lower()
+
+
+# --- review step 7: every stale connection is saved at once, on its own thread ---
+
+# Long enough that every thread is past the read before any write lands.
+READ_WINDOW_SECONDS = 0.05
+CONCURRENT_CONNECTIONS = ("app-attic", "app-lounge", "app-shed", "app-loft")
+
+
+def test_saving_every_library_at_once_keeps_them_all(tmp_path: Path, monkeypatch) -> None:
+    """`_refresh_series` gathers one `series_library` per stale connection, and each now
+    awaits its save on a worker thread. `save` reads the whole document, replaces one
+    connection and writes it back, so without a lock the last writer drops the rest."""
+    cache = SeriesLibraryCache(tmp_path)
+    original_load = cache._load_document
+
+    def load_slowly() -> dict:
+        stored = original_load()
+        time.sleep(READ_WINDOW_SECONDS)
+        return stored
+
+    monkeypatch.setattr(cache, "_load_document", load_slowly)
+
+    threads = [
+        threading.Thread(target=cache.save, args=(app_id, (_sonarr_series(),)))
+        for app_id in CONCURRENT_CONNECTIONS
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert all(cache.load(app_id) is not None for app_id in CONCURRENT_CONNECTIONS)

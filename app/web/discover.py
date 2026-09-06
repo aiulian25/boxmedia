@@ -44,10 +44,11 @@ from app.services.discovery import (
     PROVIDER_TRAKT,
     TRENDING_KEY,
     DiscoverShow,
+    DiscoveryError,
 )
 from app.services.mediaserver import HOLDS_PROBABLY, HOLDS_YES
 from app.services.posters import SERIES_POSTER_WIDTH
-from app.services.reports import MovieStatus, RunStatus
+from app.services.reports import MovieStatus, RunStatus, imdb_url
 from app.services.tmdb import TmdbClient, TmdbError
 from app.services.trakt import TraktClient, TraktError
 from app.web.deps import (
@@ -176,7 +177,7 @@ def _show_views(
             "poster_url": show.poster_url,
             "tmdb_id": show.tmdb_id,
             "tvdb_id": show.tvdb_id,
-            "imdb_url": f"https://www.imdb.com/title/{show.imdb_id}/" if show.imdb_id else None,
+            "imdb_url": imdb_url(show.imdb_id),
             "server_name": server_name,
             **_show_state(show, held, on_server),
         })
@@ -309,10 +310,15 @@ async def refresh(request: Request) -> RedirectResponse:
     """
     user = current_user(request)
     keys = request.app.state.discovery
-    client_id = keys.decrypt(PROVIDER_TRAKT)
-    if not client_id:
-        return _redirect(request, DiscoverStatus.NO_KEYS)
-    tmdb_key = keys.decrypt(PROVIDER_TMDB)
+    try:
+        client_id = keys.decrypt(PROVIDER_TRAKT)
+        if not client_id:
+            return _redirect(request, DiscoverStatus.NO_KEYS)
+        tmdb_key = keys.decrypt(PROVIDER_TMDB)
+    except DiscoveryError:
+        # Stored, and unreadable. Deliberately NOT the refresh-failed banner beside it:
+        # that one says Trakt could not be reached, and nothing was asked of Trakt.
+        return _redirect(request, DiscoverStatus.KEYS_UNREADABLE)
     tmdb = TmdbClient(tmdb_key) if tmdb_key else None
     try:
         rows = await asyncio.wait_for(
@@ -320,7 +326,7 @@ async def refresh(request: Request) -> RedirectResponse:
         )
     except (TraktError, TmdbError, TimeoutError):
         return _redirect(request, DiscoverStatus.REFRESH_FAILED)
-    request.app.state.discover_cache.save(rows)
+    await asyncio.to_thread(request.app.state.discover_cache.save, rows)
     request.app.state.audit.record(
         AuditAction.DISCOVER_REFRESHED,
         actor=user.username,
@@ -412,6 +418,9 @@ class DiscoverStatus:
     REFRESHED = "discover_refreshed"
     REFRESH_FAILED = "discover_refresh_failed"
     NO_KEYS = "discover_no_keys"
+    # Stored, but this install's encryption key cannot open them. A different fact from
+    # "no keys" and from "Trakt is down", and the only one whose fix is the key file.
+    KEYS_UNREADABLE = "discover_keys_unreadable"
 
 
 STATUS_MESSAGES = {
@@ -423,6 +432,11 @@ STATUS_MESSAGES = {
     DiscoverStatus.NO_KEYS: (
         "error",
         "Add a Trakt client ID in Settings first.",
+    ),
+    DiscoverStatus.KEYS_UNREADABLE: (
+        "error",
+        "Your saved discovery keys cannot be read with this install’s encryption key — "
+        "restore the key file, or re-enter the keys under Discovery in Settings.",
     ),
 }
 

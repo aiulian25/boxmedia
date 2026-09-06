@@ -28,11 +28,13 @@ feature exists to prevent.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from app.core import filestore
+from app.core.values import int_or_none
 from app.services.matcher import normalize_title
 from app.services.mediaserver import HOLDS_PROBABLY, HOLDS_YES
 from app.services.sonarr import SonarrSeries
@@ -169,10 +171,6 @@ def _cached_from(series: SonarrSeries) -> CachedSeries:
     )
 
 
-def _int_or_none(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
 def _series_from_document(entry: object) -> CachedSeries | None:
     """One stored row back into a record, or None when it is not one.
 
@@ -185,16 +183,16 @@ def _series_from_document(entry: object) -> CachedSeries | None:
     if not isinstance(title, str) or not title:
         return None
     return CachedSeries(
-        sonarr_id=_int_or_none(entry.get("sonarr_id")) or 0,
-        tvdb_id=_int_or_none(entry.get("tvdb_id")) or 0,
+        sonarr_id=int_or_none(entry.get("sonarr_id")) or 0,
+        tvdb_id=int_or_none(entry.get("tvdb_id")) or 0,
         title=title,
-        year=_int_or_none(entry.get("year")),
+        year=int_or_none(entry.get("year")),
         monitored=bool(entry.get("monitored", False)),
         ended=bool(entry.get("ended", False)),
-        episode_count=_int_or_none(entry.get("episode_count")) or 0,
-        episode_file_count=_int_or_none(entry.get("episode_file_count")) or 0,
+        episode_count=int_or_none(entry.get("episode_count")) or 0,
+        episode_file_count=int_or_none(entry.get("episode_file_count")) or 0,
         imdb_id=entry.get("imdb_id") if isinstance(entry.get("imdb_id"), str) else None,
-        tmdb_id=_int_or_none(entry.get("tmdb_id")),
+        tmdb_id=int_or_none(entry.get("tmdb_id")),
         title_slug=(
             entry.get("title_slug") if isinstance(entry.get("title_slug"), str) else None
         ),
@@ -234,6 +232,14 @@ class SeriesLibraryCache:
 
     def __init__(self, cache_dir: Path) -> None:
         self._path = cache_dir / SERIES_CACHE_FILENAME
+        # Its own lock, not the filestore's: `save` and `forget` are
+        # read-modify-write over one shared document, and `filestore.write_json`
+        # only guards the write half. `_refresh_series` saves every stale connection
+        # at once through `asyncio.gather`, so without this each worker builds the
+        # file from a read that predates its siblings' writes and all but the last
+        # library is lost. Always taken BEFORE the filestore lock, never after, so
+        # the pair cannot deadlock.
+        self._lock = threading.Lock()
 
     def _load_document(self) -> dict:
         if not self._path.exists():
@@ -256,6 +262,10 @@ class SeriesLibraryCache:
 
     def save(self, app_id: str, series: tuple[SonarrSeries, ...]) -> None:
         """Replace one connection's library, leaving every other connection's alone."""
+        with self._lock:
+            self._replace(app_id, series)
+
+    def _replace(self, app_id: str, series: tuple[SonarrSeries, ...]) -> None:
         by_app = self._load_document()
         by_app[app_id] = {
             FETCHED_AT_KEY: time.time(),
@@ -339,6 +349,7 @@ class SeriesLibraryCache:
     def forget(self, app_id: str) -> None:
         """Drop a removed connection's library so it cannot keep decorating cards, and
         so the file does not grow forever."""
-        by_app = self._load_document()
-        if by_app.pop(app_id, None) is not None:
-            self._write(by_app)
+        with self._lock:
+            by_app = self._load_document()
+            if by_app.pop(app_id, None) is not None:
+                self._write(by_app)

@@ -468,3 +468,53 @@ def test_an_unknown_ignore_kind_is_refused_rather_than_stored(
         store.add(tmdb_id=1, title="X", normalized_title="x", kind="lidarr")
 
     assert store.list_ignored() == []
+
+
+def test_a_stored_key_that_will_not_decrypt_says_so(harness: AppHarness) -> None:
+    """"Add a TMDB API key" is the wrong advice for a key that is already there — the
+    thing to fix is the encryption key, so the page says that instead."""
+    from app.core import crypto
+    from app.services.discovery import DiscoveryStore
+    from app.web.shows import UNAVAILABLE_MESSAGE, UNREADABLE_KEY_MESSAGE
+
+    harness.activate()
+    _keys(harness)
+    harness.client.app.state.discovery = DiscoveryStore(
+        harness.settings.config_dir, key=crypto.generate_key()
+    )
+
+    page = harness.client.get("/shows/1396")
+
+    assert page.status_code == 200
+    assert UNREADABLE_KEY_MESSAGE in page.text
+    assert UNAVAILABLE_MESSAGE not in page.text
+
+
+def test_the_tmdb_client_ignores_the_home_server_tls_escape_hatch(tmp_path) -> None:
+    """`BM_TLS_CA_FILE` is for the user's OWN servers, and a CA-file context trusts only
+    that CA — so passing it to TMDB broke the show page on exactly the installs that set
+    it, while Discover's refresh (which never passed it) kept working.
+
+    Built adversarially: verification disabled AND a private CA named. The client must
+    still verify against the system trust store, which is what the README promises for
+    every public endpoint.
+    """
+    from types import SimpleNamespace
+
+    from app.web.shows import _tmdb_client
+    from tests.conftest import build_harness
+
+    ca_file = tmp_path / "home-ca.pem"
+    ca_file.write_text("-----BEGIN CERTIFICATE-----\nnot a real CA\n-----END CERTIFICATE-----\n")
+    harness = build_harness(tmp_path, outbound_tls_verify=False, tls_ca_file=ca_file)
+    harness.activate()
+    _keys(harness)
+
+    # The settings really are hostile, so this test cannot pass by accident.
+    assert harness.settings.outbound_tls_verify is False
+    assert harness.settings.tls_ca_file == ca_file
+
+    client = _tmdb_client(SimpleNamespace(app=harness.client.app))
+
+    assert client is not None
+    assert client._verify is True

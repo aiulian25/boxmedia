@@ -25,14 +25,15 @@ from __future__ import annotations
 
 import re
 import secrets
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from app.core import crypto, filestore
 from app.core.audit import AuditAction, AuditLog
-from app.services.radarr import RadarrClient, build_verify
-from app.services.sonarr import SERIES_TYPES, SonarrClient
+from app.services.radarr import RadarrClient, RadarrConnectionError, build_verify
+from app.services.sonarr import SERIES_TYPES, SonarrClient, SonarrConnectionError
 
 APPS_SCHEMA_VERSION = 1
 APPS_FILENAME = "apps.yml"
@@ -212,6 +213,15 @@ class AppsStore:
         self._path = config_dir / APPS_FILENAME
         self._key = key
         self._audit = audit
+        # Its own lock, not the filestore's: every mutator here loads the whole file,
+        # changes one entry and writes it all back, and `filestore.write_yaml` guards
+        # only the write half. `add_app` is a coroutine while the update and delete
+        # routes are sync and run in FastAPI's threadpool, so these genuinely run on
+        # different threads. It is also what makes the name check below a decision
+        # rather than a suggestion: check and write have to be one step, or two
+        # submissions both pass and both land. Always taken BEFORE the filestore lock
+        # and never after, so the pair cannot deadlock.
+        self._lock = threading.Lock()
 
     def _load_raw(self) -> list[dict]:
         if not self._path.exists():
@@ -221,6 +231,27 @@ class AppsStore:
 
     def _save_raw(self, apps: list[dict]) -> None:
         filestore.write_yaml(self._path, {APPS_KEY: apps}, schema_version=APPS_SCHEMA_VERSION)
+
+    def _ensure_unique_name(self, name: str, *, except_id: str | None = None) -> None:
+        """Refuse a name another connection already answers to. `except_id` is the
+        connection being edited, which is allowed to keep its own name.
+
+        Compared case- and whitespace-insensitively, because the point is what a
+        person reads: the calendar cache and the target badges identify a connection
+        BY NAME, so two boxes called Radarr collapse into one row and one badge, and
+        the rows of the one that is down vanish the moment its namesake answers.
+
+        Tolerant about what it reads and strict about what it accepts, like
+        `_validated_kind`: a hand-edited apps.yml missing a name must not turn a form
+        submission into a 500. Callers hold `self._lock`, so this and the write it
+        guards are one step.
+        """
+        wanted = name.strip().casefold()
+        for item in self._load_raw():
+            if except_id is not None and item.get("id") == except_id:
+                continue
+            if str(item.get("name", "")).strip().casefold() == wanted:
+                raise InvalidAppError("a connection with that name already exists")
 
     def list_apps(self, kind: str | None = KIND_RADARR) -> list[ExternalApp]:
         """Connections of one kind — Radarr unless asked otherwise.
@@ -270,83 +301,91 @@ class AppsStore:
         Exactly one Radarr and one Sonarr win, independently: choosing which Sonarr adds
         a series has no business demoting the Radarr the weekly run talks to.
         """
-        apps = self._load_raw()
-        chosen = next((item for item in apps if item["id"] == app_id), None)
-        if chosen is None:
-            raise AppNotFoundError(app_id)
-        kind = _validated_kind(chosen.get(KIND_KEY))
-        for item in apps:
-            if _validated_kind(item.get(KIND_KEY)) != kind:
-                continue
-            item[PRIMARY_KEY] = item["id"] == app_id
-        self._save_raw(apps)
-        self._audit.record(AuditAction.APP_UPDATED, app_id=app_id, kind=kind, primary=True)
+        with self._lock:
+            apps = self._load_raw()
+            chosen = next((item for item in apps if item["id"] == app_id), None)
+            if chosen is None:
+                raise AppNotFoundError(app_id)
+            kind = _validated_kind(chosen.get(KIND_KEY))
+            for item in apps:
+                if _validated_kind(item.get(KIND_KEY)) != kind:
+                    continue
+                item[PRIMARY_KEY] = item["id"] == app_id
+            self._save_raw(apps)
+            self._audit.record(AuditAction.APP_UPDATED, app_id=app_id, kind=kind, primary=True)
 
     def add(self, *, name: str, url: str, api_key: str, kind: str = KIND_RADARR) -> ExternalApp:
-        name = _validated_name(name)
-        if not api_key.strip():
-            raise InvalidAppError("API key is required")
-        # Strict here, tolerant on read: the caller is a form submission, and a kind this
-        # build does not ship is a bug or an attack, not something to quietly accept.
-        if kind not in APP_KINDS:
-            raise InvalidAppError(f"unknown app kind: {kind!r}")
-        app = ExternalApp(
-            id=f"{APP_ID_PREFIX}{secrets.token_hex(4)}",
-            name=name,
-            url=normalize_url(url),
-            api_key_encrypted=crypto.encrypt_field(api_key.strip(), self._key),
-            kind=kind,
-        )
-        apps = self._load_raw()
-        apps.append(
-            {
-                "id": app.id,
-                "name": app.name,
-                "url": app.url,
-                "api_key_encrypted": app.api_key_encrypted,
-                KIND_KEY: app.kind,
-            }
-        )
-        self._save_raw(apps)
-        self._audit.record(AuditAction.APP_ADDED, app_id=app.id, name=app.name, kind=app.kind)
-        return app
+        with self._lock:
+            name = _validated_name(name)
+            self._ensure_unique_name(name)
+            if not api_key.strip():
+                raise InvalidAppError("API key is required")
+            # Strict here, tolerant on read: the caller is a form submission, and a kind this
+            # build does not ship is a bug or an attack, not something to quietly accept.
+            if kind not in APP_KINDS:
+                raise InvalidAppError(f"unknown app kind: {kind!r}")
+            app = ExternalApp(
+                id=f"{APP_ID_PREFIX}{secrets.token_hex(4)}",
+                name=name,
+                url=normalize_url(url),
+                api_key_encrypted=crypto.encrypt_field(api_key.strip(), self._key),
+                kind=kind,
+            )
+            apps = self._load_raw()
+            apps.append(
+                {
+                    "id": app.id,
+                    "name": app.name,
+                    "url": app.url,
+                    "api_key_encrypted": app.api_key_encrypted,
+                    KIND_KEY: app.kind,
+                }
+            )
+            self._save_raw(apps)
+            self._audit.record(AuditAction.APP_ADDED, app_id=app.id, name=app.name, kind=app.kind)
+            return app
 
     def update(self, app_id: str, *, name: str, url: str, api_key: str | None) -> ExternalApp:
-        apps = self._load_raw()
-        for item in apps:
-            if item["id"] != app_id:
-                continue
-            # A rename flows straight through to the Add menu and the badges, which read
-            # the live name on every render — so it is checked here too, not just on add.
-            item["name"] = _validated_name(name) if name.strip() else item["name"]
-            item["url"] = normalize_url(url)
-            # A blank field means "leave the stored key unchanged".
-            if api_key and api_key.strip() and api_key != API_KEY_MASK:
-                item["api_key_encrypted"] = crypto.encrypt_field(api_key.strip(), self._key)
-            self._save_raw(apps)
-            self._audit.record(AuditAction.APP_UPDATED, app_id=app_id, name=item["name"])
-            return self.get(app_id)
-        raise AppNotFoundError(app_id)
+        with self._lock:
+            apps = self._load_raw()
+            for item in apps:
+                if item["id"] != app_id:
+                    continue
+                # A rename flows straight through to the Add menu and the badges, which read
+                # the live name on every render — so it is checked here too, not just on add.
+                item["name"] = _validated_name(name) if name.strip() else item["name"]
+                # Against the STORED names, so a rename onto a sibling is refused; its
+                # own row is skipped, so an edit that leaves the name alone still saves.
+                self._ensure_unique_name(item["name"], except_id=app_id)
+                item["url"] = normalize_url(url)
+                # A blank field means "leave the stored key unchanged".
+                if api_key and api_key.strip() and api_key != API_KEY_MASK:
+                    item["api_key_encrypted"] = crypto.encrypt_field(api_key.strip(), self._key)
+                self._save_raw(apps)
+                self._audit.record(AuditAction.APP_UPDATED, app_id=app_id, name=item["name"])
+                return self.get(app_id)
+            raise AppNotFoundError(app_id)
 
     def remove(self, app_id: str) -> None:
-        apps = self._load_raw()
-        remaining = [item for item in apps if item["id"] != app_id]
-        if len(remaining) == len(apps):
-            raise AppNotFoundError(app_id)
-        # Removing the primary promotes the next connection OF THE SAME KIND, so the app
-        # is never left pointing at a connection that no longer exists — and removing the
-        # last Sonarr never hands the Sonarr primacy to a Radarr.
-        removed = next(item for item in apps if item["id"] == app_id)
-        kind = _validated_kind(removed.get(KIND_KEY))
-        if removed.get(PRIMARY_KEY):
-            successor = next(
-                (item for item in remaining if _validated_kind(item.get(KIND_KEY)) == kind),
-                None,
-            )
-            if successor is not None:
-                successor[PRIMARY_KEY] = True
-        self._save_raw(remaining)
-        self._audit.record(AuditAction.APP_REMOVED, app_id=app_id, kind=kind)
+        with self._lock:
+            apps = self._load_raw()
+            remaining = [item for item in apps if item["id"] != app_id]
+            if len(remaining) == len(apps):
+                raise AppNotFoundError(app_id)
+            # Removing the primary promotes the next connection OF THE SAME KIND, so the app
+            # is never left pointing at a connection that no longer exists — and removing the
+            # last Sonarr never hands the Sonarr primacy to a Radarr.
+            removed = next(item for item in apps if item["id"] == app_id)
+            kind = _validated_kind(removed.get(KIND_KEY))
+            if removed.get(PRIMARY_KEY):
+                successor = next(
+                    (item for item in remaining if _validated_kind(item.get(KIND_KEY)) == kind),
+                    None,
+                )
+                if successor is not None:
+                    successor[PRIMARY_KEY] = True
+            self._save_raw(remaining)
+            self._audit.record(AuditAction.APP_REMOVED, app_id=app_id, kind=kind)
 
     def set_defaults(
         self,
@@ -370,25 +409,26 @@ class AppsStore:
         Radarr card, and the movie flows) cannot erase a Sonarr's settings. `False` is a
         value, not an absence, so a season-folders toggle turned off is honoured.
         """
-        apps = self._load_raw()
-        for item in apps:
-            if item["id"] != app_id:
-                continue
-            if series_type is not None and series_type not in SERIES_TYPES:
-                raise InvalidAppError(f"unknown series type: {series_type!r}")
-            item[QUALITY_PROFILE_KEY] = quality_profile_id
-            item[ROOT_FOLDER_KEY] = root_folder
-            for key, value in (
-                (SERIES_TYPE_KEY, series_type),
-                (SEASON_FOLDERS_KEY, season_folders),
-                (SEARCH_ON_ADD_KEY, search_on_add),
-            ):
-                if value is not None:
-                    item[key] = value
-            self._save_raw(apps)
-            self._audit.record(AuditAction.APP_UPDATED, app_id=app_id, defaults=True)
-            return
-        raise AppNotFoundError(app_id)
+        with self._lock:
+            apps = self._load_raw()
+            for item in apps:
+                if item["id"] != app_id:
+                    continue
+                if series_type is not None and series_type not in SERIES_TYPES:
+                    raise InvalidAppError(f"unknown series type: {series_type!r}")
+                item[QUALITY_PROFILE_KEY] = quality_profile_id
+                item[ROOT_FOLDER_KEY] = root_folder
+                for key, value in (
+                    (SERIES_TYPE_KEY, series_type),
+                    (SEASON_FOLDERS_KEY, season_folders),
+                    (SEARCH_ON_ADD_KEY, search_on_add),
+                ):
+                    if value is not None:
+                        item[key] = value
+                self._save_raw(apps)
+                self._audit.record(AuditAction.APP_UPDATED, app_id=app_id, defaults=True)
+                return
+            raise AppNotFoundError(app_id)
 
     def decrypt_key(self, app_id: str) -> str:
         return crypto.decrypt_field(self.get(app_id).api_key_encrypted, self._key)
@@ -407,15 +447,27 @@ class AppsStore:
         `/api/v3/system/status` too, so a Radarr client pointed at one would answer, the
         health dot would go green, and the first `movie` call would fail somewhere far
         from the cause. Better to be wrong loudly, here.
+
+        A stored key this build's encryption key cannot open is reported as a CONNECTION
+        failure rather than escaping as `DecryptionError`. It reaches a page through the
+        same callers a switched-off Radarr does — every one of which catches
+        `RadarrError` — so a key/file mismatch lands in the "Unreachable" banner instead
+        of a traceback.
         """
         app = self.get(app_id)
         if app.kind != KIND_RADARR:
             raise InvalidAppError(
                 f"{app.name} is a {app.kind_name} connection, not Radarr"
             )
+        try:
+            api_key = self.decrypt_key(app_id)
+        except crypto.DecryptionError as exc:
+            raise RadarrConnectionError(
+                f"{app.name}: {crypto.UNREADABLE_CREDENTIAL_MESSAGE}"
+            ) from exc
         return client_for_credentials(
             app.url,
-            self.decrypt_key(app_id),
+            api_key,
             tls_verify=tls_verify,
             ca_file=ca_file,
             timeout=timeout,
@@ -434,15 +486,25 @@ class AppsStore:
         Refuses any other kind, for `build_client`'s reason in the other direction:
         Radarr answers `/api/v3/system/status` too, so a Sonarr client pointed at one
         would go green and then fail at the first `series` call.
+
+        An unreadable stored key becomes a connection failure here for the reason
+        `build_client` documents, in Sonarr's own error type so the banner names the
+        right app.
         """
         app = self.get(app_id)
         if app.kind != KIND_SONARR:
             raise InvalidAppError(
                 f"{app.name} is a {app.kind_name} connection, not Sonarr"
             )
+        try:
+            api_key = self.decrypt_key(app_id)
+        except crypto.DecryptionError as exc:
+            raise SonarrConnectionError(
+                f"{app.name}: {crypto.UNREADABLE_CREDENTIAL_MESSAGE}"
+            ) from exc
         return sonarr_client_for_credentials(
             app.url,
-            self.decrypt_key(app_id),
+            api_key,
             tls_verify=tls_verify,
             ca_file=ca_file,
             timeout=timeout,

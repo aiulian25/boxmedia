@@ -12,7 +12,7 @@ import re
 import httpx
 import respx
 
-from app.services.apps import ExternalApp
+from app.services.apps import KIND_SONARR, ExternalApp
 from app.services.corrections import Correction
 from app.services.matcher import normalize_title
 from app.services.radarr import RadarrMovie
@@ -25,6 +25,7 @@ from app.services.reports import (
     RunStatus,
     RunTrigger,
 )
+from app.services.sonarr import SonarrSeries
 from app.web.deps import radarr_url_for
 from app.web.library import DEFAULT_LIMIT, PAGE_INCREMENT
 from tests.conftest import AppHarness
@@ -1045,3 +1046,88 @@ def test_a_corrected_film_stays_one_film_across_its_weeks(harness: AppHarness) -
     assert page.count("Mirrors No. 3") >= 1
     assert "Miroirs No. 3" not in page, "the chart's spelling is still on a card"
     assert "3 weeks" in page, "the film's weeks were split across two cards"
+
+
+def test_a_key_the_app_cannot_read_renders_the_unreachable_banner(
+    harness: AppHarness,
+) -> None:
+    """A mis-pointed BM_ENCRYPTION_KEY_FILE, or a rotation that reached only some stores,
+    used to raise DecryptionError out of every library read on this page.
+
+    No respx mocks on purpose: the client is refused before any request is built, so a
+    regression that started reaching the network would fail here on an unmocked call.
+    """
+    from app.core import crypto
+    from app.core.audit import AuditLog
+    from app.services.apps import AppsStore
+
+    harness.activate()
+    harness.client.app.state.apps.add(
+        name="Attic Radarr", url=RADARR_URL, api_key=RADARR_KEY
+    )
+    harness.client.app.state.apps = AppsStore(
+        harness.settings.config_dir,
+        key=crypto.generate_key(),
+        audit=AuditLog(harness.settings.logs_dir / "audit.jsonl"),
+    )
+
+    page = harness.client.get("/library")
+
+    assert page.status_code == 200
+    assert "Attic Radarr" in page.text  # named by the "couldn’t reach" banner
+
+
+# --- review step 9: 0 is "no tvdb id", not an id ---
+
+SONARR_URL = "http://sonarr.local:8989"
+
+
+def _series(*, sonarr_id: int, tvdb_id: int, title: str) -> SonarrSeries:
+    return SonarrSeries(
+        sonarr_id=sonarr_id, tvdb_id=tvdb_id, title=title, year=2024,
+        monitored=True, ended=False, episode_count=10, episode_file_count=10,
+    )
+
+
+def test_every_series_without_a_tvdb_id_still_reaches_the_page(harness: AppHarness) -> None:
+    """Sonarr answers with no `tvdbId` for some sources, and the reader stores that as 0.
+    Treating 0 as an identity collapsed every such series into the first one, and the rest
+    left the page with no error at all — the failure mode nobody reports because it looks
+    like they were never added.
+    """
+    harness.activate()
+    app = harness.client.app.state.apps.add(
+        name="Attic Sonarr", url=SONARR_URL, api_key=RADARR_KEY, kind=KIND_SONARR
+    )
+    harness.client.app.state.series_cache.save(app.id, (
+        _series(sonarr_id=1, tvdb_id=0, title="Harbour Watch"),
+        _series(sonarr_id=2, tvdb_id=0, title="Salt Flats"),
+        _series(sonarr_id=3, tvdb_id=0, title="Night Ferry"),
+    ))
+
+    page = harness.client.get("/library").text
+
+    assert "Harbour Watch" in page
+    assert "Salt Flats" in page
+    assert "Night Ferry" in page
+
+
+def test_a_real_tvdb_id_on_two_connections_is_still_one_card(harness: AppHarness) -> None:
+    """The guard must not switch de-duplication off. Two boxes holding the same show stay
+    one entry, on the first that answered — so the second connection, which holds nothing
+    else, never appears on the page."""
+    harness.activate()
+    apps = harness.client.app.state.apps
+    first = apps.add(name="Attic Sonarr", url=SONARR_URL, api_key=RADARR_KEY, kind=KIND_SONARR)
+    second = apps.add(
+        name="Loft Sonarr", url="http://loft.local:8989", api_key=RADARR_KEY, kind=KIND_SONARR
+    )
+    hollow_coast = _series(sonarr_id=14, tvdb_id=121361, title="The Hollow Coast")
+    harness.client.app.state.series_cache.save(first.id, (hollow_coast,))
+    harness.client.app.state.series_cache.save(second.id, (hollow_coast,))
+
+    page = harness.client.get("/library").text
+
+    assert "The Hollow Coast" in page
+    assert "Attic Sonarr" in page
+    assert "Loft Sonarr" not in page, "the duplicate was rendered a second time"

@@ -295,12 +295,17 @@ def _series_views(request: Request) -> list[dict]:
         if app is None:
             continue  # a connection removed since the snapshot was written
         for series in library:
-            if series.tvdb_id in seen:
+            if series.tvdb_id and series.tvdb_id in seen:
                 # Two connections holding the same series is one entry on this page, on
                 # the first that answered — the same rule the film half applies to a title
                 # sitting on both a 1080p and a 4K box.
+                #
+                # 0 is "Sonarr gave no id", not an id — `snapshot_from` makes the same
+                # exception. Deduping on it would collapse every series without a tvdbId
+                # into the first one, and the rest would leave the page with no error.
                 continue
-            seen.add(series.tvdb_id)
+            if series.tvdb_id:
+                seen.add(series.tvdb_id)
             views.append({
                 "kind": KIND_SERIES,
                 "title": series.title,

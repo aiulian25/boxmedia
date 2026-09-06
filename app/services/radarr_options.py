@@ -8,6 +8,7 @@ ever been fetched, the UI falls back to plain text entry (never a dead-end).
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -62,6 +63,15 @@ class RadarrOptionsCache:
 
     def __init__(self, config_dir: Path, *, filename: str = RADARR_OPTIONS_FILENAME) -> None:
         self._path = config_dir / filename
+        # Its own lock, not the filestore's: `save` and `forget` are
+        # read-modify-write over one shared document, and `filestore.write_yaml`
+        # only guards the write half. Callers reach this from worker threads —
+        # `asyncio.to_thread` on the render path, FastAPI's threadpool from the
+        # sync delete route — so without this two connections saved at once each
+        # build the file from a read that predates the other's write, and one
+        # connection's entry is silently dropped. Always taken BEFORE the filestore
+        # lock and never the other way round, so the pair cannot deadlock.
+        self._lock = threading.Lock()
 
     def _load_all(self) -> dict[str, RadarrOptions]:
         if not self._path.exists():
@@ -88,15 +98,17 @@ class RadarrOptionsCache:
         return self._load_all()
 
     def save(self, app_id: str, options: RadarrOptions) -> None:
-        stored = self._load_all()
-        stored[app_id] = options
-        self._write(stored)
+        with self._lock:
+            stored = self._load_all()
+            stored[app_id] = options
+            self._write(stored)
 
     def forget(self, app_id: str) -> None:
         """Drop a removed connection's entry so the file cannot grow forever."""
-        stored = self._load_all()
-        if stored.pop(app_id, None) is not None:
-            self._write(stored)
+        with self._lock:
+            stored = self._load_all()
+            if stored.pop(app_id, None) is not None:
+                self._write(stored)
 
     def _write(self, stored: dict[str, RadarrOptions]) -> None:
         filestore.write_yaml(

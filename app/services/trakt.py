@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.core.values import int_or_none
 from app.services.discovery import TRAKT_BASE_URL, scrub, trakt_headers
 
 REQUEST_TIMEOUT_SECONDS = 10.0
@@ -89,11 +90,6 @@ class TraktShow:
         return self.tvdb_id is not None
 
 
-def _int_or_none(value: object) -> int | None:
-    """A real integer, or None. `bool` is an int in Python and would become 0/1."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
 def _text_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
@@ -114,15 +110,15 @@ def _show_from(entry: dict, *, watchers_key: str | None) -> TraktShow | None:
         return None
     ids = show.get("ids")
     ids = ids if isinstance(ids, dict) else {}
-    count = _int_or_none(entry.get(watchers_key)) if watchers_key else None
+    count = int_or_none(entry.get(watchers_key)) if watchers_key else None
     return TraktShow(
         title=title,
-        year=_int_or_none(show.get("year")),
-        trakt_id=_int_or_none(ids.get("trakt")),
+        year=int_or_none(show.get("year")),
+        trakt_id=int_or_none(ids.get("trakt")),
         slug=_text_or_none(ids.get("slug")),
         imdb_id=_text_or_none(ids.get("imdb")),
-        tmdb_id=_int_or_none(ids.get("tmdb")),
-        tvdb_id=_int_or_none(ids.get("tvdb")),
+        tmdb_id=int_or_none(ids.get("tmdb")),
+        tvdb_id=int_or_none(ids.get("tvdb")),
         overview=_text_or_none(show.get("overview")),
         watchers=count if watchers_key == "watchers" else None,
         list_count=count if watchers_key == "list_count" else None,

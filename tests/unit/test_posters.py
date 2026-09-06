@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from pathlib import Path
 
 import httpx
 import respx
 
+from app.services import posters
 from app.services.posters import (
     FAILED_RETRY_AFTER_SECONDS,
     MAX_POSTER_BYTES,
@@ -315,3 +317,33 @@ def test_the_two_widths_are_different_cache_entries(tmp_path: Path) -> None:
     cache = PosterCache(tmp_path)
     film = sized(TMDB_POSTER, POSTER_WIDTH)
     assert cache.local_name(film) != cache.local_name(TMDB_POSTER)
+
+
+# --- review step 7: the write does not run on the event loop ---
+
+
+@respx.mock
+async def test_the_poster_write_happens_off_the_event_loop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A poster-heavy page caches one image per new title, and each write is a temp file,
+    an fsync and a rename — plus however long the filestore lock is already held by a
+    backup. On the loop thread that stops every other request for the duration.
+    """
+    respx.get(POSTER_URL).mock(return_value=httpx.Response(200, content=b"\xff\xd8\xff jpeg"))
+    writing_threads: list[threading.Thread] = []
+    real_write = posters.atomic_write_bytes
+
+    def recording_write(target: Path, payload: bytes) -> None:
+        writing_threads.append(threading.current_thread())
+        real_write(target, payload)
+
+    monkeypatch.setattr(posters, "atomic_write_bytes", recording_write)
+    cache = PosterCache(tmp_path)
+
+    async with httpx.AsyncClient() as client:
+        assert await cache.ensure(client, POSTER_URL) is True
+
+    assert writing_threads, "the poster was never written"
+    assert writing_threads[0] is not threading.current_thread()
+    assert cache.is_cached(POSTER_URL)  # and it really landed on disk

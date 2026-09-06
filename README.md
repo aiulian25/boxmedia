@@ -238,6 +238,13 @@ Your `.env`, data and key are unaffected.
 Then point a reverse proxy (nginx/Traefik/Caddy/Pangolin/Cloudflare) at
 `127.0.0.1:${BM_HOST_PORT}` (default `58546`) and terminate TLS there.
 
+Leave `BM_FORWARDED_ALLOW_IPS` commented out while the port stays on loopback: the
+compose file then trusts your proxy's `X-Forwarded-For`, which is what makes login
+lockout and the audit log record real client addresses instead of the proxy's. If you
+change the bind to `0.0.0.0`, set it to your proxy's address — with the port reachable
+off-host, trusting every peer would let anyone forge that header and give themselves a
+fresh rate-limit bucket per request.
+
 ## First run
 
 1. Read the one-time admin password from the logs:
@@ -275,7 +282,9 @@ indistinguishable from the app never having been lost — you log in with your
 previous password and find every report and setting exactly as before.
 
 Media files are **never** in a backup. BoxMedia doesn't store them; your movie
-library belongs to Radarr and its own storage. Archives are only a few MB.
+library belongs to Radarr and its own storage. A typical archive is a few MB —
+the poster cache is the part that grows. Uploaded archives are capped at **64 MB**;
+a larger one has to be restored from `/data/backups/` rather than imported.
 
 Create, download, restore, or import backups under **Settings → Backups**, or let
 one happen automatically before every restore (a safety net). Archives live in
@@ -324,9 +333,11 @@ archives**, or the whole point of keeping the key out of the backup is defeated:
 
 ### Rotating the encryption key
 
-If the key is ever exposed, rotate it — this re-encrypts the stored Radarr API keys
-under a new key. **Stop BoxMedia first:** a running instance holds the old key in
-memory and would write old-key ciphertext back over the rotated file.
+If the key is ever exposed, rotate it. This re-encrypts **every** credential the key
+protects under the new one — the Radarr and Sonarr API keys, the media-server
+token/API key, and your TMDB key and Trakt client ID. **Stop BoxMedia first:** a running
+instance holds the old key in memory and would write old-key ciphertext back over the
+rotated files.
 
 ```bash
 # 1. Stop the app.
@@ -343,10 +354,17 @@ docker run --rm -v "$PWD/secrets:/secrets" -v "$PWD/data:/data" \
 docker compose up -d
 ```
 
-Nothing is written unless every key re-encrypts cleanly, so a failed rotation leaves
-`apps.yml` untouched. **Keep the old key until every backup made with it is deleted** —
+Nothing is written unless every credential in every store re-encrypts cleanly, so a
+failed rotation leaves all of them untouched — a half-rotated install would be worse
+than one that never started, because the half that moved could no longer be rotated back
+with the old key. **Keep the old key until every backup made with it is deleted** —
 existing `.backup` archives can only be decrypted with the key they were created under.
 Afterwards, verify with Settings → **Test Connection**.
+
+If the app is ever pointed at the wrong key file, it says so rather than failing: the
+connection cards read **Unreachable**, the Test buttons say the saved credential can't be
+read, and the pages still render. Restore the key file (or finish the rotation) and they
+come back on the next load.
 
 ### Restoring
 
@@ -370,7 +388,11 @@ Afterwards, verify with Settings → **Test Connection**.
 - TLS certificate validation on all outbound calls; point `BM_TLS_CA_FILE` at a
   CA bundle for a self-signed home Radarr, Sonarr or media server rather than
   disabling verification. That escape hatch is for **your own servers** — the
-  public endpoints below are always verified.
+  public endpoints below are always verified, against the system trust store, and
+  neither `BM_TLS_CA_FILE` nor `BM_OUTBOUND_TLS_VERIFY` can change that. (If your
+  network intercepts TLS wholesale, set the container's `SSL_CERT_FILE` to a bundle
+  holding both your CA **and** the public roots; that keeps verification on rather
+  than turning it off for a public API carrying your TMDB key.)
 - **Every host BoxMedia can contact**, and nothing else: `boxofficemojo.com`
   (the weekly chart), `api.themoviedb.org` and `image.tmdb.org` (artwork and
   metadata, only once you add a TMDB key), `api.trakt.tv` (trending series, only

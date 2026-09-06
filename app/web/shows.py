@@ -36,11 +36,11 @@ from app.services.apps import (
     KIND_SONARR,
     InvalidAppError,
 )
-from app.services.discovery import PROVIDER_TMDB
+from app.services.discovery import PROVIDER_TMDB, DiscoveryError
 from app.services.ignore import KIND_SERIES
 from app.services.matcher import normalize_title
 from app.services.posters import HEADSHOT_WIDTH, SERIES_POSTER_WIDTH
-from app.services.radarr import build_verify
+from app.services.reports import imdb_url
 from app.services.sonarr import (
     MONITOR_ALL,
     MONITOR_OPTIONS,
@@ -75,6 +75,13 @@ MAX_CAST = 12
 
 UNAVAILABLE_MESSAGE = (
     "Add a TMDB API key under Discovery in Settings to see series details."
+)
+# Said instead of the line above when a key IS stored and will not decrypt. "Add a key"
+# is the wrong advice for one that is already there, and the thing to fix is the
+# encryption key rather than the credential.
+UNREADABLE_KEY_MESSAGE = (
+    "Your saved TMDB key cannot be read with this install’s encryption key. "
+    "Restore the key file, or re-enter the key under Discovery in Settings."
 )
 
 # What Monitor offers, in the words a person would use. Sonarr's own values are the
@@ -125,19 +132,32 @@ STATUS_MESSAGES = {
 
 
 def _tmdb_client(request: Request) -> TmdbClient | None:
-    """A TMDB client from the stored key, or None when there is none to build one from."""
-    key = request.app.state.discovery.decrypt(PROVIDER_TMDB)
+    """A TMDB client from the stored key, or None when there is none to build one from.
+
+    None also covers a stored key this install's encryption key cannot open;
+    `_missing_client_message` asks which of the two it was, because the advice differs.
+    """
+    try:
+        key = request.app.state.discovery.decrypt(PROVIDER_TMDB)
+    except DiscoveryError:
+        return None
     if not key:
         return None
-    settings = request.app.state.settings
-    return TmdbClient(
-        key,
-        verify=build_verify(
-            tls_verify=settings.outbound_tls_verify,
-            ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
-        ),
-        timeout=DETAIL_TIMEOUT_SECONDS,
-    )
+    # Deliberately WITHOUT the app's outbound-TLS settings, unlike every Radarr, Sonarr
+    # and media-server client. That escape hatch exists for the user's OWN servers, and
+    # `BM_TLS_CA_FILE` becomes a context trusting only that CA — which TMDB's public
+    # certificate then fails. Passing it here broke the show page for every install with
+    # a self-signed home server, while Discover's own refresh (which never passed it)
+    # kept working. The README's promise is the rule: public endpoints are always
+    # verified, against the system trust store.
+    return TmdbClient(key, timeout=DETAIL_TIMEOUT_SECONDS)
+
+
+def _missing_client_message(request: Request) -> str:
+    """Why there is no TMDB client: nothing stored, or stored and unreadable."""
+    if request.app.state.discovery.load().has_tmdb:
+        return UNREADABLE_KEY_MESSAGE
+    return UNAVAILABLE_MESSAGE
 
 
 def _sonarr_targets(request: Request) -> list[dict[str, object]]:
@@ -191,7 +211,9 @@ async def show_detail(request: Request, tmdb_id: int) -> HTMLResponse:
 
     client = _tmdb_client(request)
     if client is None:
-        return render(request, template, show=None, error=UNAVAILABLE_MESSAGE)
+        return render(
+            request, template, show=None, error=_missing_client_message(request)
+        )
     try:
         detail = await asyncio.wait_for(
             client.tv_detail(tmdb_id), timeout=DETAIL_TIMEOUT_SECONDS
@@ -247,9 +269,7 @@ async def show_detail(request: Request, tmdb_id: int) -> HTMLResponse:
             "seasons": detail.seasons,
             "first_air_date": _day_first(detail.first_air_date),
             "poster_local": poster_holder[0].get("poster_local"),
-            "imdb_url": (
-                f"https://www.imdb.com/title/{detail.imdb_id}/" if detail.imdb_id else None
-            ),
+            "imdb_url": imdb_url(detail.imdb_id),
             "trailer_url": detail.trailer_url,
             "addable": detail.addable,
             "cast": cast,

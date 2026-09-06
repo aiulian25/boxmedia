@@ -36,6 +36,7 @@ MAX_REPORT_RETENTION = 260
 # round of Radarr lookups. A history with more holes than this takes a second click.
 MAX_BACKFILL_WEEKS = 12
 IMDB_TITLE_URL = "https://www.imdb.com/title/{imdb_id}/"
+YOUTUBE_WATCH_URL = "https://www.youtube.com/watch?v={video_id}"
 WIKI_SEARCH_URL = "https://en.wikipedia.org/wiki/Special:Search?search={query}"
 _REPORT_ID_RE = re.compile(r"^report-[0-9A-Za-z\-]+$")
 
@@ -124,6 +125,13 @@ def imdb_url(imdb_id: str | None) -> str | None:
     """The IMDb page for a Radarr lookup result, or None when it has no IMDb id.
     Lives here beside MovieResult so the pipeline and the manual match fixer agree."""
     return IMDB_TITLE_URL.format(imdb_id=imdb_id) if imdb_id else None
+
+
+def youtube_url(video_id: str | None) -> str | None:
+    """The trailer page for a TMDB video key, or None when there is no trailer.
+    Beside `imdb_url` for the same reason: the reader that finds the key and the page
+    that renders the link must not each carry their own copy of the address."""
+    return YOUTUBE_WATCH_URL.format(video_id=video_id) if video_id else None
 
 
 class ReportTotals(BaseModel):

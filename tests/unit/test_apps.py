@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,8 @@ from app.services.apps import (
     InvalidAppError,
     normalize_url,
 )
+from app.services.radarr import RadarrConnectionError
+from app.services.sonarr import SonarrConnectionError
 
 RADARR_KEY = "0123456789abcdef0123456789abcdef"
 
@@ -119,6 +123,36 @@ def test_rotated_keys_open_with_the_new_key_through_the_store(tmp_path: Path) ->
     stale = AppsStore(config_dir, key=crypto.load_key(old_file), audit=audit)
     with pytest.raises(crypto.DecryptionError):
         stale.decrypt_key(app.id)  # the old key no longer opens the store
+
+
+def test_a_key_mismatch_builds_no_client_and_is_a_connection_failure(tmp_path: Path) -> None:
+    """A mis-pointed key file, or a rotation that never finished, must reach the page as
+    the "Unreachable" banner every caller already handles.
+
+    `DecryptionError` matches none of the `except RadarrError` clauses the render paths
+    use, so before this it escaped all of them and 500'd the request.
+    """
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    stored = AppsStore(tmp_path, key=crypto.generate_key(), audit=audit)
+    radarr = stored.add(name="Attic Radarr", url="radarr.local:7878", api_key=RADARR_KEY)
+    sonarr = stored.add(
+        name="Attic Sonarr", url="sonarr.local:8989", api_key=RADARR_KEY, kind=KIND_SONARR
+    )
+
+    mismatched = AppsStore(tmp_path, key=crypto.generate_key(), audit=audit)
+
+    with pytest.raises(RadarrConnectionError) as radarr_failure:
+        mismatched.build_client(radarr.id, tls_verify=True, ca_file=None)
+    with pytest.raises(SonarrConnectionError) as sonarr_failure:
+        mismatched.build_sonarr_client(sonarr.id, tls_verify=True, ca_file=None)
+
+    # Each names its own connection, so a two-box install says which one to look at —
+    # and neither message carries the ciphertext it could not open.
+    assert "Attic Radarr" in str(radarr_failure.value)
+    assert "Attic Sonarr" in str(sonarr_failure.value)
+    for failure in (radarr_failure, sonarr_failure):
+        assert RADARR_KEY not in str(failure.value)
+        assert "gcm:v1:" not in str(failure.value)
 
 
 # --- primary connection (F9) ---
@@ -425,3 +459,93 @@ def test_the_public_view_names_the_kind_and_still_masks_the_key(store: AppsStore
     assert view["kind_name"] == "Sonarr"
     assert view["api_key_mask"] == API_KEY_MASK
     assert RADARR_KEY not in str(view)
+
+
+# --- review step 8: a connection name identifies a box, so it has to be unique ---
+
+ATTIC = "Attic Radarr"
+# Long enough that both threads are past the check before either write lands.
+CHECK_WINDOW_SECONDS = 0.05
+
+
+def test_a_second_connection_cannot_take_a_name_already_in_use(store: AppsStore) -> None:
+    store.add(name=ATTIC, url="radarr.local:7878", api_key=RADARR_KEY)
+
+    with pytest.raises(InvalidAppError):
+        store.add(name=ATTIC, url="other.local:7878", api_key=RADARR_KEY)
+
+    assert len(store.list_apps()) == 1
+
+
+def test_the_name_check_ignores_case_and_padding(store: AppsStore) -> None:
+    """What matters is what a person reads on a badge, and nobody reads the difference
+    between "Attic Radarr" and "  attic radarr  "."""
+    store.add(name=ATTIC, url="radarr.local:7878", api_key=RADARR_KEY)
+
+    with pytest.raises(InvalidAppError):
+        store.add(name="  attic radarr  ", url="other.local:7878", api_key=RADARR_KEY)
+
+
+def test_a_sonarr_cannot_borrow_a_radarr_name(store: AppsStore) -> None:
+    """Uniqueness is across every connection, not per kind: the calendar merges both
+    kinds into one cache keyed by connection name, so a Sonarr and a Radarr that share
+    one are exactly the collision this refuses."""
+    store.add(name=ATTIC, url="radarr.local:7878", api_key=RADARR_KEY)
+
+    with pytest.raises(InvalidAppError):
+        store.add(name=ATTIC, url="sonarr.local:8989", api_key=RADARR_KEY, kind=KIND_SONARR)
+
+
+def test_renaming_onto_a_sibling_is_refused_and_changes_nothing(store: AppsStore) -> None:
+    first = store.add(name=ATTIC, url="radarr.local:7878", api_key=RADARR_KEY)
+    second = store.add(name="Loft Radarr", url="loft.local:7878", api_key=RADARR_KEY)
+
+    with pytest.raises(InvalidAppError):
+        store.update(second.id, name=ATTIC, url="loft.local:7878", api_key=None)
+
+    assert store.get(second.id).name == "Loft Radarr"
+    assert store.get(second.id).url == "http://loft.local:7878"  # the URL did not save
+    assert store.get(first.id).name == ATTIC
+
+
+def test_editing_a_connection_that_keeps_its_own_name_still_saves(store: AppsStore) -> None:
+    """The regression this rule could easily cause: a connection must not be refused its
+    own name, or changing a port would need a rename first."""
+    app = store.add(name=ATTIC, url="radarr.local:7878", api_key=RADARR_KEY)
+
+    store.update(app.id, name=ATTIC, url="radarr.local:7879", api_key=None)
+
+    assert store.get(app.id).url == "http://radarr.local:7879"
+
+
+def test_two_connections_added_at_once_cannot_both_take_the_name(
+    store: AppsStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The add route is a coroutine and the update route is sync, so these run on
+    different threads. A check that is not serialized with the write it guards is a
+    suggestion: both submissions read a file without the name and both write it.
+    """
+    original_load = store._load_raw
+
+    def load_slowly() -> list[dict]:
+        stored = original_load()
+        time.sleep(CHECK_WINDOW_SECONDS)
+        return stored
+
+    monkeypatch.setattr(store, "_load_raw", load_slowly)
+    refused: list[InvalidAppError] = []
+
+    def add_it() -> None:
+        try:
+            store.add(name=ATTIC, url="radarr.local:7878", api_key=RADARR_KEY)
+        except InvalidAppError as exc:
+            refused.append(exc)
+
+    threads = [threading.Thread(target=add_it) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert len(refused) == 1, "one of the two had to be turned away"
+    assert len(store.list_apps()) == 1

@@ -27,9 +27,18 @@ ENV_PREFIX = "BM_"
 SESSION_SECRET_MIN_LENGTH = 32
 TCP_PORT_MIN = 1
 TCP_PORT_MAX = 65535
-DEFAULT_CONTAINER_PORT = 8686
 DEFAULT_HOST_PORT = 58546
 DEFAULT_SESSION_TTL_HOURS = 12
+# Which peers uvicorn may believe about X-Forwarded-*. Deliberately mirrored from
+# docker-compose.yml, which is what actually passes it to uvicorn, and pinned equal by a
+# test — this value exists so `python -m app.core.config` can report the deployed policy,
+# and a default that disagreed with the shipped compose would report a policy nobody has.
+#
+# `*` is correct for that file BECAUSE it publishes on loopback: the only peers are
+# processes on the host, i.e. the reverse proxy. docker-compose.dev.yml publishes on
+# 0.0.0.0 and therefore narrows it in its own file; a run of THAT stack with the variable
+# unset is the one case this summary reads wider than reality.
+DEFAULT_FORWARDED_ALLOW_IPS = "*"
 # Box Office Mojo weekly chart URL. Deliberately mirrored by the boxoffice scraper's
 # BOM_WEEKLY_URL (kept in both layers) so core never imports the services layer.
 DEFAULT_BOXOFFICE_URL = "https://www.boxofficemojo.com/weekly/"
@@ -90,7 +99,6 @@ class Settings(BaseSettings):
 
     # --- Optional with defaults ---
     data_dir: Path = Path("/data")
-    port: int = DEFAULT_CONTAINER_PORT
     host_port: int = DEFAULT_HOST_PORT
     url_base: str = ""
     # Secure cookies require HTTPS. Keep true in production: the reverse proxy
@@ -109,12 +117,12 @@ class Settings(BaseSettings):
     login_lock_seconds: int = Field(default=DEFAULT_LOCK_SECONDS, ge=30)
     outbound_tls_verify: bool = True
     tls_ca_file: Path | None = None
-    forwarded_allow_ips: str = "127.0.0.1"
+    forwarded_allow_ips: str = DEFAULT_FORWARDED_ALLOW_IPS
     # The box-office chart source. Defaults to Box Office Mojo (ruling #6); override
     # if the upstream URL changes or to point tests at a fixture server.
     boxoffice_url: str = DEFAULT_BOXOFFICE_URL
 
-    @field_validator("port", "host_port")
+    @field_validator("host_port")
     @classmethod
     def _port_in_range(cls, value: int) -> int:
         if not (TCP_PORT_MIN <= value <= TCP_PORT_MAX):
@@ -186,11 +194,22 @@ class Settings(BaseSettings):
             except PermissionError:
                 raise SystemExit(unwritable_data_dir_message(self.data_dir)) from None
 
+    def outbound_tls(self) -> dict[str, object]:
+        """The two arguments every outbound client takes — one place for the CA-file
+        dance. Spread with `**` at the call site so a client that gains a third TLS
+        argument gains it everywhere at once.
+
+        Always the app's OWN settings, never anything a form can influence.
+        """
+        return {
+            "tls_verify": self.outbound_tls_verify,
+            "ca_file": str(self.tls_ca_file) if self.tls_ca_file else None,
+        }
+
     def public_summary(self) -> dict[str, object]:
         """Non-secret config for the config-check entrypoint and logs."""
         return {
             "data_dir": str(self.data_dir),
-            "port": self.port,
             "host_port": self.host_port,
             "url_base": self.url_base or "(root)",
             "outbound_tls_verify": self.outbound_tls_verify,

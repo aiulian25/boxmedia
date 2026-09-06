@@ -577,3 +577,63 @@ def test_one_lookup_per_show_even_when_both_shelves_carry_it(
     cache = harness.client.app.state.discover_cache.load()
     assert "meridian.jpg" in cache[TRENDING_KEY][0].poster_url
     assert "meridian.jpg" in cache[ANTICIPATED_KEY][0].poster_url
+
+
+def test_a_refresh_with_unreadable_keys_says_which_problem_it_is(
+    harness: AppHarness,
+) -> None:
+    """Stored keys this install's encryption key cannot open are their own answer.
+
+    Not the refresh-failed banner beside it: that one says Trakt could not be reached,
+    and with an unreadable key nothing is ever asked of Trakt. No respx mock, so a
+    regression that started making the call would fail on an unmocked request.
+    """
+    from app.core import crypto
+    from app.services.discovery import DiscoveryStore
+
+    harness.activate()
+    _keys(harness)
+    harness.client.app.state.discovery = DiscoveryStore(
+        harness.settings.config_dir, key=crypto.generate_key()
+    )
+
+    response = harness.client.post("/discover/refresh", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert DiscoverStatus.KEYS_UNREADABLE in response.headers["location"]
+    assert harness.client.get("/discover").status_code == 200
+
+
+def test_refresh_builds_both_public_clients_without_the_tls_escape_hatch(
+    tmp_path, monkeypatch
+) -> None:
+    """Refresh was already correct; this pins it so a later "consistency" edit cannot
+    hand TMDB and Trakt the CA file meant for the user's own servers."""
+    from tests.conftest import build_harness
+
+    built: list[dict] = []
+
+    class _Recorder:
+        def __init__(self, credential, **kwargs):
+            built.append(kwargs)
+            self.credential = credential
+
+        async def trending_shows(self, limit):
+            return []
+
+        async def anticipated_shows(self, limit):
+            return []
+
+    ca_file = tmp_path / "home-ca.pem"
+    ca_file.write_text("-----BEGIN CERTIFICATE-----\nnot a real CA\n-----END CERTIFICATE-----\n")
+    harness = build_harness(tmp_path, outbound_tls_verify=False, tls_ca_file=ca_file)
+    harness.activate()
+    _keys(harness)
+    monkeypatch.setattr("app.web.discover.TraktClient", _Recorder)
+    monkeypatch.setattr("app.web.discover.TmdbClient", _Recorder)
+
+    harness.client.post("/discover/refresh", follow_redirects=False)
+
+    assert built, "refresh built no client at all"
+    for kwargs in built:
+        assert "verify" not in kwargs, kwargs

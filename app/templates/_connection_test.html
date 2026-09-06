@@ -29,6 +29,15 @@
   <span class="dot dot-failed"></span>
   <span>{{ app_name }} rejected the API key</span>
 </span>
+{% elif result.state == 'unreadable' %}
+{# Stored, and this install's encryption key will not open it. Deliberately NOT the
+   "rejected the API key" line above: nothing was asked of the remote, so blaming it
+   would be a claim about a request that was never made. Wraps rather than truncates —
+   it is a sentence, and a longer translation of it has to stay readable. #}
+<span class="app-health app-health-auth test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>The saved {{ app_name }} credential can’t be read — restore the encryption key, or re-enter it and save</span>
+</span>
 {% elif result.state == 'bad_url' %}
 <span class="app-health app-health-unreachable test-result" role="status">
   <span class="dot dot-failed"></span>

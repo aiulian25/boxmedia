@@ -26,6 +26,14 @@
   <span class="dot dot-failed"></span>
   <span>{{ server_name }} rejected the credential</span>
 </span>
+{% elif result.state == 'unreadable' %}
+{# The stored credential will not decrypt with this install's encryption key. Its own
+   verdict for `_connection_test.html`'s reason: nothing was asked of the server, so
+   neither "rejected the credential" nor "could not reach it" would be true. #}
+<span class="app-health app-health-auth test-result" role="status">
+  <span class="dot dot-failed"></span>
+  <span>The saved {{ server_name }} credential can’t be read — restore the encryption key, or re-enter it and save</span>
+</span>
 {% elif result.state == 'bad_url' %}
 <span class="app-health app-health-unreachable test-result" role="status">
   <span class="dot dot-failed"></span>

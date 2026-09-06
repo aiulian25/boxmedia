@@ -87,7 +87,6 @@ from app.services.radarr import (
     RadarrAuthError,
     RadarrConnectionError,
     RadarrError,
-    build_verify,
 )
 from app.services.radarr_options import RadarrOptions
 from app.services.reports import Report
@@ -224,7 +223,10 @@ STATUS_MESSAGES: dict[str, tuple[str, str]] = {
     ),
     SettingsStatus.APP_UPDATED: (_SUCCESS, "Connection updated."),
     SettingsStatus.APP_REMOVED: (_SUCCESS, "Connection removed."),
-    SettingsStatus.APP_INVALID: (_ERROR, "Please check the connection fields and try again."),
+    SettingsStatus.APP_INVALID: (
+        _ERROR,
+        "Please check the connection fields — the name must be unique — and try again.",
+    ),
     SettingsStatus.TEST_OK: (_SUCCESS, "Connection succeeded — Radarr responded."),
     SettingsStatus.TEST_AUTH: (_ERROR, "Radarr rejected the API key."),
     SettingsStatus.TEST_CONN: (_ERROR, "Could not reach Radarr (check the address / TLS)."),
@@ -559,6 +561,10 @@ class TestResult:
     # "Something answered and spoke the API, but it is not the app you picked." The name
     # is historical — it now covers a Sonarr card pointed at a Radarr just as well.
     NOT_RADARR = "not_radarr"
+    # The credential is stored, and this install's encryption key will not open it. Its
+    # own state because none of the four above is true: nothing was asked of the remote,
+    # so saying it "rejected the API key" would be a claim about a request never made.
+    UNREADABLE = "unreadable"
 
 
 @router.post(TEST_CREDENTIALS_PATH)
@@ -882,8 +888,7 @@ def _validated_mode(mode: str) -> str:
 def _server_client(request: Request, *, timeout: float | None = None):  # noqa: ANN202
     settings = request.app.state.settings
     return request.app.state.media_server.build_client(
-        tls_verify=settings.outbound_tls_verify,
-        ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+        **settings.outbound_tls(),
         timeout=timeout,
     )
 
@@ -991,25 +996,35 @@ async def test_discovery_key(
     # one form — that is what lets a key be checked BEFORE it is committed to disk.
     typed = tmdb_key if provider == PROVIDER_TMDB else trakt_client_id
     secret = typed.strip()
+    app_name = PROVIDER_NAMES[provider]
     if not secret or secret == KEY_MASK:
         # Nothing typed: test what is stored, so the button still answers "does the key
         # I saved last week still work?".
-        secret = request.app.state.discovery.decrypt(provider) or ""
-    app_name = PROVIDER_NAMES[provider]
+        try:
+            secret = request.app.state.discovery.decrypt(provider) or ""
+        except DiscoveryError:
+            # Stored and unreadable. Its own verdict rather than the "rejected the API
+            # key" line below, which would blame a service that was never contacted.
+            return render(
+                request,
+                "_connection_test.html",
+                result={
+                    "state": TestResult.UNREADABLE, "version": None, "app_name": app_name
+                },
+            )
     if not secret:
         return render(
             request,
             "_connection_test.html",
             result={"state": ProbeResult.AUTH, "version": None, "app_name": app_name},
         )
-    verify = build_verify(
-        tls_verify=request.app.state.settings.outbound_tls_verify,
-        ca_file=str(request.app.state.settings.tls_ca_file)
-        if request.app.state.settings.tls_ca_file
-        else None,
-    )
+    # Probed against the system trust store, NOT the app's outbound-TLS settings. Those
+    # exist for the user's own servers: `BM_TLS_CA_FILE` builds a context trusting only
+    # that CA, so passing it here made both Test buttons fail on exactly the installs the
+    # CA file was added for, and `BM_OUTBOUND_TLS_VERIFY=false` silently stopped verifying
+    # a public API. The probes already default to full verification.
     probe = probe_tmdb if provider == PROVIDER_TMDB else probe_trakt
-    state = await probe(secret, verify=verify)
+    state = await probe(secret)
     return render(
         request,
         "_connection_test.html",
@@ -1058,12 +1073,16 @@ async def _test_server_credentials(
         return {"state": TestResult.AUTH}
     try:
         secret = token or request.app.state.media_server.decrypt_token()
+    except MediaServerError:
+        # The stored secret will not decrypt. Answered on its own rather than falling
+        # into "could not reach it" below: nothing was asked of the server.
+        return {"state": TestResult.UNREADABLE}
+    try:
         client = server_client_for_credentials(
             url,
             secret,
             kind=kind,
-            tls_verify=settings.outbound_tls_verify,
-            ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+            **settings.outbound_tls(),
             timeout=HEALTH_TIMEOUT_SECONDS,
         )
         sections = await asyncio.wait_for(

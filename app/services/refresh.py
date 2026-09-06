@@ -15,6 +15,7 @@ and "there is nothing" are different claims, and only one of them is true.
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import UTC, datetime
 
 from app.core.config import Settings
@@ -61,6 +62,8 @@ class ServerRefresher:
         self._calendar_cache = calendar_cache
         self._series_cache = series_cache
         self._backoff = backoff
+        # Guards the calendar's read-modify-write; see `_merge_calendar`.
+        self._calendar_write_lock = threading.Lock()
 
     # --- the calendar ---
 
@@ -85,19 +88,33 @@ class ServerRefresher:
             app.name for app, rows in zip(apps, results, strict=True) if rows is not None
         }
         configured = {app.name for app in apps}
-        kept = [
-            entry
-            for entry in self._calendar_cache.load()
-            if entry.connection in configured and entry.connection not in answered
-        ]
         fresh = [entry for rows in results if rows is not None for entry in rows]
         if answered or not apps:
             # Nothing answered means nothing was learned. Writing an empty week here would
             # stamp it fresh and turn "we could not look" into "nothing is due" — so the
             # previous answer keeps its own timestamp and stays visibly stale instead. With
             # no connections configured at all, an empty week is the true answer.
-            self._calendar_cache.save(fresh + kept)
+            await asyncio.to_thread(self._merge_calendar, fresh, configured - answered)
         return all(rows is not None for rows in results)
+
+    def _merge_calendar(self, fresh: list[CalendarEntry], keep: set[str]) -> None:
+        """Write `fresh`, plus the rows still held by the connections `keep` names.
+
+        A connection that did not answer keeps the rows it contributed last time; one
+        that no longer exists is dropped, or a deleted Radarr would fill days forever
+        with nothing left to refresh it.
+
+        Read and write happen together, on one worker thread, under one lock, because
+        they are a read-modify-write: the morning job can overlap a page render that
+        found the cache stale. Split across an await, the later writer would build its
+        document from a read taken before the earlier one's write and lose a
+        connection's whole week.
+        """
+        with self._calendar_write_lock:
+            kept = [
+                entry for entry in self._calendar_cache.load() if entry.connection in keep
+            ]
+            self._calendar_cache.save(fresh + kept)
 
     async def _read_calendar(
         self, app: ExternalApp, *, start: datetime, end: datetime, now: datetime
@@ -172,7 +189,7 @@ class ServerRefresher:
             self._backoff.note_failure(app_id)
             return False
         self._backoff.note_success(app_id)
-        self._series_cache.save(app_id, tuple(series))
+        await asyncio.to_thread(self._series_cache.save, app_id, tuple(series))
         return True
 
     async def _refresh_series(self, apps: list[ExternalApp]) -> bool:
@@ -186,19 +203,12 @@ class ServerRefresher:
     # --- one place for the outbound-TLS dance ---
 
     def _radarr_client(self, app_id: str, *, timeout: float) -> RadarrClient:
-        return self._apps.build_client(app_id, timeout=timeout, **self._tls())
+        return self._apps.build_client(app_id, timeout=timeout, **self._settings.outbound_tls())
 
     def _sonarr_client(self, app_id: str, *, timeout: float) -> SonarrClient:
-        return self._apps.build_sonarr_client(app_id, timeout=timeout, **self._tls())
-
-    def _tls(self) -> dict[str, object]:
-        """The app's own outbound-TLS settings — never anything a form can influence."""
-        return {
-            "tls_verify": self._settings.outbound_tls_verify,
-            "ca_file": (
-                str(self._settings.tls_ca_file) if self._settings.tls_ca_file else None
-            ),
-        }
+        return self._apps.build_sonarr_client(
+            app_id, timeout=timeout, **self._settings.outbound_tls()
+        )
 
 
 async def _queue_or_empty(client: RadarrClient | SonarrClient) -> dict[int, float]:

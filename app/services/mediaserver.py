@@ -42,6 +42,12 @@ MEDIA_SERVER_FILENAME = "mediaserver.yml"
 # keeps working with no action; the next save writes the new name and removes this one.
 LEGACY_PLEX_FILENAME = "plex.yml"
 SERVER_KEY = "server"
+# The stored record's own field names. Named rather than repeated as literals in `load`
+# and `save` because `app.core.crypto` now mirrors the token one to rotate it, and a pin
+# test compares the two — a literal on each side would be two places to drift.
+URL_FIELD = "url"
+TOKEN_FIELD = "token_encrypted"  # noqa: S105 — field name, not a secret
+KIND_FIELD = "kind"
 
 # Which server this connection is. The store owns its vocabulary the way users.py owns
 # THEMES: read-tolerant on load (an unknown kind is a Plex install from before kinds
@@ -227,9 +233,9 @@ class MediaServerStore:
         if not isinstance(stored, dict):
             return None
         return MediaServerConnection(
-            url=str(stored.get("url", "")),
-            token_encrypted=str(stored.get("token_encrypted", "")),
-            kind=validated_kind(stored.get("kind")),
+            url=str(stored.get(URL_FIELD, "")),
+            token_encrypted=str(stored.get(TOKEN_FIELD, "")),
+            kind=validated_kind(stored.get(KIND_FIELD)),
         )
 
     def save(
@@ -259,9 +265,9 @@ class MediaServerStore:
         filestore.write_yaml(
             self._path,
             {SERVER_KEY: {
-                "url": server.url,
-                "token_encrypted": server.token_encrypted,
-                "kind": server.kind,
+                URL_FIELD: server.url,
+                TOKEN_FIELD: server.token_encrypted,
+                KIND_FIELD: server.kind,
             }},
             schema_version=MEDIA_SERVER_SCHEMA_VERSION,
         )
@@ -284,10 +290,21 @@ class MediaServerStore:
         return True
 
     def decrypt_token(self) -> str:
+        """The stored secret in plaintext.
+
+        A ciphertext this build's encryption key cannot open is reported as
+        `MediaServerError` rather than escaping as `DecryptionError`. Every caller
+        already catches that — the client builder, the render-path snapshot, and the
+        Settings test, which reaches this method WITHOUT going through `build_client` —
+        so a key/file mismatch degrades to "could not reach it" instead of a traceback.
+        """
         server = self.load()
         if server is None:
             raise PlexError("no Plex connection is configured")
-        return crypto.decrypt_field(server.token_encrypted, self._key)
+        try:
+            return crypto.decrypt_field(server.token_encrypted, self._key)
+        except crypto.DecryptionError as exc:
+            raise MediaServerError(crypto.UNREADABLE_CREDENTIAL_MESSAGE) from exc
 
     def build_client(
         self, *, tls_verify: bool, ca_file: str | None, timeout: float | None = None

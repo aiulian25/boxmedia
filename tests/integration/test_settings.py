@@ -966,6 +966,68 @@ def test_an_unreachable_provider_says_so(harness: AppHarness) -> None:
     assert "Trakt" in response.text
 
 
+def test_the_discovery_probe_ignores_the_home_server_tls_escape_hatch(
+    tmp_path, monkeypatch
+) -> None:
+    """Both Test buttons probe against the system trust store.
+
+    They used to carry the app's outbound-TLS settings, which are for the user's OWN
+    servers: `BM_TLS_CA_FILE` builds a context trusting only that CA, so the button
+    failed on exactly the installs that set it, and `BM_OUTBOUND_TLS_VERIFY=false`
+    silently stopped verifying a public API. Passing nothing leaves the probe on its own
+    full-verification default.
+    """
+    from app.services.discovery import ProbeResult
+    from tests.conftest import build_harness
+
+    seen: list[dict] = []
+
+    async def recorder(secret: str, **kwargs: object) -> str:
+        seen.append(kwargs)
+        return ProbeResult.OK
+
+    ca_file = tmp_path / "home-ca.pem"
+    ca_file.write_text("-----BEGIN CERTIFICATE-----\nnot a real CA\n-----END CERTIFICATE-----\n")
+    harness = build_harness(tmp_path, outbound_tls_verify=False, tls_ca_file=ca_file)
+    harness.activate()
+    _save_keys(harness)
+    monkeypatch.setattr("app.web.settings.probe_tmdb", recorder)
+
+    harness.client.post(
+        "/settings/discovery/test",
+        data={"provider": "tmdb", "tmdb_key": TMDB_KEY, "trakt_client_id": ""},
+    )
+
+    assert seen == [{}], f"the probe was handed a TLS override: {seen}"
+
+
+def test_testing_a_stored_key_that_will_not_decrypt_blames_neither_provider(
+    harness: AppHarness,
+) -> None:
+    """A key this install's encryption key cannot open is its own verdict.
+
+    Deliberately NOT "TMDB rejected the API key": TMDB was never asked. No respx mock, so
+    a regression that started probing would fail here on an unmocked request.
+    """
+    from app.core import crypto
+    from app.services.discovery import DiscoveryStore
+
+    harness.activate()
+    _save_keys(harness)
+    harness.client.app.state.discovery = DiscoveryStore(
+        harness.settings.config_dir, key=crypto.generate_key()
+    )
+
+    response = harness.client.post(
+        "/settings/discovery/test",
+        data={"provider": "tmdb", "tmdb_key": "", "trakt_client_id": ""},
+    )
+
+    assert "can’t be read" in response.text
+    assert "rejected the API key" not in response.text
+    assert "Could not reach" not in response.text
+
+
 def test_testing_with_nothing_typed_and_nothing_stored_is_not_a_probe(
     harness: AppHarness,
 ) -> None:

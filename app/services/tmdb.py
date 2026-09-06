@@ -28,6 +28,7 @@ from datetime import date
 
 import httpx
 
+from app.core.values import float_or_none, int_or_none
 from app.services.discovery import (
     TMDB_BASE_URL,
     TMDB_IMAGE_BASE_URL,
@@ -36,6 +37,7 @@ from app.services.discovery import (
     scrub,
 )
 from app.services.posters import HEADSHOT_WIDTH, POSTER_WIDTH
+from app.services.reports import youtube_url
 
 REQUEST_TIMEOUT_SECONDS = 10.0
 # TMDB answers in the language you ask for. One constant so a future locale is a single
@@ -168,17 +170,6 @@ def image_url(path: object, width: str = POSTER_WIDTH) -> str | None:
     return f"{TMDB_IMAGE_BASE_URL}/{width}{path}"
 
 
-def _int_or_none(value: object) -> int | None:
-    """A real integer, or None. `bool` is an int in Python and would become 0/1."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _float_or_none(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    return float(value)
-
-
 def _air_date(value: object) -> date | None:
     """TMDB's `YYYY-MM-DD`, or None.
 
@@ -209,7 +200,7 @@ def _show_from(item: dict) -> TmdbShow:
     """One `/discover/tv` or `/search/tv` row -> TmdbShow. Shared so the two can never
     drift in what they read — `radarr._library_movie`'s reason."""
     return TmdbShow(
-        tmdb_id=_int_or_none(item.get("id")) or 0,
+        tmdb_id=int_or_none(item.get("id")) or 0,
         # TMDB calls a series' title `name`; `title` is the movie field. Both are read so
         # a row from a multi-search still lands with something in it.
         title=item.get("name") or item.get("title") or "",
@@ -217,7 +208,7 @@ def _show_from(item: dict) -> TmdbShow:
         overview=item.get("overview") or None,
         poster_url=image_url(item.get("poster_path")),
         backdrop_url=image_url(item.get("backdrop_path"), BACKDROP_WIDTH),
-        rating=_float_or_none(item.get("vote_average")),
+        rating=float_or_none(item.get("vote_average")),
         original_language=item.get("original_language") or None,
     )
 
@@ -256,7 +247,7 @@ def _trailer_url(videos: object) -> str | None:
             continue
         key = entry.get("key")
         if entry.get("site") == "YouTube" and entry.get("type") == "Trailer" and key:
-            return f"https://www.youtube.com/watch?v={key}"
+            return youtube_url(key)
     return None
 
 
@@ -267,14 +258,14 @@ def _seasons(items: object) -> tuple[TmdbSeason, ...]:
     for entry in items:
         if not isinstance(entry, dict):
             continue
-        number = _int_or_none(entry.get("season_number"))
+        number = int_or_none(entry.get("season_number"))
         if number is None:
             continue
         seasons.append(
             TmdbSeason(
                 season_number=number,
                 name=entry.get("name") or f"Season {number}",
-                episode_count=_int_or_none(entry.get("episode_count")) or 0,
+                episode_count=int_or_none(entry.get("episode_count")) or 0,
                 air_date=_air_date(entry.get("air_date")),
                 overview=entry.get("overview") or None,
                 poster_url=image_url(entry.get("poster_path")),
@@ -445,23 +436,23 @@ class TmdbClient:
         run_times = item.get("episode_run_time")
         run_time = None
         if isinstance(run_times, list) and run_times:
-            run_time = _int_or_none(run_times[0])
+            run_time = int_or_none(run_times[0])
         return TmdbShowDetail(
-            tmdb_id=_int_or_none(item.get("id")) or tmdb_id,
+            tmdb_id=int_or_none(item.get("id")) or tmdb_id,
             title=item.get("name") or "",
             first_air_date=_air_date(item.get("first_air_date")),
             overview=item.get("overview") or None,
             poster_url=image_url(item.get("poster_path")),
             backdrop_url=image_url(item.get("backdrop_path"), BACKDROP_WIDTH),
-            rating=_float_or_none(item.get("vote_average")),
+            rating=float_or_none(item.get("vote_average")),
             genres=_names(item.get("genres")),
             networks=_names(item.get("networks")),
             status=item.get("status") or None,
             episode_run_time=run_time,
-            number_of_seasons=_int_or_none(item.get("number_of_seasons")),
-            number_of_episodes=_int_or_none(item.get("number_of_episodes")),
+            number_of_seasons=int_or_none(item.get("number_of_seasons")),
+            number_of_episodes=int_or_none(item.get("number_of_episodes")),
             in_production=bool(item.get("in_production", False)),
-            tvdb_id=_int_or_none(external.get("tvdb_id")),
+            tvdb_id=int_or_none(external.get("tvdb_id")),
             imdb_id=external.get("imdb_id") or None,
             certification=_certification(item.get("content_ratings")),
             trailer_url=_trailer_url(item.get("videos")),
@@ -479,7 +470,7 @@ class TmdbClient:
         payload = await self._request(f"/tv/{tmdb_id}/external_ids")
         if not isinstance(payload, dict):
             raise TmdbError("unexpected TMDB external-ids response shape")
-        return _int_or_none(payload.get("tvdb_id"))
+        return int_or_none(payload.get("tvdb_id"))
 
 
 def _rows(payload: object) -> list[TmdbShow]:

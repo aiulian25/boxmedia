@@ -36,6 +36,7 @@ import httpx
 from app import __version__
 from app.core import crypto, filestore
 from app.core.audit import AuditAction, AuditLog
+from app.core.values import float_or_none, int_or_none
 
 DISCOVERY_SCHEMA_VERSION = 1
 DISCOVERY_FILENAME = "discovery.yml"
@@ -224,11 +225,19 @@ class DiscoveryStore:
 
         The only path out of this store that yields a value, and it exists for exactly
         two callers: the clients that must send it, and the Test buttons.
+
+        A stored value this build's encryption key cannot open raises `DiscoveryError`
+        rather than letting `DecryptionError` escape: the key and the file have come
+        apart, which the pages above report as a state of their own rather than as a
+        crash. None still means "nothing stored", which is a different thing entirely.
         """
         stored = self._load_raw().get(self._field_for(provider))
         if not stored:
             return None
-        return crypto.decrypt_field(str(stored), self._key)
+        try:
+            return crypto.decrypt_field(str(stored), self._key)
+        except crypto.DecryptionError as exc:
+            raise DiscoveryError(crypto.UNREADABLE_CREDENTIAL_MESSAGE) from exc
 
     def tmdb_key(self) -> str | None:
         return self.decrypt(PROVIDER_TMDB)
@@ -296,8 +305,7 @@ def _show_from_document(entry: object) -> DiscoverShow | None:
         return None
 
     def integer(key: str) -> int | None:
-        value = entry.get(key)
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
+        return int_or_none(entry.get(key))
 
     def text(key: str) -> str | None:
         value = entry.get(key)
@@ -308,11 +316,7 @@ def _show_from_document(entry: object) -> DiscoverShow | None:
         tmdb_id=integer("tmdb_id"), tvdb_id=integer("tvdb_id"), imdb_id=text("imdb_id"),
         trakt_id=integer("trakt_id"), title=title, year=integer("year"),
         overview=text("overview"), poster_url=text("poster_url"),
-        rating=(
-            float(rating)
-            if isinstance(rating, int | float) and not isinstance(rating, bool)
-            else None
-        ),
+        rating=float_or_none(rating),
         watchers=integer("watchers"), list_count=integer("list_count"),
     )
 

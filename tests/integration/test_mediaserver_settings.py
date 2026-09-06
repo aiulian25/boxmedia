@@ -556,3 +556,32 @@ def test_a_jellyfin_library_refreshes_through_the_same_button(harness: AppHarnes
     assert cached[0].holds(52001, None, "x", None) == "yes"
     # And the collection id did not become a film, end to end.
     assert cached[0].holds(9999, None, "x", None) is None
+
+
+def test_a_stored_token_that_will_not_decrypt_blames_neither_the_server_nor_the_address(
+    harness: AppHarness,
+) -> None:
+    """Testing with the field left blank reaches `decrypt_token` WITHOUT going through
+    `build_client`, so this path needs the mapping in its own right.
+
+    The verdict is its own: nothing was asked of the server, so "rejected the credential"
+    and "could not reach it" would both be claims about a request never made. No respx
+    mock, so a regression that started probing would fail on an unmocked request.
+    """
+    from app.core import crypto
+    from app.services.mediaserver import MediaServerStore
+
+    harness.activate()
+    _connect(harness)
+    harness.client.app.state.media_server = MediaServerStore(
+        harness.settings.config_dir, key=crypto.generate_key()
+    )
+
+    response = harness.client.post(
+        "/settings/media-server/test-credentials",
+        data={"url": PLEX_URL, "token": "", "kind": KIND_PLEX},
+    )
+
+    assert "can’t be read" in response.text
+    assert "rejected the credential" not in response.text
+    assert "Could not reach it" not in response.text

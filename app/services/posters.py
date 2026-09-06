@@ -110,8 +110,10 @@ class PosterCache:
             self._failed_at[url] = time.monotonic()
             return False
         # Atomic write (temp + fsync + rename) so an interrupted download never leaves a
-        # torn JPEG that would then be served — and backed up — forever.
-        atomic_write_bytes(target, payload)
+        # torn JPEG that would then be served — and backed up — forever. On a worker
+        # thread: the fsync, and any wait for the filestore lock, must not stop the
+        # event loop once per new image on a poster-heavy page.
+        await asyncio.to_thread(atomic_write_bytes, target, payload)
         return True
 
     async def _download(self, client: httpx.AsyncClient, url: str) -> bytes | None:

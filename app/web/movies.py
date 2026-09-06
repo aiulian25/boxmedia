@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.services.posters import HEADSHOT_WIDTH, POSTER_WIDTH, sized
 from app.services.radarr import CreditPerson, MovieDetail, RadarrError, RadarrMovie
-from app.services.reports import imdb_url
+from app.services.reports import imdb_url, youtube_url
 from app.web.deps import (
     DETAIL_STATUS_MESSAGES,
     RADARR_LIBRARY_TIMEOUT_SECONDS,
@@ -319,11 +319,7 @@ async def movie_detail(request: Request, tmdb_id: int) -> HTMLResponse:
             # The shared builder, not a third copy of the format: it already returns None
             # for a missing id, and it exists so every IMDb link in the app agrees.
             "imdb_url": imdb_url(detail.imdb_id),
-            "trailer_url": (
-                f"https://www.youtube.com/watch?v={detail.trailer_id}"
-                if detail.trailer_id
-                else None
-            ),
+            "trailer_url": youtube_url(detail.trailer_id),
             "website": safe_external_url(detail.website),
             "in_library": in_library is not None,
             "holders": holders,

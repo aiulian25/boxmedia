@@ -13,15 +13,23 @@ are different claims and only one of them is true.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from app.core.config import Settings
 from app.services.apps import KIND_RADARR, KIND_SONARR, ExternalApp, InvalidAppError
 from app.services.backoff import RadarrBackoff
-from app.services.calendar import KIND_MOVIE, KIND_SERIES, CalendarCache
+from app.services.calendar import (
+    KIND_MOVIE,
+    KIND_SERIES,
+    STATE_MONITORED,
+    CalendarCache,
+    CalendarEntry,
+)
 from app.services.radarr import RELEASE_DIGITAL, RadarrError, RadarrRelease
 from app.services.refresh import ServerRefresher
 from app.services.series import SeriesLibraryCache
@@ -124,6 +132,19 @@ def _app(app_id: str, name: str, kind: str) -> ExternalApp:
     )
 
 
+def _settings(*, tls_verify: bool = True, ca_file: object = None) -> Settings:
+    """A real Settings rather than a stand-in. `Settings.outbound_tls()` is what the
+    refresher calls, and it is where the CA-file-to-string conversion now lives — so a
+    duck-typed stub would leave the assertions below testing nothing at all."""
+    return Settings(
+        _env_file=None,
+        session_secret="s" * 40,
+        encryption_key_file=Path("/secrets/boxmedia.key"),
+        outbound_tls_verify=tls_verify,
+        tls_ca_file=ca_file,
+    )
+
+
 def _refresher(
     tmp_path: Path,
     apps: list[ExternalApp],
@@ -134,7 +155,7 @@ def _refresher(
 ) -> ServerRefresher:
     return ServerRefresher(
         apps=_StubApps(apps, clients),
-        settings=SimpleNamespace(outbound_tls_verify=tls_verify, tls_ca_file=ca_file),
+        settings=_settings(tls_verify=tls_verify, ca_file=ca_file),
         calendar_cache=CalendarCache(tmp_path),
         series_cache=SeriesLibraryCache(tmp_path),
         backoff=RadarrBackoff(),
@@ -448,7 +469,7 @@ class TestTheOutboundTlsSettings:
         )
         refresher = ServerRefresher(
             apps=apps,
-            settings=SimpleNamespace(outbound_tls_verify=verify, tls_ca_file=None),
+            settings=_settings(tls_verify=verify),
             calendar_cache=CalendarCache(tmp_path),
             series_cache=SeriesLibraryCache(tmp_path),
             backoff=RadarrBackoff(),
@@ -464,9 +485,7 @@ class TestTheOutboundTlsSettings:
         )
         refresher = ServerRefresher(
             apps=apps,
-            settings=SimpleNamespace(
-                outbound_tls_verify=True, tls_ca_file=tmp_path / "ca.pem"
-            ),
+            settings=_settings(ca_file=tmp_path / "ca.pem"),
             calendar_cache=CalendarCache(tmp_path),
             series_cache=SeriesLibraryCache(tmp_path),
             backoff=RadarrBackoff(),
@@ -474,3 +493,52 @@ class TestTheOutboundTlsSettings:
         asyncio.run(refresher.calendar())
 
         assert apps.tls_seen[0]["ca_file"] == str(tmp_path / "ca.pem")
+
+
+# --- review step 7: the merge is a read-modify-write, off the loop but still atomic ---
+
+# Long enough that both threads are past the read before either write lands.
+MERGE_WINDOW_SECONDS = 0.05
+
+
+def _entry(connection: str) -> CalendarEntry:
+    return CalendarEntry(
+        kind=KIND_MOVIE, title=f"Arrival from {connection}", sub="Digital",
+        when=TONIGHT, state=STATE_MONITORED, connection=connection,
+    )
+
+
+def test_two_overlapping_calendar_merges_keep_both_weeks(tmp_path: Path, monkeypatch) -> None:
+    """The morning job and a page render that found the cache stale both call `calendar`,
+    and the merge now runs on a worker thread. Read and write have to stay one step, or
+    the later writer builds its document from a read that predates the earlier one's
+    write and drops that connection's whole week.
+    """
+    refresher = _refresher(tmp_path, [], {})
+    cache = refresher._calendar_cache
+    original_load = cache.load
+
+    def load_slowly() -> list[CalendarEntry]:
+        entries = original_load()
+        time.sleep(MERGE_WINDOW_SECONDS)
+        return entries
+
+    monkeypatch.setattr(cache, "load", load_slowly)
+
+    # Each writer refreshed one connection and keeps whatever the other one left behind.
+    threads = [
+        threading.Thread(
+            target=refresher._merge_calendar,
+            args=([_entry(mine)], {theirs}),
+        )
+        for mine, theirs in ((RADARR_CONNECTION, SONARR_CONNECTION),
+                             (SONARR_CONNECTION, RADARR_CONNECTION))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert {entry.connection for entry in original_load()} == {
+        RADARR_CONNECTION, SONARR_CONNECTION
+    }

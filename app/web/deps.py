@@ -224,8 +224,7 @@ def radarr_client_for(
     settings = request.app.state.settings
     return request.app.state.apps.build_client(
         app_id,
-        tls_verify=settings.outbound_tls_verify,
-        ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+        **settings.outbound_tls(),
         timeout=timeout,
     )
 
@@ -237,8 +236,7 @@ def sonarr_client_for(
     settings = request.app.state.settings
     return request.app.state.apps.build_sonarr_client(
         app_id,
-        tls_verify=settings.outbound_tls_verify,
-        ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+        **settings.outbound_tls(),
         timeout=timeout,
     )
 
@@ -255,8 +253,7 @@ def sonarr_client_for_credentials_dep(
     return sonarr_client_for_credentials(
         url,
         api_key,
-        tls_verify=settings.outbound_tls_verify,
-        ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+        **settings.outbound_tls(),
         timeout=timeout,
     )
 
@@ -273,8 +270,7 @@ def radarr_client_for_credentials(
     return client_for_credentials(
         url,
         api_key,
-        tls_verify=settings.outbound_tls_verify,
-        ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+        **settings.outbound_tls(),
         timeout=timeout,
     )
 
@@ -362,8 +358,7 @@ async def load_media_server_snapshot(request: Request) -> MediaServerSnapshot | 
     settings = request.app.state.settings
     try:
         client = store.build_client(
-            tls_verify=settings.outbound_tls_verify,
-            ca_file=str(settings.tls_ca_file) if settings.tls_ca_file else None,
+            **settings.outbound_tls(),
             timeout=RENDER_FETCH_TIMEOUT_SECONDS,
         )
         # Only walk the TV library when there is a Sonarr to compare it against.
@@ -378,7 +373,7 @@ async def load_media_server_snapshot(request: Request) -> MediaServerSnapshot | 
         backoff.note_failure(MEDIA_SERVER_BACKOFF_KEY)
         return stale
     backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)
-    cache.save(fetch)
+    await asyncio.to_thread(cache.save, fetch)
     return snapshot_from_library(
         fetch.movies, series=fetch.series, truncated=fetch.truncated
     )
@@ -408,7 +403,7 @@ async def load_radarr_options(request: Request, app_id: str | None = None) -> Ra
     # Only rewrite the cache when the options actually changed — otherwise every page
     # view churns radarr_options.yml under the global filestore write lock for nothing.
     if options != cache.load(app_id):
-        cache.save(app_id, options)
+        await asyncio.to_thread(cache.save, app_id, options)
     return options
 
 
@@ -435,7 +430,7 @@ async def load_sonarr_options(request: Request, app_id: str) -> RadarrOptions:
     # Only rewrite the cache when the options actually changed — otherwise every page
     # view churns sonarr_options.yml under the global filestore write lock for nothing.
     if options != cache.load(app_id):
-        cache.save(app_id, options)
+        await asyncio.to_thread(cache.save, app_id, options)
     return options
 
 

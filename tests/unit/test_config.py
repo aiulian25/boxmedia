@@ -33,18 +33,28 @@ def test_short_secret_is_rejected() -> None:
 
 def test_valid_config_loads_with_defaults() -> None:
     settings = _settings()
-    assert settings.port == 8686
     assert settings.host_port == 58546
     assert settings.outbound_tls_verify is True
     assert settings.url_base == ""
 
 
 @pytest.mark.parametrize("bad_port", [0, -1, 65536, 98546])
-def test_out_of_range_ports_rejected(bad_port: int) -> None:
-    with pytest.raises(ValidationError):
-        _settings(port=bad_port)
+def test_an_out_of_range_host_port_is_rejected(bad_port: int) -> None:
     with pytest.raises(ValidationError):
         _settings(host_port=bad_port)
+
+
+def test_an_env_that_still_carries_bm_port_starts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`BM_PORT` was removed, not renamed, so every install whose .env still sets it has
+    to keep starting. `extra="ignore"` on the model is the whole reason that is true,
+    which makes it a promise worth pinning rather than a detail.
+    """
+    monkeypatch.setenv("BM_PORT", "9000")
+
+    settings = _settings()
+
+    assert not hasattr(settings, "port"), "the inert setting is gone"
+    assert settings.host_port == 58546  # and the one that does something is untouched
 
 
 def test_url_base_normalized() -> None:
@@ -55,6 +65,18 @@ def test_url_base_normalized() -> None:
 def test_url_base_without_leading_slash_rejected() -> None:
     with pytest.raises(ValidationError):
         _settings(url_base="boxmedia")
+
+
+def test_outbound_tls_hands_every_client_the_same_two_arguments() -> None:
+    """Ten call sites spread this dict, so the CA-file-to-string conversion happens in
+    exactly one place. A Path that reached a client unconverted would fail deep inside
+    ssl, at request time, on whichever connection was tried first."""
+    assert _settings().outbound_tls() == {"tls_verify": True, "ca_file": None}
+
+    configured = _settings(outbound_tls_verify=False, tls_ca_file="/secrets/ca.pem").outbound_tls()
+
+    assert configured == {"tls_verify": False, "ca_file": "/secrets/ca.pem"}
+    assert isinstance(configured["ca_file"], str), "a Path here breaks ssl at request time"
 
 
 def test_public_summary_excludes_secrets() -> None:

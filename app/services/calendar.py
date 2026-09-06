@@ -41,6 +41,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from app.core import filestore
+from app.core.values import float_or_none, int_or_none
 from app.services.radarr import RadarrRelease
 from app.services.sonarr import SonarrCalendarEpisode
 
@@ -217,10 +218,6 @@ def _entry_from_document(row: object) -> CalendarEntry | None:
     except ValueError:
         return None
 
-    def integer(key: str) -> int | None:
-        value = row.get(key)
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
     progress = row.get("progress")
     return CalendarEntry(
         kind=KIND_SERIES if row.get("kind") == KIND_SERIES else KIND_MOVIE,
@@ -229,13 +226,9 @@ def _entry_from_document(row: object) -> CalendarEntry | None:
         when=parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC),
         state=row.get("state") if isinstance(row.get("state"), str) else STATE_MONITORED,
         connection=row.get("connection") if isinstance(row.get("connection"), str) else "",
-        tmdb_id=integer("tmdb_id"),
-        tvdb_id=integer("tvdb_id"),
-        progress=(
-            float(progress)
-            if isinstance(progress, int | float) and not isinstance(progress, bool)
-            else None
-        ),
+        tmdb_id=int_or_none(row.get("tmdb_id")),
+        tvdb_id=int_or_none(row.get("tvdb_id")),
+        progress=float_or_none(progress),
     )
 
 
