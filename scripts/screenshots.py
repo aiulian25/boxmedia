@@ -271,16 +271,6 @@ def _seed(harness) -> None:
         movies=(), truncated=False,
         series=(MediaServerSeries(title="Verdigris", year=2026, tvdb_id=402),),
     ))
-    _unused = tuple(
-        SonarrSeries(
-            sonarr_id=index, tvdb_id=100 + index, title=title, year=year,
-            monitored=True, ended=False, episode_count=total, episode_file_count=have,
-            poster_url=_poster_url(title), path=f"/tv/{normalize_title(title)}",
-            imdb_id=None, tmdb_id=1400 + index,
-            title_slug=normalize_title(title).replace(" ", "-"),
-        )
-        for index, (title, _, year, total, have) in enumerate(SERIES, start=1)
-    )
 
     harness.client.app.state.discover_cache.save({
         TRENDING_KEY: tuple(
