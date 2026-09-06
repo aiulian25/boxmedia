@@ -20,8 +20,10 @@ import io
 import json
 import shutil
 import tarfile
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 from secrets import token_hex
 
@@ -54,11 +56,26 @@ BACKUP_TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
 MANIFEST_NAME = "MANIFEST.json"
 MANIFEST_SCHEMA_VERSION = 1
 DEFAULT_KEEP = 10
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB cap on external restore uploads
+# An import is resident three times over — the upload, its plaintext and the tree
+# extracted from it — so this bounds the peak against the runtime's memory limit.
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # 64 MB cap on external restore uploads
 CONFIG_SUBDIR = "config"
 HISTORY_SUBDIR = "history"
+LOGS_SUBDIR = "logs"
+CACHE_SUBDIR = "cache"
 # Top-level data subdirs a backup captures and a restore swaps (never "backups").
-_SNAPSHOT_SUBDIRS = (CONFIG_SUBDIR, HISTORY_SUBDIR, "logs", "cache")
+_SNAPSHOT_SUBDIRS = (CONFIG_SUBDIR, HISTORY_SUBDIR, LOGS_SUBDIR, CACHE_SUBDIR)
+# The subset a restore has to see as a single moment, and so the only part read with
+# writers quiesced. The poster cache is derived and content-addressed: a poster
+# written or pruned mid-read cannot make the archive disagree with itself. It is also
+# the one subdir with no ceiling, so holding the lock across it stalls every write in
+# the process — a scheduled run included — for as long as reading it takes.
+_CONSISTENT_SUBDIRS = (CONFIG_SUBDIR, HISTORY_SUBDIR, LOGS_SUBDIR)
+# Derived rather than listed, so a subdir added to the snapshot above cannot be
+# silently left out of one.
+_STREAMED_SUBDIRS = tuple(
+    subdir for subdir in _SNAPSHOT_SUBDIRS if subdir not in _CONSISTENT_SUBDIRS
+)
 
 # Mirrored from app.services.filters, which imports THIS module — importing it back
 # would be a circular import. A test pins these equal to the real ones so they cannot
@@ -193,9 +210,12 @@ class BackupService:
         # Random suffix so two backups in the same second (e.g. a manual backup
         # immediately followed by the pre-restore safety backup) never collide.
         name = f"{BACKUP_PREFIX}{timestamp}-{token_hex(2)}{BACKUP_SUFFIX}"
-        # Quiesce writes so the archive is a consistent snapshot (flat-file "dump").
+        # Quiesce writes only across the stores that have to agree with each other.
+        # The poster cache and every byte of compression follow unlocked — they are
+        # the slow part, and neither needs writers held still.
         with filestore.write_lock():
-            plaintext = self._build_archive()
+            consistent = self._collect(_CONSISTENT_SUBDIRS)
+        plaintext = self._pack(chain(consistent, self._read_files(_STREAMED_SUBDIRS)))
         blob = crypto.encrypt_bytes(plaintext, self._key)
         self._backups_dir.mkdir(parents=True, exist_ok=True)
         filestore.atomic_write_bytes(self._backups_dir / name, blob)
@@ -204,23 +224,37 @@ class BackupService:
         self._audit.record(AuditAction.BACKUP_CREATED, name=name, reason=reason)
         return name
 
-    def _build_archive(self) -> bytes:
+    def _read_files(self, subdirs: tuple[str, ...]) -> Iterator[tuple[str, bytes]]:
+        """Yield (archive name, bytes) for each file under `subdirs`, one at a time."""
+        for subdir in subdirs:
+            source = self._data_dir / subdir
+            if not source.exists():
+                continue
+            for path in sorted(source.rglob("*")):
+                if not path.is_file():
+                    continue
+                yield str(path.relative_to(self._data_dir)), path.read_bytes()
+
+    def _collect(self, subdirs: tuple[str, ...]) -> list[tuple[str, bytes]]:
+        """Read `subdirs` eagerly. Being eager is the entire point: the caller holds
+        the write lock, and these files have to be off disk before it lets go.
+
+        Only ever called for the bounded stores — config, the retained reports and the
+        rotated audit logs. The poster cache has no ceiling, so it is streamed through
+        `_read_files` instead of being held in memory alongside the archive.
+        """
+        return list(self._read_files(subdirs))
+
+    def _pack(self, files: Iterable[tuple[str, bytes]]) -> bytes:
+        """Compress (archive name, bytes) pairs into the manifest-bearing tar."""
         buffer = io.BytesIO()
         checksums: dict[str, str] = {}
         with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
-            for subdir in _SNAPSHOT_SUBDIRS:
-                source = self._data_dir / subdir
-                if not source.exists():
-                    continue
-                for path in sorted(source.rglob("*")):
-                    if not path.is_file():
-                        continue
-                    arcname = str(path.relative_to(self._data_dir))
-                    data = path.read_bytes()
-                    checksums[arcname] = hashlib.sha256(data).hexdigest()
-                    info = tarfile.TarInfo(name=arcname)
-                    info.size = len(data)
-                    tar.addfile(info, io.BytesIO(data))
+            for arcname, data in files:
+                checksums[arcname] = hashlib.sha256(data).hexdigest()
+                info = tarfile.TarInfo(name=arcname)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
             manifest = json.dumps(
                 {
                     "schema_version": MANIFEST_SCHEMA_VERSION,

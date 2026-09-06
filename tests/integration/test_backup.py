@@ -14,6 +14,7 @@ from app.core import crypto, filestore
 from app.core.audit import AuditLog
 from app.core.config import Settings
 from app.services.backup import (
+    _CONSISTENT_SUBDIRS,
     BACKUP_TIMESTAMP_FORMAT,
     MANIFEST_NAME,
     MAX_UPLOAD_BYTES,
@@ -256,6 +257,57 @@ def test_created_at_from_name_handles_odd_names() -> None:
     assert created_at_from_name("boxmedia-nonsense.backup") is None
     parsed = created_at_from_name("boxmedia-20260814-102956-eada.backup")
     assert (parsed.year, parsed.month, parsed.day, parsed.hour) == (2026, 8, 14, 10)
+
+
+# --- create quiesces writers only for what needs it (review step 6) ---
+
+
+def test_the_write_lock_is_released_before_the_archive_is_packed(tmp_path: Path) -> None:
+    """Reading the poster cache and gzipping the tree is the slow part of a backup, and
+    neither needs writers held still. Holding the lock across them stalls every write in
+    the process — a scheduled run included — for as long as the whole backup takes."""
+    settings, key = _make_settings(tmp_path, "packing")
+    service = _service(settings, key)
+    _seed_report(settings)
+    (settings.cache_dir / "posters" / "p.jpg").write_bytes(b"poster-bytes")
+
+    held_during_pack: list[bool] = []
+    original_pack = service._pack
+
+    def recording_pack(files):
+        held_during_pack.append(filestore.write_lock().locked())
+        return original_pack(files)
+
+    service._pack = recording_pack
+    name = service.create()
+
+    assert held_during_pack == [False]
+    # And the cache was read after the lock rather than dropped from the archive.
+    blob = (settings.backups_dir / name).read_bytes()
+    names = tarfile.open(fileobj=io.BytesIO(crypto.decrypt_bytes(blob, key))).getnames()
+    assert "cache/posters/p.jpg" in names
+
+
+def test_the_stores_that_must_agree_are_still_read_under_the_lock(tmp_path: Path) -> None:
+    """The other half of narrowing the lock. Config, history and the audit logs still
+    have to leave disk as one moment, or a restore can resurrect a half-written set —
+    filters.yml from after a change and apps.yml from before it."""
+    settings, key = _make_settings(tmp_path, "consistent")
+    service = _service(settings, key)
+    _seed_report(settings)
+
+    reads: list[tuple[tuple[str, ...], bool]] = []
+    original_collect = service._collect
+
+    def recording_collect(subdirs):
+        reads.append((subdirs, filestore.write_lock().locked()))
+        return original_collect(subdirs)
+
+    service._collect = recording_collect
+    service.create()
+
+    assert reads == [(_CONSISTENT_SUBDIRS, True)]
+    assert not filestore.write_lock().locked()
 
 
 # --- the swap runs under the filestore write lock (review step 4) ---
