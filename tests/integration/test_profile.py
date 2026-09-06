@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from app.core.sessions import COOKIE_NAME
 from app.web.profile import MAX_EMAIL_LENGTH, MAX_USERNAME_LENGTH, ProfileStatus
-from tests.conftest import AppHarness
+from tests.conftest import AppHarness, CsrfClient
 
 NEW_PASSWORD = "second9password"
 
@@ -281,3 +282,68 @@ def test_changing_the_theme_is_csrf_guarded(harness: AppHarness) -> None:
 
     assert response.status_code == 403
     assert "theme: dark" in _user_yml(harness)
+
+
+def test_changing_your_password_ends_every_other_session(harness: AppHarness) -> None:
+    """Changing the password is the answer to "somebody may have my cookie", so the copy
+    has to stop working now rather than in up to BM_SESSION_TTL_HOURS.
+
+    The caller's OWN id has to change too: a stolen cookie is a copy of that id, so
+    sparing it would leave the thief signed in — the one outcome this action exists to
+    prevent.
+    """
+    active = harness.activate()
+    stolen = CsrfClient(harness.client.app)
+    stolen.post(
+        "/login", data={"username": "admin", "password": active}, follow_redirects=False
+    )
+    assert stolen.get("/library", follow_redirects=False).status_code == 200
+    before = harness.client.cookies.get(COOKIE_NAME)
+
+    changed = harness.client.post(
+        "/account/password",
+        data={
+            "current_password": active,
+            "new_password": NEW_PASSWORD,
+            "confirm_password": NEW_PASSWORD,
+        },
+        follow_redirects=False,
+    )
+
+    assert changed.status_code == 303
+    assert ProfileStatus.PASSWORD_CHANGED in changed.headers["location"]
+    # The other holder is out.
+    assert (
+        stolen.get("/library", follow_redirects=False).headers["location"].endswith("/login")
+    )
+    # The caller is still in, on a DIFFERENT id.
+    after = harness.client.cookies.get(COOKIE_NAME)
+    assert after and after != before, "the caller's own session id must be replaced"
+    assert harness.client.get("/library", follow_redirects=False).status_code == 200
+    assert "sessions_reset" in "\n".join(harness.audit_lines())
+    # And it is visible where an admin would look for it, not only in the file.
+    assert "sessions_reset=True" in harness.client.get("/security").text
+
+
+def test_the_caller_can_act_immediately_after_changing_their_password(
+    harness: AppHarness,
+) -> None:
+    """Rotating the id re-derives the CSRF token, so the promise "you stay signed in" has
+    to mean the next action actually works, not just that a GET renders."""
+    active = harness.activate()
+    harness.client.post(
+        "/account/password",
+        data={
+            "current_password": active,
+            "new_password": NEW_PASSWORD,
+            "confirm_password": NEW_PASSWORD,
+        },
+        follow_redirects=False,
+    )
+
+    acted = harness.client.post(
+        "/account/theme", data={"theme": "light"}, follow_redirects=False
+    )
+
+    assert acted.status_code == 303
+    assert ProfileStatus.THEME_UPDATED in acted.headers["location"]

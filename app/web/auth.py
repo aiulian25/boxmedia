@@ -73,6 +73,25 @@ def _set_session_cookie(request: Request, response: RedirectResponse, session_id
     )
 
 
+def rotate_session(request: Request, response: RedirectResponse, username: str) -> None:
+    """Invalidate every session, then sign THIS browser back in on a fresh one.
+
+    What a password change has to do, in one place because both change handlers do it and
+    it is the security-critical half of either.
+
+    EVERY session goes, not merely the other ones. The caller's own id is precisely what
+    a stolen cookie is a copy of, so sparing it would leave the thief signed in — the one
+    outcome changing the password exists to prevent. Issuing a new id immediately keeps
+    the person who just changed it signed in, so nothing about the visible flow changes.
+
+    No `notice`: that one-shot banner reports an actual sign-in, and replaying it here
+    would announce a login that never happened.
+    """
+    sessions = request.app.state.sessions
+    sessions.delete_all()
+    _set_session_cookie(request, response, sessions.create(username))
+
+
 @router.get(LOGIN_PATH)
 def login_form(request: Request) -> object:
     if getattr(request.state, "user", None) is not None:
@@ -176,10 +195,18 @@ def change_password_submit(
         )
 
     request.app.state.audit.record(
-        AuditAction.PASSWORD_CHANGED, actor=user.username, source_ip=client_ip(request)
+        AuditAction.PASSWORD_CHANGED,
+        actor=user.username,
+        source_ip=client_ip(request),
+        # On the same line rather than as a second action: one password change is one
+        # event, and the Security page prints this in its detail column.
+        sessions_reset=True,
     )
     # First-run mini-wizard: with no Radarr connection yet, send the admin straight
     # to Settings to add one rather than to an empty library.
-    if not request.app.state.apps.list_apps():
-        return _redirect(request, SETTINGS_PATH)
-    return _redirect(request, LIBRARY_PATH)
+    needs_a_connection = not request.app.state.apps.list_apps()
+    response = _redirect(request, SETTINGS_PATH if needs_a_connection else LIBRARY_PATH)
+    # The bootstrap password was printed to the container logs, so anyone who read them
+    # could be holding a session right now. This is the moment those stop working.
+    rotate_session(request, response, user.username)
+    return response

@@ -13,6 +13,7 @@ from fastapi.responses import RedirectResponse
 
 from app.core.audit import AuditAction
 from app.services.users import InvalidThemeError, PasswordPolicyError
+from app.web.auth import rotate_session
 from app.web.deps import client_ip, current_user
 
 router = APIRouter()
@@ -74,8 +75,14 @@ def change_own_password(
     except PasswordPolicyError:
         return _back_to_settings(request, ProfileStatus.POLICY)
 
-    audit.record(AuditAction.PASSWORD_CHANGED, actor=user.username, source_ip=ip)
-    return _back_to_settings(request, ProfileStatus.PASSWORD_CHANGED)
+    audit.record(
+        AuditAction.PASSWORD_CHANGED, actor=user.username, source_ip=ip, sessions_reset=True
+    )
+    response = _back_to_settings(request, ProfileStatus.PASSWORD_CHANGED)
+    # Changing your password is the answer to "somebody may have my cookie", so the old
+    # cookies stop working here rather than in up to BM_SESSION_TTL_HOURS.
+    rotate_session(request, response, user.username)
+    return response
 
 
 @router.post("/account/logout-all")

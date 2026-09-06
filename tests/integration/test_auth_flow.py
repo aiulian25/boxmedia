@@ -340,3 +340,34 @@ def test_an_unreachable_radarr_stays_a_page_banner(harness: AppHarness) -> None:
 
     assert "Couldn’t reach Main" in page
     assert "Couldn’t reach Main" not in _toast_markup(page)
+
+
+def test_the_forced_change_ends_every_other_session(harness: AppHarness) -> None:
+    """The bootstrap password is printed to the container logs, so anyone who read them
+    could be holding a session at the moment the admin first signs in. Setting a real
+    password is where those stop working."""
+    from app.core.sessions import COOKIE_NAME
+
+    _login(harness, harness.bootstrap_password)
+    other = CsrfClient(harness.client.app)
+    other.post(
+        "/login",
+        data={"username": "admin", "password": harness.bootstrap_password},
+        follow_redirects=False,
+    )
+    # Both are held at the forced-change screen, which is as far as either gets.
+    assert other.get(LIBRARY, follow_redirects=False).headers["location"].endswith(CHANGE_PW)
+    before = harness.client.cookies.get(COOKIE_NAME)
+
+    changed = harness.client.post(
+        CHANGE_PW,
+        data={"new_password": STRONG_PASSWORD, "confirm_password": STRONG_PASSWORD},
+        follow_redirects=False,
+    )
+
+    assert changed.status_code == 303
+    after = harness.client.cookies.get(COOKIE_NAME)
+    assert after and after != before, "the caller's own session id must be replaced"
+    # The other holder is out; the admin who set the password is not.
+    assert other.get(LIBRARY, follow_redirects=False).headers["location"].endswith(LOGIN)
+    assert harness.client.get(LIBRARY, follow_redirects=False).status_code == 200
