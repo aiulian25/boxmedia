@@ -12,6 +12,12 @@
 #   - BoxMedia uses no Kerberos/GSSAPI (libkrb5 CVEs).
 #   - It parses no untrusted XML (cpython DTD stack overflow).
 #   - It does not use OpenSSL PKCS7_verify, nor http.client for inbound requests.
+#   - It never loads expat (libexpat1 CVEs, added 2026-10-02 at 1.5.0). Verified, not
+#     assumed: in the shipped image, importing every app module, building the app and
+#     serving requests leaves no `pyexpat` or `xml.*` module in sys.modules. The one
+#     markup parser is BeautifulSoup(html, "html.parser"), which is pure Python, and
+#     the image ships no XML backend for it (no lxml, html5lib or defusedxml). The
+#     fixed package is 2.5.0-1+deb12u4; distroless still ships deb12u2.
 # Action: drop these waivers once the distroless base is rebuilt with the fixes,
 # and re-pin its digest.
 
@@ -21,3 +27,11 @@ CVE-2026-40356
 CVE-2026-4224
 CVE-2026-45447
 CVE-2026-6100
+# libexpat1 — see above
+CVE-2024-28757
+CVE-2025-59375
+CVE-2026-25210
+CVE-2026-45186
+CVE-2026-66046
+CVE-2026-76957
+CVE-2026-93990
