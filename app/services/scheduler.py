@@ -17,12 +17,13 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from app.core.audit import AuditAction, AuditLog
+from app.services.backfill import BackfillRunner
 from app.services.backup import DEFAULT_KEEP, BackupError, BackupService
 from app.services.filters import SCHEDULE_MODE_CADENCE
 from app.services.pipeline import Pipeline
 from app.services.radarr import RadarrError
 from app.services.refresh import ServerRefresher
-from app.services.reports import Report, ReportsStore, RunTrigger
+from app.services.reports import Report, ReportsStore, RunStatus, RunTrigger
 from app.services.sonarr import SonarrError
 
 JOB_ID = "weekly-box-office"
@@ -86,6 +87,7 @@ class BoxMediaScheduler:
         backup_keep: int = DEFAULT_KEEP,
         audit: AuditLog | None = None,
         reports: ReportsStore | None = None,
+        backfill: BackfillRunner | None = None,
     ) -> None:
         self._pipeline = pipeline
         self._interval_hours = interval_hours
@@ -102,6 +104,10 @@ class BoxMediaScheduler:
         self._audit = audit
         # Used only to answer "when did a scheduled run last happen" — see _first_run_at.
         self._reports = reports
+        # What makes the schedule headless: after a run, it fetches any week the
+        # history skipped while the container was down, with nobody there to press
+        # the button. Optional like the services above; the app always passes it.
+        self._backfill = backfill
         self._scheduler = AsyncIOScheduler()
 
     def last_run_at(self, reports: list[Report] | None = None) -> datetime | None:
@@ -278,7 +284,33 @@ class BoxMediaScheduler:
         )
 
     async def _run_scheduled(self) -> None:
-        await self._pipeline.run(trigger=RunTrigger.SCHEDULED)
+        report = await self._pipeline.run(trigger=RunTrigger.SCHEDULED)
+        self._fill_missing_weeks(report)
+
+    def _fill_missing_weeks(self, report: Report) -> None:
+        """Fetch every week the history skipped — the half of the schedule nobody sees.
+
+        A scheduled run only ever asks Mojo for its current chart, so a week that came
+        and went while the container was down is simply stepped over. Once this run
+        has stored the latest week, a skipped one sits INSIDE the stored range, which
+        is exactly where `missing_weeks` looks — so the boot catch-up after an outage,
+        and every run after it, closes the hole on its own. Never earlier than the
+        oldest stored week: an install started in October fills forward, not back.
+
+        Only after a run that SUCCEEDED. A failed run usually means Radarr or Mojo is
+        unreachable, and filling then would record every missing week as failed — and
+        a failed week is never offered as missing again, so an outage would cost every
+        week it overlapped, permanently. Waiting for a healthy run costs nothing: the
+        next one is at most a couple of days away.
+        """
+        if self._backfill is None or self._reports is None:
+            return
+        if report.status != RunStatus.OK:
+            return
+        missing = self._reports.missing_weeks()
+        if missing:
+            # Single-flight, polite and capped per start; a run already going says no.
+            self._backfill.start(missing)
 
     async def _run_backup(self) -> None:
         """Take an unattended encrypted snapshot, pruned to the configured retention.

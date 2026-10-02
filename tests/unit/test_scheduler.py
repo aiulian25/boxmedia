@@ -10,7 +10,13 @@ import pytest
 from app.core.audit import AuditLog
 from app.services.backup import BackupError
 from app.services.filters import SCHEDULE_MODE_INTERVAL
-from app.services.reports import Report, ReportTotals, RunStatus
+from app.services.reports import (
+    Report,
+    ReportsStore,
+    ReportTotals,
+    RunStatus,
+    RunTrigger,
+)
 from app.services.scheduler import (
     BACKUP_JOB_ID,
     CALENDAR_JOB_ID,
@@ -470,3 +476,66 @@ async def test_nothing_reaches_a_third_party_unattended() -> None:
         assert CALENDAR_JOB_ID in registered and SERIES_JOB_ID in registered
     finally:
         scheduler.shutdown()
+
+
+# --- headless: a scheduled run fills the weeks the history skipped ---
+
+
+class _RecordingBackfill:
+    def __init__(self) -> None:
+        self.started: list[list[str]] = []
+
+    def start(self, weeks: list[str]) -> bool:
+        self.started.append(list(weeks))
+        return True
+
+
+class _FailingPipeline:
+    async def run(self, *, trigger: str) -> Report:
+        return Report(
+            id="report-stub-failed", run_at="2026-10-02T00:00:00+00:00", trigger=trigger,
+            status=RunStatus.RADARR_FAILED, totals=ReportTotals(movies=0, matched=0),
+        )
+
+
+def _history_with_a_hole(tmp_path: Path) -> ReportsStore:
+    """Weeks 33 and 36 stored; 34 and 35 came and went while the container was down."""
+    store = ReportsStore(tmp_path / "history")
+    for week in ("2026W33", "2026W36"):
+        store.save(Report(
+            id=f"report-{week}", run_at="2026-09-01T00:00:00+00:00",
+            trigger=RunTrigger.SCHEDULED, status=RunStatus.OK, week=week,
+            totals=ReportTotals(movies=1, matched=1),
+        ))
+    return store
+
+
+async def test_a_healthy_scheduled_run_fetches_the_weeks_the_history_skipped(
+    tmp_path: Path,
+) -> None:
+    """The app is a headless container: nobody is there to press "Fetch missing weeks",
+    so after an outage the schedule has to close the hole on its own."""
+    backfill = _RecordingBackfill()
+    scheduler = BoxMediaScheduler(
+        StubPipeline(), interval_hours=WEEKLY_HOURS,
+        reports=_history_with_a_hole(tmp_path), backfill=backfill,
+    )
+
+    await scheduler._run_scheduled()
+
+    assert backfill.started == [["2026W34", "2026W35"]]
+
+
+async def test_a_failed_scheduled_run_fetches_nothing_else(tmp_path: Path) -> None:
+    """A failed run usually means Radarr or Mojo is unreachable. Filling then would record
+    every missing week as failed, and a failed week is never offered again — the outage
+    would cost every week it overlapped, permanently."""
+    backfill = _RecordingBackfill()
+    scheduler = BoxMediaScheduler(
+        _FailingPipeline(), interval_hours=WEEKLY_HOURS,
+        reports=_history_with_a_hole(tmp_path), backfill=backfill,
+    )
+
+    await scheduler._run_scheduled()
+
+    assert backfill.started == []

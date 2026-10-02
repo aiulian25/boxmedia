@@ -129,6 +129,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             audit=audit,
             reports=running_app.state.reports,
             refresher=running_app.state.refresher,
+            backfill=running_app.state.backfill,
         )
         scheduler.start()
         running_app.state.scheduler = scheduler

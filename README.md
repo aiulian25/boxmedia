@@ -16,7 +16,9 @@ home server. It never downloads anything itself — it tells Radarr what to fetc
 - **Follows the source's rhythm.** Mojo posts an estimate and settles it over the
   following days, so the unattended check runs four times a week (Sun · Mon · Wed ·
   Fri) and keeps only what actually changed. A week already recorded is not
-  re-saved. A fixed interval is still selectable.
+  re-saved. A fixed interval is still selectable. Weeks that came and went while
+  the container was down are fetched on their own after the next healthy check,
+  so a headless install keeps an unbroken history with nobody opening it.
 - **Knows the film, not just the title.** When Radarr cannot recognise a chart
   title, BoxMedia reads the IMDb id off Mojo's own release page and matches on
   that. What it still cannot identify says **"Best guess — verify"** and offers a
