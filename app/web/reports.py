@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Callable
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 from fastapi import APIRouter, Form, Request, status
 from fastapi.responses import RedirectResponse
@@ -19,9 +19,11 @@ from fastapi.responses import RedirectResponse
 from app.core.audit import AuditAction
 from app.services.boxoffice import (
     CURRENT_WEEK,
+    WeekNotPublishedError,
     bom_week_id,
     format_gross,
     is_week_id,
+    last_finished_week,
     next_week_id,
     previous_week_id,
     spans_multiple_years,
@@ -68,6 +70,30 @@ DISPLAY_TIME_LENGTH = 16  # "YYYY-MM-DDTHH:MM"
 BAD_WEEK_MESSAGE = (
     "That date didn’t parse — pick a week with the date field (YYYY-MM-DD)."
 )
+BAD_WEEK_STATUS = "bad_week"
+# From a week's Monday to the Sunday it ends on: the last date the picker accepts.
+WEEK_LAST_DAY_OFFSET = timedelta(days=6)
+# A week that has not ended has no weekly chart yet. Refused BEFORE the run, because a
+# run stores a failed report, and a week holding a failed report is never offered as
+# missing again — so a fetch made too early would cost that week its backfill.
+WEEK_NOT_FINISHED_STATUS = "week_not_finished"
+WEEK_NOT_FINISHED_MESSAGE = (
+    "That week hasn’t finished yet, so Box Office Mojo has no chart for it. "
+    "Nothing was fetched or saved. Pick a week that has ended — the date picker "
+    "opens on the most recent one."
+)
+WEEK_NOT_PUBLISHED_STATUS = "week_not_published"
+WEEK_NOT_PUBLISHED_MESSAGE = (
+    "Box Office Mojo hasn’t published that week yet, so nothing was fetched or "
+    "saved. Mojo’s weeks run Friday to Thursday and appear a few days after they "
+    "end — the scheduled check fetches it on its own once it is out."
+)
+# Closed set: the code in the URL is ours, never user text, so nothing is injected.
+_LIST_BANNERS = {
+    BAD_WEEK_STATUS: BAD_WEEK_MESSAGE,
+    WEEK_NOT_FINISHED_STATUS: WEEK_NOT_FINISHED_MESSAGE,
+    WEEK_NOT_PUBLISHED_STATUS: WEEK_NOT_PUBLISHED_MESSAGE,
+}
 FIX_MATCH_PATH = "/fix-match"
 SEARCH_PATH = "/reports/search"
 BACKFILL_PATH = "/run-backfill"
@@ -97,6 +123,11 @@ NEVER_RAN = "never"
 # A closed value, never a URL: un-ignoring from the Settings list returns there instead
 # of to a report, without letting the form choose an arbitrary redirect target.
 SETTINGS_TARGET = "settings"
+
+
+def _today() -> date:
+    """UTC, like the scheduler's cadence, so "has this week ended" has one answer."""
+    return datetime.now(UTC).date()
 
 
 def _resolve_week(week: str, week_date: str) -> str | None:
@@ -399,7 +430,10 @@ async def reports_list(request: Request) -> object:
     reports = request.app.state.reports.list_reports()
     latest = reports[0] if reports else None
     last_run_failed = latest is not None and latest.status != RunStatus.OK
-    bad_week = request.query_params.get("status") == "bad_week"
+    banner_text = _LIST_BANNERS.get(request.query_params.get("status", ""))
+    # The week the picker opens on, and the last day it will accept. Dates after it
+    # are greyed out in the calendar, which is what stops a too-early fetch at all.
+    finished = week_start(last_finished_week(_today()))
     schedule = _schedule_view(request, reports)
     # Computed from the report list already in hand, so the leaderboard costs no extra
     # read; only its five posters are fetched, and the weekly view has usually cached them.
@@ -418,8 +452,10 @@ async def reports_list(request: Request) -> object:
         backfill=request.app.state.backfill.status(),
         schedule=schedule,
         last_run_error=latest.error if last_run_failed else None,
-        banner_kind=BANNER_ERROR if bad_week else None,
-        banner_text=BAD_WEEK_MESSAGE if bad_week else None,
+        banner_kind=BANNER_ERROR if banner_text else None,
+        banner_text=banner_text,
+        week_date_default=finished.isoformat() if finished else "",
+        week_date_max=(finished + WEEK_LAST_DAY_OFFSET).isoformat() if finished else "",
         search_path=SEARCH_PATH,
         backfill_path=BACKFILL_PATH,
         max_query_length=MAX_QUERY_LENGTH,
@@ -826,7 +862,12 @@ async def run_now(
     try:
         resolved = _resolve_week(week, week_date)
     except ValueError:
-        return _redirect_reports(request, "bad_week")
+        return _redirect_reports(request, BAD_WEEK_STATUS)
+    # Week ids compare chronologically as strings (`find_latest_week` relies on the
+    # same thing). The Re-run button and an old cached page reach this as well as the
+    # picker, which is why the check lives here and not only in the template.
+    if resolved is not None and resolved > last_finished_week(_today()):
+        return _redirect_reports(request, WEEK_NOT_FINISHED_STATUS)
     # When each stored report last ran, before this one. Getting the same report back
     # with the same timestamp is precisely what "nothing had changed" means, and reading
     # it here saves threading an outcome type through the scheduler and every caller of
@@ -843,7 +884,14 @@ async def run_now(
     if resolved is None and scheduler is not None:
         report = await scheduler.run_now()
     else:
-        report = await request.app.state.pipeline.run(trigger=RunTrigger.MANUAL, week=resolved)
+        try:
+            report = await request.app.state.pipeline.run(
+                trigger=RunTrigger.MANUAL, week=resolved
+            )
+        except WeekNotPublishedError:
+            # Nothing was stored, so there is no report to land on and no card to
+            # clean up — the week stays free to be fetched once Mojo has it.
+            return _redirect_reports(request, WEEK_NOT_PUBLISHED_STATUS)
     # An unchanged run hands back the STORED report object, its old timestamp included;
     # a run that recorded anything stamps a fresh `run_at`. A first sighting of a week is
     # not in the map at all, so it is not unchanged either.

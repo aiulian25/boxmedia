@@ -50,7 +50,10 @@
   <form method="post" action="{{ url_base }}/run" class="run-week">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="week_date" class="run-week-label">Pick a week</label>
-    <input id="week_date" name="week_date" type="date" aria-label="Week to fetch">
+    {# Opens on the most recent week that has ended, and greys out every later date —
+       a week still running has no chart, and fetching it early stores a failed report. #}
+    <input id="week_date" name="week_date" type="date" aria-label="Week to fetch"
+           value="{{ week_date_default }}" max="{{ week_date_max }}">
     <button type="submit" class="btn-secondary">Fetch that week</button>
   </form>
   <form method="post" action="{{ url_base }}/run">
@@ -77,7 +80,9 @@
 </p>
 {% elif missing %}
 <div class="backfill-offer">
-  <p class="backfill-line">{{ missing.count }} week{% if missing.count != 1 %}s{% endif %} missing between {{ missing.first }} and {{ missing.last }}: {{ missing.labels | join(", ") }}</p>
+  {# "Between W39 and W39" said nothing: first and last are the first and last MISSING
+     week, so a single gap is both. One week is named; a run of them is bounded. #}
+  <p class="backfill-line">{% if missing.count == 1 %}1 week missing: {{ missing.first }}{% else %}{{ missing.count }} weeks missing between {{ missing.first }} and {{ missing.last }}: {{ missing.labels | join(", ") }}{% endif %}</p>
   <form method="post" action="{{ url_base }}{{ backfill_path }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit" class="btn-secondary">Fetch missing weeks</button>

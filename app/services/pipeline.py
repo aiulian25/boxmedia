@@ -22,7 +22,12 @@ from app.core.audit import AuditAction, AuditLog
 from app.core.config import Settings
 from app.services import boxoffice
 from app.services.apps import AppsStore
-from app.services.boxoffice import BoxOfficeEntry, ScrapeError, format_gross
+from app.services.boxoffice import (
+    BoxOfficeEntry,
+    ScrapeError,
+    WeekNotPublishedError,
+    format_gross,
+)
 from app.services.corrections import Correction, CorrectionStore
 from app.services.ignore import IgnoreSnapshot, IgnoreStore
 from app.services.matcher import Candidate, find_match, normalize_title
@@ -193,6 +198,11 @@ class Pipeline:
 
         try:
             resolved_week, entries = await self._fetch_chart(week)
+        except WeekNotPublishedError:
+            # Stored as nothing: a recorded failure would mark the week attempted, and
+            # an attempted week is never offered as missing again. The caller decides
+            # what to say; the next run simply tries once Mojo has published it.
+            raise
         except ScrapeError as exc:
             return self._save_failed(
                 report_id, run_at, trigger, week_label, RunStatus.SCRAPE_FAILED, str(exc)

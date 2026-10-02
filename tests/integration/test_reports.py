@@ -10,7 +10,7 @@ import httpx
 import pytest
 import respx
 
-from app.services.boxoffice import BoxOfficeEntry, bom_week_id
+from app.services.boxoffice import BoxOfficeEntry, WeekNotPublishedError, bom_week_id
 from app.services.filters import SCHEDULE_MODE_CADENCE, SCHEDULE_MODE_INTERVAL
 from app.services.radarr import RadarrLookupResult, RadarrMovie
 from app.services.reports import (
@@ -57,8 +57,9 @@ def _ok_report(report_id: str) -> Report:
 def test_week_start_display() -> None:
     from app.web.reports import _week_start_display
 
-    assert _week_start_display("2026W27") == "29/6/2026"  # Monday of ISO week 27, day-first
-    assert _week_start_display("2026W01") == "29/12/2025"  # ISO week 1 spills into prev year
+    # Mojo's own dates, from its /weekly/ index: week 27 is "Jul 3-9", week 1 "Jan 2-8".
+    assert _week_start_display("2026W27") == "3/7/2026"  # a Friday, day-first
+    assert _week_start_display("2026W01") == "2/1/2026"
     assert _week_start_display("current") is None
     assert _week_start_display("garbage") is None
 
@@ -69,7 +70,7 @@ def test_reports_list_shows_cards(harness: AppHarness) -> None:
     page = harness.client.get("/reports")
     assert page.status_code == 200
     assert "2026W27" in page.text
-    assert "29/6/2026" in page.text  # the week's start date, day-first (not the fetch time)
+    assert "3/7/2026" in page.text  # the week's start date, day-first (not the fetch time)
     assert "Matched" in page.text
 
 
@@ -1958,3 +1959,85 @@ def test_correcting_a_rank_that_is_not_there_changes_nothing(harness: AppHarness
     assert harness.client.app.state.corrections.all() == {}
     assert harness.client.app.state.reports.get(report_id).movies[0].tmdb_id == 999
     assert "/reports" in response.headers["location"]
+
+
+# --- a week is only fetched by hand once it has ended AND Mojo has published it ---
+
+# Friday 2 October 2026: Mojo's week 40 (2-8 Oct) is running and week 39 (25 Sep - 1 Oct)
+# ended yesterday. Pinned so these tests mean the same thing whatever day they run.
+FRIDAY_2_OCTOBER = date(2026, 10, 2)
+
+
+def _pin_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.web.reports._today", lambda: FRIDAY_2_OCTOBER)
+
+
+def test_an_unfinished_week_is_refused_and_nothing_is_stored(
+    harness: AppHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refused before anything runs, from the picker AND from a Re-run button — a stored
+    failure would mark the week attempted and cost it its backfill."""
+    harness.activate()
+    _pin_today(monkeypatch)
+    before = len(harness.client.app.state.reports.list_reports())
+
+    for data in ({"week_date": "2026-10-02"}, {"week": "2026W40"}):
+        response = harness.client.post("/run", data=data, follow_redirects=False)
+        assert response.headers["location"].endswith("/reports?status=week_not_finished")
+
+    assert len(harness.client.app.state.reports.list_reports()) == before
+    page = harness.client.get("/reports?status=week_not_finished").text
+    assert "hasn’t finished yet" in page
+
+
+def test_a_week_mojo_has_not_published_is_refused_and_nothing_is_stored(
+    harness: AppHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Week 39 has ended but is not out yet — exactly what happened on 2 October. The
+    banner says so, and there is no failed card to clean up afterwards."""
+    harness.activate()
+    _pin_today(monkeypatch)
+
+    async def not_out_yet(**_kwargs: object) -> object:
+        raise WeekNotPublishedError("Box Office Mojo has not published week 2026W39 yet")
+
+    monkeypatch.setattr(harness.client.app.state.pipeline, "run", not_out_yet)
+    before = len(harness.client.app.state.reports.list_reports())
+
+    # A Monday: under the old Monday-to-Sunday reading this asked for week 40.
+    response = harness.client.post(
+        "/run", data={"week_date": "2026-09-28"}, follow_redirects=False
+    )
+
+    assert response.headers["location"].endswith("/reports?status=week_not_published")
+    assert len(harness.client.app.state.reports.list_reports()) == before
+    page = harness.client.get("/reports?status=week_not_published").text
+    assert "hasn’t published that week yet" in page
+
+
+def test_the_picker_opens_on_the_last_finished_week_and_greys_out_later_dates(
+    harness: AppHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.activate()
+    _pin_today(monkeypatch)
+
+    page = harness.client.get("/reports").text
+
+    assert 'value="2026-09-25"' in page  # Friday: Mojo's week 39 begins
+    assert 'max="2026-10-01"' in page  # Thursday: its last day; everything later is greyed out
+
+
+def test_a_single_missing_week_is_named_not_bounded_by_itself(harness: AppHarness) -> None:
+    """It read "1 week missing between W39 and W39: W39" — the first and last MISSING week
+    are the same week when there is only one."""
+    harness.activate()
+    for report_id, week in (("report-20260901-000000-aaa1", "2026W36"),
+                            ("report-20260901-000000-aaa2", "2026W38")):
+        report = _ok_report(report_id)
+        report.week = week
+        _save(harness, report)
+
+    page = harness.client.get("/reports").text
+
+    assert "1 week missing: W37" in page
+    assert "between W37 and W37" not in page

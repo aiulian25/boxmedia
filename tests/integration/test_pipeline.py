@@ -16,6 +16,7 @@ from app.services.boxoffice import (
     MAX_RELEASE_LOOKUPS_PER_RUN,
     BoxOfficeEntry,
     ScrapeError,
+    WeekNotPublishedError,
 )
 from app.services.corrections import Correction, CorrectionStore
 from app.services.filters import FiltersConfig, FiltersStore
@@ -1374,3 +1375,19 @@ async def test_a_correction_does_not_make_an_unchanged_week_look_changed(env) ->
     stored = reports_store.latest_for_week("2026W32").movies[0]
     assert stored.tmdb_id == 111, "the correction was thrown away by the next check"
     assert stored.normalized_title == "miroirs no 3", "the row left its own chart line"
+
+
+async def test_a_week_mojo_has_not_published_is_not_recorded(env) -> None:
+    """Recording it would mark the week attempted, and an attempted week is never offered
+    as missing again — so a fetch made a few days early would cost the week its backfill.
+    Nothing is stored; the caller says why, and a later run simply tries again."""
+    pipeline, reports = _build_pipeline(env, FakeRadarr([], {}), FiltersConfig(), [])
+
+    async def not_out_yet(week=None):
+        raise WeekNotPublishedError("Box Office Mojo has not published week 2026W39 yet")
+
+    pipeline._fetch_chart = not_out_yet
+
+    with pytest.raises(WeekNotPublishedError):
+        await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W39")
+    assert reports.list_reports() == []

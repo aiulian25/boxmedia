@@ -79,10 +79,36 @@ def _currency_prefix(text: str) -> str | None:
     return match.group(1) if match else None
 
 
+# Box Office Mojo's weeks run Friday to Thursday — films open on Fridays — and its week
+# N is the one whose Friday falls in ISO week N. Checked against every week Mojo's own
+# index lists for 2026, the year boundary included: 2026W01 begins Friday 2 January.
+# Treating the id as a plain ISO week (Monday to Sunday) put every card date four days
+# early and sent any Monday-to-Thursday date picked in the week picker to the wrong week.
+MOJO_WEEK_START_ISO_WEEKDAY = 5  # isocalendar numbering: Monday is 1, Friday is 5
+DAYS_PER_WEEK = 7
+
+
 def bom_week_id(day: date) -> str:
-    """Box Office Mojo week identifier for a date, e.g. '2026W03' (ISO week)."""
-    iso_year, iso_week, _ = day.isocalendar()
+    """The Box Office Mojo week a date falls in, e.g. '2026W03'.
+
+    A Monday-to-Thursday date belongs to the week that began the Friday before, which
+    is the PREVIOUS ISO week — so the ISO week of `day` itself is wrong by one for four
+    days in seven. Anchor on that Friday instead.
+    """
+    since_friday = (day.isoweekday() - MOJO_WEEK_START_ISO_WEEKDAY) % DAYS_PER_WEEK
+    iso_year, iso_week, _ = (day - timedelta(days=since_friday)).isocalendar()
     return f"{iso_year}W{iso_week:02d}"
+
+
+def last_finished_week(today: date) -> str:
+    """The newest week Box Office Mojo can hold a finished weekly chart for.
+
+    Mojo's weeks run Friday to Thursday and a weekly chart only exists once its week
+    is over, so this is the Mojo week before the one `today` falls in. "Ended" is not
+    "published": Mojo posts a week some days after its Thursday, which is why the run
+    route also asks Mojo's own index before fetching a week by hand.
+    """
+    return bom_week_id(today - timedelta(weeks=1))
 
 
 def week_chart_url(
@@ -117,7 +143,7 @@ def find_latest_week(index_html: str) -> str | None:
 
 
 def week_start(week: str) -> date | None:
-    """The Monday a 'YYYYWNN' week id begins on, or None when it isn't one.
+    """The Friday a 'YYYYWNN' week id begins on, or None when it isn't one.
 
     Public because callers outside this module need the same answer — which calendar
     month a week belongs to, and what date to print beside it. One definition, so a
@@ -127,7 +153,9 @@ def week_start(week: str) -> date | None:
     if match is None:
         return None
     try:
-        return date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1)
+        return date.fromisocalendar(
+            int(match.group(1)), int(match.group(2)), MOJO_WEEK_START_ISO_WEEKDAY
+        )
     except ValueError:
         return None
 
@@ -146,15 +174,15 @@ def is_week_id(week: str) -> bool:
 def previous_week_id(week: str) -> str | None:
     """The BOM week id one ISO week before `week` ('2026W32' -> '2026W31'), or None if
     `week` is not a 'YYYYWNN' id. isocalendar handles the year boundary."""
-    monday = week_start(week)
-    return bom_week_id(monday - timedelta(days=7)) if monday else None
+    start = week_start(week)
+    return bom_week_id(start - timedelta(weeks=1)) if start else None
 
 
 def next_week_id(week: str) -> str | None:
     """The BOM week id one ISO week after `week` ('2026W31' -> '2026W32'), or None if
     `week` is not a 'YYYYWNN' id."""
-    monday = week_start(week)
-    return bom_week_id(monday + timedelta(days=7)) if monday else None
+    start = week_start(week)
+    return bom_week_id(start + timedelta(weeks=1)) if start else None
 
 
 def week_chip_label(week: str, *, with_year: bool) -> str:
@@ -251,6 +279,17 @@ _BILLION = 1_000_000_000
 
 class ScrapeError(Exception):
     """The box-office chart could not be fetched or parsed."""
+
+
+class WeekNotPublishedError(ScrapeError):
+    """Box Office Mojo has not published this week yet — a fact about time, not a fault.
+
+    Kept apart from a real scrape failure because the two must be stored differently.
+    A failed run is recorded, and a week holding a failed report is never offered as
+    missing again; recording THIS would cost a week its backfill for having been asked
+    about a few days too early. So nothing is stored for it, and a later run — the
+    schedule, or the gap filler behind it — simply tries again once Mojo has it.
+    """
 
 
 class BoxOfficeEntry(BaseModel):
@@ -464,9 +503,16 @@ async def fetch_weekly_chart(
                 if position < len(candidates) - 1:
                     continue  # current-week lookback: step back to the previous week
                 if week and week != CURRENT_WEEK:
-                    # A picked/re-run week is fetched exactly. If it has no chart (a future
-                    # week, or one not yet reported), say so honestly rather than showing a
-                    # different week or a misleading "layout changed".
+                    # A picked/re-run week is fetched exactly. Asked only on THIS path, so
+                    # a chart that parses — every scheduled run and backfill — costs no
+                    # extra request. Newer than anything Mojo lists means not out yet;
+                    # anything else with no chart is a real gap, and stays a stored one.
+                    latest = await _latest_published_week(client, url, area=area)
+                    if latest is not None and week > latest:
+                        raise WeekNotPublishedError(
+                            f"Box Office Mojo has not published week {week} yet — its "
+                            f"newest is {latest}."
+                        ) from None
                     raise ScrapeError(
                         f"No box-office data available for week {week} — it may be in the "
                         "future or not yet reported. Pick a completed past week, or use Run "
@@ -476,6 +522,8 @@ async def fetch_weekly_chart(
         raise ScrapeError("no box-office week could be resolved")  # unreachable: guards len>=1
     except httpx.HTTPError as exc:
         raise ScrapeError(f"could not fetch box-office chart: {exc}") from exc
+    except WeekNotPublishedError:
+        raise  # not a layout problem, so nothing for the Maintenance card to show
     except ScrapeError:
         _snapshot_failure(snapshot_dir, html)
         raise
@@ -528,6 +576,21 @@ async def _get_text(client: httpx.AsyncClient, target: str) -> str:
     return response.text
 
 
+async def _latest_published_week(
+    client: httpx.AsyncClient, url: str, *, area: str = DOMESTIC_REGION
+) -> str | None:
+    """The newest week Mojo's own index links, or None when the index cannot be read.
+
+    Mojo's index is the authority on which weeks exist. The calendar can say a week has
+    ended; only Mojo can say it has been published, which happens some days later.
+    """
+    try:
+        index = await client.get(week_chart_url(url, None, area=area))
+    except httpx.HTTPError:
+        return None
+    return find_latest_week(index.text)
+
+
 async def _week_candidates(
     client: httpx.AsyncClient, url: str, week: str | None, *, area: str = DOMESTIC_REGION
 ) -> list[str | None]:
@@ -537,11 +600,7 @@ async def _week_candidates(
     `None` means the bare page itself (the test mock serves a chart there)."""
     if week and week != CURRENT_WEEK:
         return [week]
-    try:
-        index = await client.get(week_chart_url(url, None, area=area))
-        latest = find_latest_week(index.text)
-    except httpx.HTTPError:
-        latest = None
+    latest = await _latest_published_week(client, url, area=area)
     if latest is None:
         return [None]  # bare page (test mock serves a chart there)
     candidates: list[str | None] = [latest]

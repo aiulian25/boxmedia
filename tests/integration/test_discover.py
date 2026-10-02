@@ -135,8 +135,9 @@ def test_the_week_caption_is_day_first(harness: AppHarness) -> None:
     _seed_report(harness)
 
     page = harness.client.get("/discover").text
-    # 2026W32 begins on the 3rd of August. Day first, month second — never American.
-    assert "3/8/2026" in page
+    # 2026W32 begins Friday the 7th of August — Mojo's own "Aug 7-13". Day first, month
+    # second — never American.
+    assert "7/8/2026" in page
 
 
 def test_a_report_less_install_still_renders_the_tv_rows(harness: AppHarness) -> None:

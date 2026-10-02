@@ -22,6 +22,7 @@ from app.services.boxoffice import (
     SNAPSHOT_SUFFIX,
     TOP_N,
     ScrapeError,
+    WeekNotPublishedError,
     _clean_percent,
     _currency_prefix,
     _snapshot_failure,
@@ -129,8 +130,28 @@ def test_gross_formatting() -> None:
 
 
 def test_bom_week_id() -> None:
-    assert bom_week_id(date(2026, 1, 5)) == "2026W02"  # ISO week of Jan 5, 2026
-    assert bom_week_id(date(2026, 8, 12)) == "2026W33"
+    """Mojo's weeks run Friday to Thursday. Expected values are Mojo's own, read off its
+    /weekly/ index — 2026W01 is "Jan 2-8", 2026W32 is "Aug 7-13" — not derived here."""
+    assert bom_week_id(date(2026, 1, 5)) == "2026W01"  # a Monday: still the week of Jan 2
+    assert bom_week_id(date(2026, 8, 12)) == "2026W32"  # a Wednesday: the week of Aug 7
+
+
+@pytest.mark.parametrize(
+    ("day", "week"),
+    [
+        (date(2026, 9, 18), "2026W38"),  # Friday: the day Mojo's week 38 begins
+        (date(2026, 9, 21), "2026W38"),  # Monday: ISO says 39, Mojo says 38
+        (date(2026, 9, 24), "2026W38"),  # Thursday: the last day of week 38
+        (date(2026, 9, 25), "2026W39"),  # Friday: week 39 begins
+        (date(2026, 1, 1), "2025W52"),   # New Year's Day belongs to the last 2025 week
+        (date(2026, 1, 2), "2026W01"),   # and 2026W01 begins the day after
+    ],
+)
+def test_a_monday_to_thursday_date_belongs_to_the_week_before(day: date, week: str) -> None:
+    """The bug this pins: taking the ISO week of the date itself put every Monday to
+    Thursday in the NEXT Mojo week, so picking 21 September asked Mojo for a week that
+    had not been published."""
+    assert bom_week_id(day) == week
 
 
 def test_week_chart_url() -> None:
@@ -237,30 +258,62 @@ async def test_current_falls_back_over_in_progress_week(tmp_path: Path) -> None:
     assert thin_route.called and full_route.called  # tried W32, fell back to W31
 
 
+def _index_html(latest: str) -> str:
+    """Mojo's /weekly/ index as `find_latest_week` reads it: links named by week id."""
+    return f'<html><body><a href="/weekly/{latest}/">latest</a></body></html>'
+
+
 @respx.mock
 async def test_specific_week_with_no_data_errors_without_fallback(tmp_path: Path) -> None:
     # A picked/re-run week with no chart must error honestly, NOT fall back to another week.
+    # Mojo's index lists a NEWER week, so this one is out and genuinely empty: a real
+    # failure, stored as one — not mistaken for a week that is merely not out yet.
+    respx.get(BOM_WEEKLY_URL).mock(
+        return_value=httpx.Response(200, text=_index_html("2026W29"))
+    )
     thin = respx.get(f"{BOM_WEEKLY_URL}2026W28/").mock(
         return_value=httpx.Response(200, text=_thin_chart_html())
     )
     prev = respx.get(f"{BOM_WEEKLY_URL}2026W27/").mock(
         return_value=httpx.Response(200, text=_fixture_html())
     )
-    with pytest.raises(ScrapeError, match="No box-office data available for week 2026W28"):
+    with pytest.raises(ScrapeError, match="No box-office data available for week 2026W28") as err:
         await fetch_weekly_chart(snapshot_dir=tmp_path / "sf", week="2026W28")
+    assert not isinstance(err.value, WeekNotPublishedError)
     assert thin.called
     assert not prev.called  # no silent fallback to the previous week
 
 
 @respx.mock
-async def test_specific_future_week_empty_page_reports_no_data(tmp_path: Path) -> None:
-    # A far-future week returns HTTP 200 with no chart table; report "no data", not the
-    # misleading "layout changed".
-    respx.get(f"{BOM_WEEKLY_URL}2027W50/").mock(
-        return_value=httpx.Response(200, text="<html><body><h1>Week 2027W50</h1></body></html>")
+async def test_a_week_mojo_has_not_published_is_not_a_scrape_failure(tmp_path: Path) -> None:
+    """A week newer than anything Mojo's index lists is not out yet. It must come back as
+    its own error — the pipeline stores nothing for it, so the week stays free to be
+    fetched once Mojo has it — and it is not a layout problem, so no failure snapshot."""
+    respx.get(BOM_WEEKLY_URL).mock(
+        return_value=httpx.Response(200, text=_index_html("2026W38"))
     )
-    with pytest.raises(ScrapeError, match="No box-office data available for week 2027W50"):
-        await fetch_weekly_chart(snapshot_dir=tmp_path / "sf", week="2027W50")
+    respx.get(f"{BOM_WEEKLY_URL}2026W39/").mock(
+        return_value=httpx.Response(200, text="<html><body><h1>No data</h1></body></html>")
+    )
+    snapshots = tmp_path / "sf"
+    with pytest.raises(WeekNotPublishedError, match="has not published week 2026W39"):
+        await fetch_weekly_chart(snapshot_dir=snapshots, week="2026W39")
+    assert not snapshots.exists() or not any(snapshots.iterdir())
+
+
+@respx.mock
+async def test_an_unreadable_index_falls_back_to_the_honest_no_data_error(
+    tmp_path: Path,
+) -> None:
+    """If the index cannot be read we cannot say "not out yet", so the week keeps the
+    plain no-data failure it always had rather than being guessed into either."""
+    respx.get(BOM_WEEKLY_URL).mock(side_effect=httpx.ConnectError("unreachable"))
+    respx.get(f"{BOM_WEEKLY_URL}2026W39/").mock(
+        return_value=httpx.Response(200, text="<html><body><h1>No data</h1></body></html>")
+    )
+    with pytest.raises(ScrapeError, match="No box-office data available") as err:
+        await fetch_weekly_chart(snapshot_dir=tmp_path / "sf", week="2026W39")
+    assert not isinstance(err.value, WeekNotPublishedError)
 
 
 def test_next_week_id() -> None:
