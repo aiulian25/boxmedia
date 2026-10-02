@@ -637,3 +637,83 @@ def test_refresh_builds_both_public_clients_without_the_tls_escape_hatch(
     assert built, "refresh built no client at all"
     for kwargs in built:
         assert "verify" not in kwargs, kwargs
+
+
+# --- Refresh returns you to the chip you pressed it from ---
+
+
+@respx.mock
+def test_refreshing_from_the_tv_chip_lands_back_on_tv(harness: AppHarness) -> None:
+    """Pressing Refresh while reading TV used to drop the reader on All, which is the
+    widest shelf and not the one they were looking at."""
+    respx.get(TRAKT_TRENDING).mock(side_effect=httpx.ConnectError("gone"))
+    respx.get(TRAKT_ANTICIPATED).mock(side_effect=httpx.ConnectError("gone"))
+    harness.activate()
+    _keys(harness)
+
+    response = harness.client.post(
+        "/discover/refresh", data={"type": "tv"}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert "type=tv" in response.headers["location"]
+    # The banner still travels with it.
+    assert DiscoverStatus.REFRESH_FAILED in response.headers["location"]
+
+
+@respx.mock
+def test_refreshing_from_movies_lands_back_on_movies(harness: AppHarness) -> None:
+    respx.get(TRAKT_TRENDING).mock(side_effect=httpx.ConnectError("gone"))
+    respx.get(TRAKT_ANTICIPATED).mock(side_effect=httpx.ConnectError("gone"))
+    harness.activate()
+    _keys(harness)
+
+    response = harness.client.post(
+        "/discover/refresh", data={"type": "movies"}, follow_redirects=False
+    )
+
+    assert "type=movies" in response.headers["location"]
+
+
+@respx.mock
+def test_a_refresh_that_names_no_chip_still_works(harness: AppHarness) -> None:
+    """An older cached page, or a client that posts nothing, must not 422."""
+    respx.get(TRAKT_TRENDING).mock(side_effect=httpx.ConnectError("gone"))
+    respx.get(TRAKT_ANTICIPATED).mock(side_effect=httpx.ConnectError("gone"))
+    harness.activate()
+    _keys(harness)
+
+    response = harness.client.post("/discover/refresh", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert "type=all" in response.headers["location"]
+
+
+@respx.mock
+def test_a_crafted_chip_never_reaches_the_location_header(harness: AppHarness) -> None:
+    """The value becomes a URL, so it is closed to the three the chip row renders before
+    it is interpolated — the same rule the theme setting follows."""
+    respx.get(TRAKT_TRENDING).mock(side_effect=httpx.ConnectError("gone"))
+    respx.get(TRAKT_ANTICIPATED).mock(side_effect=httpx.ConnectError("gone"))
+    harness.activate()
+    _keys(harness)
+
+    response = harness.client.post(
+        "/discover/refresh",
+        data={"type": "https://evil.test/steal?x="},
+        follow_redirects=False,
+    )
+
+    location = response.headers["location"]
+    assert "evil.test" not in location
+    assert location.endswith("type=all")
+
+
+def test_the_refresh_form_carries_the_open_chip(harness: AppHarness) -> None:
+    """Without the hidden field the server cannot know which shelf to come back to."""
+    harness.activate()
+    _keys(harness)
+
+    page = harness.client.get("/discover?type=tv").text
+
+    assert '<input type="hidden" name="type" value="tv">' in page

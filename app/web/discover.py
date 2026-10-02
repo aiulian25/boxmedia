@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Form, Request
 from fastapi import status as http_status
 from fastapi.responses import RedirectResponse
 
@@ -69,6 +69,8 @@ router = APIRouter()
 NAV_KEY = "discover"
 DISCOVER_PATH = "/discover"
 REFRESH_PATH = "/discover/refresh"
+# The chip the page is showing, in the URL so it survives a refresh and a bookmark.
+TYPE_QUERY_KEY = "type"
 
 # How long the Refresh action may hold the request open. Past this the answer is "that
 # took too long", which is true and actionable, rather than a spinner nobody can cancel.
@@ -298,7 +300,9 @@ def _week_display(week: str | None) -> str | None:
 
 
 @router.post(REFRESH_PATH)
-async def refresh(request: Request) -> RedirectResponse:
+async def refresh(
+    request: Request, type: str = Form(TYPE_ALL)  # noqa: A002 — the query key
+) -> RedirectResponse:
     """Fetch both Trakt shelves. The ONLY outbound call this feature makes on demand.
 
     Session-gated and CSRF-guarded by the router's dependency, audited, and bounded — so
@@ -307,25 +311,28 @@ async def refresh(request: Request) -> RedirectResponse:
 
     A failure leaves the previous shelves in place: "we could not look" and "there is
     nothing" are different claims, and only one of them is true.
+
+    `type` is the chip the user pressed Refresh from, carried back so the banner lands
+    on the shelf they were reading rather than bouncing them to All.
     """
     user = current_user(request)
     keys = request.app.state.discovery
     try:
         client_id = keys.decrypt(PROVIDER_TRAKT)
         if not client_id:
-            return _redirect(request, DiscoverStatus.NO_KEYS)
+            return _redirect(request, DiscoverStatus.NO_KEYS, type)
         tmdb_key = keys.decrypt(PROVIDER_TMDB)
     except DiscoveryError:
         # Stored, and unreadable. Deliberately NOT the refresh-failed banner beside it:
         # that one says Trakt could not be reached, and nothing was asked of Trakt.
-        return _redirect(request, DiscoverStatus.KEYS_UNREADABLE)
+        return _redirect(request, DiscoverStatus.KEYS_UNREADABLE, type)
     tmdb = TmdbClient(tmdb_key) if tmdb_key else None
     try:
         rows = await asyncio.wait_for(
             _fetch_rows(client_id, tmdb), timeout=REFRESH_TIMEOUT_SECONDS
         )
     except (TraktError, TmdbError, TimeoutError):
-        return _redirect(request, DiscoverStatus.REFRESH_FAILED)
+        return _redirect(request, DiscoverStatus.REFRESH_FAILED, type)
     await asyncio.to_thread(request.app.state.discover_cache.save, rows)
     request.app.state.audit.record(
         AuditAction.DISCOVER_REFRESHED,
@@ -334,7 +341,7 @@ async def refresh(request: Request) -> RedirectResponse:
         trending=len(rows[TRENDING_KEY]),
         anticipated=len(rows[ANTICIPATED_KEY]),
     )
-    return _redirect(request, DiscoverStatus.REFRESHED)
+    return _redirect(request, DiscoverStatus.REFRESHED, type)
 
 
 async def _fetch_rows(
@@ -441,9 +448,20 @@ STATUS_MESSAGES = {
 }
 
 
-def _redirect(request: Request, status_code: str) -> RedirectResponse:
+def _redirect(
+    request: Request, status_code: str, media_type: str = TYPE_ALL
+) -> RedirectResponse:
+    """Back to the shelf, on the chip the caller came from.
+
+    The chip is validated HERE rather than at the route, because this is where it
+    becomes a URL: `validated_media_type` closes it to the same three values the chip
+    row renders, so no caller — present or future — can put submitted text in a
+    Location header. Unrecognised falls back to All rather than erroring, which is
+    what a hand-edited `?type=` already does on the way in.
+    """
     base = request.app.state.settings.url_base
+    chip = validated_media_type(media_type)
     return RedirectResponse(
-        f"{base}{DISCOVER_PATH}?{STATUS_QUERY_KEY}={status_code}",
+        f"{base}{DISCOVER_PATH}?{STATUS_QUERY_KEY}={status_code}&{TYPE_QUERY_KEY}={chip}",
         status_code=http_status.HTTP_303_SEE_OTHER,
     )

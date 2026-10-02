@@ -24,6 +24,8 @@
   {% if keys.has_trakt %}
   <form method="post" action="{{ url_base }}{{ refresh_path }}" class="run-search">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {# Which chip is open, so the refresh lands back on it instead of on All. #}
+    <input type="hidden" name="type" value="{{ media_type }}">
     <button type="submit" class="btn-secondary">Refresh</button>
   </form>
   {% endif %}
