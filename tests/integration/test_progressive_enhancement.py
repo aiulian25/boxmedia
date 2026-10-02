@@ -250,3 +250,42 @@ def test_both_service_pickers_ship_their_radios_server_side(harness: AppHarness)
 
     assert page.count("data-app-kind") == 2  # Radarr and Sonarr
     assert page.count("data-server-kind") == 2  # Plex and Jellyfin
+
+
+# --- the modal owns a history entry, so Back closes it instead of leaving the shelf ---
+
+
+def _app_js() -> str:
+    from pathlib import Path as _Path
+
+    return (_Path(__file__).resolve().parent.parent.parent / "app" / "static" / "js"
+            / "app.js").read_text(encoding="utf-8")
+
+
+def test_opening_the_modal_pushes_a_history_entry() -> None:
+    """Without one, Back dismisses the modal by leaving the PAGE — which drops the reader
+    on whichever Discover chip they were on before this one rather than the shelf they
+    are looking at. Asserted on the source for the reason this whole file exists: the
+    behaviour needs a browser, the contract does not.
+    """
+    source = _app_js()
+    opener = source.split("function openModal(")[1].split("\n  }")[0]
+
+    assert "window.history.pushState" in opener, "the modal takes no history entry"
+
+
+def test_back_closes_the_modal_rather_than_the_page() -> None:
+    source = _app_js()
+
+    assert 'window.addEventListener("popstate"' in source
+    popstate = source.split('window.addEventListener("popstate"')[1].split("});")[0]
+    assert "dialog.close()" in popstate, "Back must close the modal, not navigate away"
+
+
+def test_closing_the_modal_spends_the_entry_it_pushed() -> None:
+    """Otherwise the reader has to press Back twice to leave a shelf they never navigated
+    away from: once to consume the modal's leftover entry, once to actually go back."""
+    source = _app_js()
+    closer = source.split('dialog.addEventListener("close"')[1].split("});")[0]
+
+    assert "window.history.back()" in closer

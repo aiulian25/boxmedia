@@ -17,6 +17,9 @@
   var SAVING_LABEL = "Saving…";
   var SAVED_ALL_STATUS = "settings_saved";
   var SAVE_FAILED_STATUS = "settings_save_failed";
+  // Marks the history entry the modal pushes for itself, so Back closes the modal
+  // instead of leaving the shelf the reader was on.
+  var MODAL_STATE_KEY = "boxmediaModal";
 
   function readStored(key) {
     try {
@@ -88,9 +91,22 @@
   var dialog = document.getElementById("movie-dialog");
   var dialogBody = dialog && dialog.querySelector("[data-movie-body]");
 
+  // Set while the fallback below is navigating away, so closing the dialog on the way
+  // out does not also fire a history.back() and race the assignment.
+  var leavingForFallback = false;
+
   function openModal(url, fallbackHref) {
     dialogBody.textContent = "Loading…";
     dialog.showModal();
+    // A history entry of its own, at the SAME url — the address bar does not change,
+    // but Back now has something to consume. Without it, Back dismisses the modal by
+    // leaving the page, which drops the reader on whichever chip they were on before
+    // this one rather than the shelf they are actually looking at.
+    if (window.history && window.history.pushState) {
+      var pushed = {};
+      pushed[MODAL_STATE_KEY] = true;
+      window.history.pushState(pushed, "");
+    }
     window
       .fetch(url, { credentials: "same-origin" })
       .then(function (response) {
@@ -106,6 +122,7 @@
       })
       .catch(function () {
         // Never strand the user in an empty modal — fall back to the real page.
+        leavingForFallback = true;
         dialog.close();
         window.location.href = fallbackHref;
       });
@@ -156,6 +173,22 @@
     });
     dialog.addEventListener("close", function () {
       dialogBody.textContent = "";
+      // Closed by Escape, the × or the backdrop: the entry opening it pushed is still
+      // current, so spend it. Otherwise the reader would have to press Back twice to
+      // leave a shelf they never navigated away from.
+      var state = window.history && window.history.state;
+      if (!leavingForFallback && state && state[MODAL_STATE_KEY]) {
+        window.history.back();
+      }
+    });
+
+    // Back closes the modal rather than the page. The entry is already popped by the
+    // time this runs, so the close handler above finds no modal state and does not
+    // push the history back the other way.
+    window.addEventListener("popstate", function () {
+      if (dialog.open) {
+        dialog.close();
+      }
     });
   }
   /* Test Connection: probe what has been typed, without saving it.
