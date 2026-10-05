@@ -12,6 +12,7 @@ per-movie error produces a recorded outcome rather than crashing the unattended 
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from secrets import token_hex
@@ -72,6 +73,15 @@ SelectAppId = Callable[[], str | None]
 # Confirming a guessed title: a release path in, the film's IMDb id or None out. Injected
 # for the same reason `fetch_chart` is — so a test can answer without a network.
 FetchReleaseId = Callable[[str], Awaitable[str | None]]
+
+
+# How many chart titles are looked up at once. Each one is a Radarr lookup — which
+# Radarr forwards to its own metadata service — and sometimes a Mojo release page.
+# Measured on 20 titles against a real Radarr: 1,884 ms one at a time, 1,066 ms two at
+# a time, 696 ms at six, and no better beyond that (727 ms with all twenty at once).
+# Six is also how many connections a browser opens to one host, which keeps this as
+# polite to Radarr's upstream and to Mojo as a person clicking through would be.
+RECONCILE_CONCURRENCY = 6
 
 
 class _ReleaseLookups:
@@ -253,10 +263,20 @@ class Pipeline:
         # a sixth costs none. Reached only on a chart that changed — the unchanged check
         # above returns before any of this.
         lookups = _ReleaseLookups(boxoffice.MAX_RELEASE_LOOKUPS_PER_RUN)
-        results = [
-            await self._reconcile(entry, radarr, library_by_tmdb, ignored, corrections, lookups)
-            for entry in entries
-        ]
+        # Together rather than one by one: each title waits on Radarr's metadata service,
+        # so twenty in a row was twenty round trips end to end. Safe to overlap because
+        # everything they share — the lookup budget above and the release-id cache — is
+        # read and written with no await in between, and every run lives on the one
+        # event loop. `gather` keeps the results in chart order.
+        limit = asyncio.Semaphore(RECONCILE_CONCURRENCY)
+
+        async def reconcile(entry: BoxOfficeEntry) -> MovieResult:
+            async with limit:
+                return await self._reconcile(
+                    entry, radarr, library_by_tmdb, ignored, corrections, lookups
+                )
+
+        results = await asyncio.gather(*[reconcile(entry) for entry in entries])
         matched = sum(
             1 for result in results if result.status in (MovieStatus.IN_LIBRARY, MovieStatus.WANTED)
         )

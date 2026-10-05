@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -21,7 +22,7 @@ from app.services.boxoffice import (
 from app.services.corrections import Correction, CorrectionStore
 from app.services.filters import FiltersConfig, FiltersStore
 from app.services.ignore import IgnoreStore
-from app.services.pipeline import CARD_GENRES, Pipeline
+from app.services.pipeline import CARD_GENRES, RECONCILE_CONCURRENCY, Pipeline
 from app.services.radarr import RadarrLookupResult, RadarrMovie
 from app.services.release_ids import RELEASE_IDS_FILENAME, ReleaseIdCache
 from app.services.reports import (
@@ -1391,3 +1392,35 @@ async def test_a_week_mojo_has_not_published_is_not_recorded(env) -> None:
     with pytest.raises(WeekNotPublishedError):
         await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W39")
     assert reports.list_reports() == []
+
+
+class _OverlapRadarr(FakeRadarr):
+    """Counts how many lookups are in flight at once, and holds each one open just long
+    enough that every title allowed to start has started before any finishes."""
+
+    def __init__(self) -> None:
+        super().__init__([], {})
+        self.in_flight = 0
+        self.peak = 0
+
+    async def lookup(self, term: str) -> list[RadarrLookupResult]:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        await asyncio.sleep(0.01)
+        self.in_flight -= 1
+        return []
+
+
+async def test_a_chart_is_looked_up_several_titles_at_a_time(env) -> None:
+    """Twenty titles one after another was twenty round trips to Radarr's metadata service
+    end to end — measured at 1.9s, against 0.7s six at a time. Overlapped now, but never
+    more than RECONCILE_CONCURRENCY at once, and the report still reads in chart order."""
+    radarr = _OverlapRadarr()
+    entries = [_entry(rank, f"Title {rank}") for rank in range(1, 21)]
+    pipeline, _store = _build_pipeline(env, radarr, FiltersConfig(), entries)
+
+    report = await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
+
+    # More than one at once, or nothing overlapped; exactly the bound, or it is not one.
+    assert 1 < radarr.peak == RECONCILE_CONCURRENCY
+    assert [movie.rank for movie in report.movies] == list(range(1, 21))
