@@ -27,7 +27,7 @@ from app.services.scheduler import BoxMediaScheduler
 from app.web import reports as report_routes
 from app.web.deps import format_timestamp
 from app.web.reports import NEVER_RAN
-from tests.conftest import AppHarness
+from tests.conftest import AppHarness, fetch_queued_posters
 
 STEP12_URL = "http://step12.radarr:7878"
 STEP12_API = f"{STEP12_URL}/api/v3"
@@ -156,9 +156,9 @@ def test_unknown_report_redirects(harness: AppHarness) -> None:
 
 @respx.mock
 def test_report_detail_caches_posters(harness: AppHarness) -> None:
-    # cache_posters (now concurrent) must still fetch + cache a poster and set the
-    # same-origin poster_local so the grid renders a local <img>. No Radarr app is
-    # configured, so only the poster URL is fetched.
+    # The grid fetches posters after the response, and once cached sets the same-origin
+    # poster_local so it renders a local <img>. No Radarr app is configured, so only the
+    # poster URL is fetched.
     harness.activate()
     poster_url = "http://img.local/MediaCover/1/poster.jpg"
     respx.get(poster_url).mock(return_value=httpx.Response(200, content=b"\xff\xd8\xff jpg"))
@@ -175,8 +175,13 @@ def test_report_detail_caches_posters(harness: AppHarness) -> None:
             totals=ReportTotals(movies=1, matched=1), movies=[movie],
         ),
     )
+    # The week's grid does not wait for posters: the first view queues them...
+    first = harness.client.get("/reports/report-20260812-110800-pppp")
+    assert "/posters/" not in first.text
+    fetch_queued_posters(harness)
+    # ...and the next view serves them from the local cache, same-origin.
     page = harness.client.get("/reports/report-20260812-110800-pppp")
-    assert "/posters/" in page.text  # poster_local was set from the local cache
+    assert "/posters/" in page.text
 
 
 class _NonAddingRadarr:

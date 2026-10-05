@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import threading
 from pathlib import Path
@@ -10,14 +11,17 @@ import httpx
 import respx
 
 from app.services import posters
+from app.services.background import SingleFlight
 from app.services.posters import (
     FAILED_RETRY_AFTER_SECONDS,
     MAX_POSTER_BYTES,
     POSTER_SUBDIR,
     POSTER_SUFFIX,
     POSTER_WIDTH,
+    PREFETCH_CONCURRENCY,
     SERIES_POSTER_WIDTH,
     PosterCache,
+    PosterPrefetcher,
     sized,
 )
 from app.services.tmdb import image_url
@@ -347,3 +351,79 @@ async def test_the_poster_write_happens_off_the_event_loop(
     assert writing_threads, "the poster was never written"
     assert writing_threads[0] is not threading.current_thread()
     assert cache.is_cached(POSTER_URL)  # and it really landed on disk
+
+
+# --- posters a page did not wait for are fetched after it, once each, a few at a time ---
+
+
+class _CountingCache(PosterCache):
+    """Records every download it is asked for, and how many run at once."""
+
+    def __init__(self, cache_dir: Path) -> None:
+        super().__init__(cache_dir)
+        self.fetched: list[str] = []
+        self.in_flight = 0
+        self.peak = 0
+
+    async def ensure(self, client: httpx.AsyncClient, url: str) -> bool:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        await asyncio.sleep(0.01)
+        self.in_flight -= 1
+        self.fetched.append(url)
+        return True
+
+
+async def test_only_posters_not_yet_cached_are_queued(tmp_path: Path) -> None:
+    cache = _CountingCache(tmp_path)
+    cached = "http://img.local/cached.jpg"
+    (tmp_path / posters.POSTER_SUBDIR).mkdir(parents=True, exist_ok=True)
+    (tmp_path / posters.POSTER_SUBDIR / cache.local_name(cached)).write_bytes(b"jpg")
+    background = SingleFlight()
+    prefetcher = PosterPrefetcher(cache, background)
+
+    prefetcher.want([cached, "http://img.local/new.jpg"])
+    await background.idle()
+
+    assert cache.fetched == ["http://img.local/new.jpg"]
+
+
+async def test_a_poster_two_pages_ask_for_is_fetched_once(tmp_path: Path) -> None:
+    cache = _CountingCache(tmp_path)
+    background = SingleFlight()
+    prefetcher = PosterPrefetcher(cache, background)
+
+    prefetcher.want(["http://img.local/a.jpg"])
+    prefetcher.want(["http://img.local/a.jpg", "http://img.local/b.jpg"])
+    await background.idle()
+
+    assert sorted(cache.fetched) == ["http://img.local/a.jpg", "http://img.local/b.jpg"]
+
+
+async def test_a_large_library_is_fetched_a_few_at_a_time(tmp_path: Path) -> None:
+    """A first visit asked for 210 at once. Bounded, a cold cache asks the image hosts for no
+    more than a browser would, and holds no more than this many posters in memory."""
+    cache = _CountingCache(tmp_path)
+    background = SingleFlight()
+    prefetcher = PosterPrefetcher(cache, background)
+
+    prefetcher.want([f"http://img.local/{n}.jpg" for n in range(40)])
+    await background.idle()
+
+    assert len(cache.fetched) == 40
+    assert 1 < cache.peak <= PREFETCH_CONCURRENCY
+
+
+async def test_a_poster_queued_while_the_worker_is_busy_is_picked_up_by_it(
+    tmp_path: Path,
+) -> None:
+    cache = _CountingCache(tmp_path)
+    background = SingleFlight()
+    prefetcher = PosterPrefetcher(cache, background)
+
+    prefetcher.want(["http://img.local/first.jpg"])
+    await asyncio.sleep(0)  # the worker is now mid-download
+    prefetcher.want(["http://img.local/second.jpg"])
+    await background.idle()
+
+    assert sorted(cache.fetched) == ["http://img.local/first.jpg", "http://img.local/second.jpg"]

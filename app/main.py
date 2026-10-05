@@ -25,6 +25,7 @@ from app.core.security import LoginRateLimiter
 from app.core.sessions import COOKIE_NAME, SessionStore
 from app.services.apps import AppsStore
 from app.services.backfill import BackfillRunner
+from app.services.background import SingleFlight
 from app.services.backoff import RadarrBackoff
 from app.services.backup import BackupService
 from app.services.calendar import CalendarCache
@@ -34,7 +35,8 @@ from app.services.filters import FiltersStore
 from app.services.ignore import IgnoreStore
 from app.services.mediaserver import MediaServerLibraryCache, MediaServerStore
 from app.services.pipeline import Pipeline
-from app.services.posters import PosterCache
+from app.services.posters import PosterCache, PosterPrefetcher
+from app.services.radarr import LibrarySnapshots
 from app.services.radarr_options import RadarrOptionsCache
 from app.services.refresh import ServerRefresher
 from app.services.release_ids import ReleaseIdCache
@@ -141,6 +143,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # cancelling says so at the next await instead of leaving the loop to be torn
             # down mid-week. Whole reports are already on disk; the rest is offered again.
             running_app.state.backfill.cancel()
+            # The same for the work pages hand off: a poster half-downloaded or a
+            # library re-read in flight is simply redone after the restart.
+            running_app.state.background.cancel_all()
 
     app = FastAPI(
         title="BoxMedia", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
@@ -152,6 +157,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.filters = FiltersStore(settings.config_dir, audit=audit)
     app.state.reports = ReportsStore(settings.history_dir)
     app.state.posters = PosterCache(settings.cache_dir)
+    # Work a page starts and does not wait for: posters it had not shown before, and the
+    # media server's library once its snapshot is stale.
+    app.state.background = SingleFlight()
+    app.state.poster_prefetcher = PosterPrefetcher(app.state.posters, app.state.background)
     app.state.release_ids = ReleaseIdCache(settings.cache_dir)
     app.state.ignore = IgnoreStore(settings.config_dir, audit=audit)
     app.state.corrections = CorrectionStore(settings.config_dir)
@@ -162,6 +171,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Per app instance, not global: a test's dead connection must not silence
     # another's.
     app.state.radarr_backoff = RadarrBackoff()
+    # Each connection's last full-library read, reused for a minute by the pages that
+    # only decorate with it. Per app instance for the same reason as the backoff.
+    app.state.radarr_library_snapshots = LibrarySnapshots()
     # The Plex trio: connection (token encrypted with the same key as the Radarr
     # ones), the on-disk library snapshot, and its own backoff so a down media server
     # cannot cost every render a timeout.

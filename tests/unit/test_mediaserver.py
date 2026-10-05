@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,6 +13,7 @@ import respx
 
 from app.core import crypto, filestore
 from app.services.apps import API_KEY_MASK, InvalidAppError
+from app.services.backoff import RadarrBackoff
 from app.services.mediaserver import (
     HOLDS_PROBABLY,
     HOLDS_YES,
@@ -19,6 +22,7 @@ from app.services.mediaserver import (
     KIND_PLEX,
     LEGACY_PLEX_FILENAME,
     LIBRARY_CACHE_FILENAME,
+    LIBRARY_CACHE_TTL_SECONDS,
     MAX_LIBRARY_PAGES,
     MEDIA_SERVER_FILENAME,
     MEDIA_SERVER_SCHEMA_VERSION,
@@ -38,6 +42,12 @@ from app.services.mediaserver import (
     _movie_from_jellyfin_item,
     snapshot_from_library,
     validated_kind,
+)
+from app.web.deps import (
+    MEDIA_SERVER_BACKOFF_KEY,
+    MEDIA_SERVER_REFRESH_KEY,
+    load_media_server_snapshot,
+    refresh_media_server_snapshot,
 )
 
 PLEX_URL = "http://plex.local:32400"
@@ -962,3 +972,111 @@ def test_series_round_trip_through_the_cache(tmp_path: Path) -> None:
     assert snapshot.holds_series(121361, None, None, "x", None) == HOLDS_YES
     # Both registers survive the round trip, each still saying what it means.
     assert snapshot.holds_series(None, None, None, "the hollow coast", 2023) == HOLDS_PROBABLY
+
+
+# --- a page never waits on the media server: stale answers now, refreshed behind it ---
+
+
+class _Deferred:
+    """Records background work instead of running it, so a test can see what was asked."""
+
+    def __init__(self) -> None:
+        self.started: list[str] = []
+
+    def start(self, key: str, work: object) -> bool:
+        self.started.append(key)
+        return True
+
+
+class _SnapshotCache:
+    def __init__(self, cached: object) -> None:
+        self.cached = cached
+        self.saved: list[object] = []
+
+    def load(self) -> object:
+        return self.cached
+
+    def save(self, fetch: object) -> None:
+        self.saved.append(fetch)
+
+
+def _app(cached: object, *, configured: bool = True, client: object = None) -> SimpleNamespace:
+    store = SimpleNamespace(
+        load=lambda: object() if configured else None,
+        build_client=lambda **_tls: client,
+    )
+    return SimpleNamespace(state=SimpleNamespace(
+        media_server=store,
+        media_server_cache=_SnapshotCache(cached),
+        media_server_backoff=RadarrBackoff(),
+        background=_Deferred(),
+        settings=SimpleNamespace(outbound_tls=lambda: {}),
+        apps=SimpleNamespace(list_apps=lambda _kind=None: []),
+    ))
+
+
+def _stale(snapshot: str) -> tuple[str, float]:
+    return snapshot, time.time() - LIBRARY_CACHE_TTL_SECONDS - 1
+
+
+async def test_a_fresh_snapshot_answers_and_asks_the_server_nothing() -> None:
+    app = _app(("fresh", time.time()))
+
+    assert await load_media_server_snapshot(SimpleNamespace(app=app)) == "fresh"
+    assert app.state.background.started == []
+
+
+async def test_a_stale_snapshot_answers_at_once_and_is_refreshed_behind_the_page() -> None:
+    """Used to re-read the whole library while the page waited — 1.3s for 2,991 films."""
+    app = _app(_stale("stale"))
+
+    assert await load_media_server_snapshot(SimpleNamespace(app=app)) == "stale"
+    assert app.state.background.started == [MEDIA_SERVER_REFRESH_KEY]
+
+
+async def test_a_new_install_renders_without_hints_once_rather_than_waiting() -> None:
+    app = _app(None)
+
+    assert await load_media_server_snapshot(SimpleNamespace(app=app)) is None
+    assert app.state.background.started == [MEDIA_SERVER_REFRESH_KEY]
+
+
+async def test_a_server_that_just_failed_is_not_asked_again_by_every_page() -> None:
+    app = _app(_stale("stale"))
+    app.state.media_server_backoff.note_failure(MEDIA_SERVER_BACKOFF_KEY)
+
+    assert await load_media_server_snapshot(SimpleNamespace(app=app)) == "stale"
+    assert app.state.background.started == []
+
+
+async def test_an_unconfigured_server_starts_nothing() -> None:
+    app = _app(None, configured=False)
+
+    assert await load_media_server_snapshot(SimpleNamespace(app=app)) is None
+    assert app.state.background.started == []
+
+
+async def test_the_refresh_saves_what_the_server_answered() -> None:
+    fetch = object()
+
+    class _Client:
+        async def list_library(self, *, include_series: bool) -> object:
+            return fetch
+
+    app = _app(None, client=_Client())
+    await refresh_media_server_snapshot(app)
+
+    assert app.state.media_server_cache.saved == [fetch]
+    assert not app.state.media_server_backoff.should_skip(MEDIA_SERVER_BACKOFF_KEY)
+
+
+async def test_a_refresh_that_fails_keeps_the_old_snapshot_and_backs_off() -> None:
+    class _Down:
+        async def list_library(self, *, include_series: bool) -> object:
+            raise MediaServerError("could not reach Plex")
+
+    app = _app(_stale("stale"), client=_Down())
+    await refresh_media_server_snapshot(app)
+
+    assert app.state.media_server_cache.saved == []
+    assert app.state.media_server_backoff.should_skip(MEDIA_SERVER_BACKOFF_KEY)

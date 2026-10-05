@@ -152,9 +152,14 @@ above is a fresh install versus one holding twenty weeks and a warm poster cache
 
 Network use is negligible and mostly LAN. Per week: four chart pages on the
 default cadence (the fetch that finds nothing new writes nothing), a poster or
-headshot on first sight of a title, and Radarr library calls on each page load.
-A connected media server is read at most once every 15 minutes, and only while
-someone is looking at a page.
+headshot on first sight of a title, and a Radarr library read at most once a
+minute while you browse. A connected media server is read at most once every 15
+minutes, and only while someone is looking at a page.
+
+Pages do not wait on any of it. A stale media-server snapshot answers at once and
+is refreshed behind the page; posters a page has not shown before are fetched
+after it and appear on the next view; and a server that does not answer is given
+up on within a second and a half, then left alone for five minutes.
 
 ### Disk
 

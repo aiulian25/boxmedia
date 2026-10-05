@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from fastapi import HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
@@ -30,10 +30,8 @@ from app.services.apps import (
 from app.services.backoff import RadarrBackoff
 from app.services.mediaserver import (
     LIBRARY_CACHE_TTL_SECONDS,
-    RENDER_FETCH_TIMEOUT_SECONDS,
     MediaServerError,
     MediaServerSnapshot,
-    snapshot_from_library,
 )
 from app.services.posters import POSTER_WIDTH, sized
 from app.services.radarr import RadarrClient, RadarrError, RadarrMovie
@@ -276,14 +274,20 @@ def radarr_client_for_credentials(
 
 
 async def cache_posters(
-    request: Request, items: list[dict], *, width: str = POSTER_WIDTH
+    request: Request, items: list[dict], *, width: str = POSTER_WIDTH, wait: bool = False
 ) -> None:
-    """Fetch each item's remote poster once into the local cache and set a same-origin
-    `poster_local` URL (or None). Shared by the dashboard, the report detail, and the
-    television pages.
+    """Set each item's same-origin `poster_local` URL, or None while it is not cached yet.
+    Shared by the dashboard, the report detail, and the television pages.
 
-    Distinct posters download concurrently, so first-view latency is the slowest single
-    poster, not the sum of them all.
+    Never downloads. Whatever is already cached is used; the rest goes to the prefetcher,
+    which fetches it after the response, so the poster is there on the next view and the
+    template shows its placeholder until then. A page used to wait for every poster it had
+    not shown before — up to 1.2s on a first visit to a large library.
+
+    `wait=True` keeps the old in-request download, for views opened once and looked at now:
+    a series' modal, the search results, and the fix-match chooser, whose whole point is to
+    tell same-titled films apart by their artwork. A placeholder there would rarely ever be
+    replaced, and they are a handful of posters each rather than a library's worth.
 
     `width` defaults to the film width, so every caller that predates television is
     untouched. Television passes SERIES_POSTER_WIDTH — its surfaces are smaller, and one
@@ -295,8 +299,11 @@ async def cache_posters(
     # Every poster path routes through posters.sized() — the cache keys on the URL, so
     # fetching one form and pruning another would delete the whole cache.
     urls = {sized(item["poster_url"], width) for item in items if item.get("poster_url")}
-    async with httpx.AsyncClient() as client:
-        await asyncio.gather(*[cache.ensure(client, url) for url in urls])
+    if wait:
+        async with httpx.AsyncClient() as client:
+            await asyncio.gather(*[cache.ensure(client, url) for url in urls])
+    else:
+        request.app.state.poster_prefetcher.want(urls)
     for item in items:
         poster_url = sized(item.get("poster_url"), width)
         if poster_url and cache.is_cached(poster_url):
@@ -309,10 +316,19 @@ async def load_radarr_library(
     request: Request, app_id: str | None = None
 ) -> dict[int, RadarrMovie] | None:
     """A live snapshot of one Radarr's library keyed by tmdb_id, or None when
-    unavailable (no app / unreachable). Defaults to the primary. Best-effort and bounded."""
+    unavailable (no app / unreachable). Defaults to the primary. Best-effort and bounded.
+
+    A successful read is reused for a minute (`LibrarySnapshots`), so browsing from page to
+    page no longer downloads the whole library each time. Adds, upgrades and connection
+    edits made from this app clear it at once.
+    """
     app_id = app_id or request.app.state.apps.primary_id()
     if app_id is None:
         return None
+    snapshots = request.app.state.radarr_library_snapshots
+    recent = snapshots.get(app_id)
+    if recent is not None:
+        return recent
     if radarr_backoff(request).should_skip(app_id):
         # Same answer this call would have produced, without the wait. Callers already
         # treat None as "could not look" rather than "not there", so nothing downstream
@@ -327,56 +343,64 @@ async def load_radarr_library(
         radarr_backoff(request).note_failure(app_id)
         return None
     radarr_backoff(request).note_success(app_id)
-    return {movie.tmdb_id: movie for movie in library}
+    by_tmdb = {movie.tmdb_id: movie for movie in library}
+    snapshots.put(app_id, by_tmdb)
+    return by_tmdb
 
 
 MEDIA_SERVER_BACKOFF_KEY = "media-server"
+# The background refresh of that snapshot: one at a time, however many pages ask.
+MEDIA_SERVER_REFRESH_KEY = "media-server-refresh"
 
 
 async def load_media_server_snapshot(request: Request) -> MediaServerSnapshot | None:
-    """What Plex holds, for annotating one page. None when unconfigured or unknowable.
+    """What the media server holds, for annotating one page. None when unconfigured or
+    not known yet.
 
-    Reads the disk cache first: inside the TTL a render costs Plex nothing at all.
-    Outside it, one bounded fetch refreshes the cache; a slow or down server falls
-    back to the STALE snapshot rather than to nothing, because fifteen-minute-old
-    truth about a library decorates a card better than silence — and the same backoff
-    the Radarr reads use stops a dead server costing every render a timeout.
+    Never waits on the server. Inside the TTL the disk cache answers. Past it, the stale
+    snapshot still answers and a refresh starts behind the response — fifteen-minute-old
+    truth about a library decorates a card better than a page held for a full re-read,
+    measured at 1.3s for 2,991 films. A brand-new install has nothing to fall back on, so
+    its very first page renders without the hints and the next one has them; the Settings
+    Refresh button stays a synchronous read for "I just added a film".
+
+    The backoff still applies, so a dead server is not asked again on every page.
     """
-    store = request.app.state.media_server
-    if store.load() is None:
+    app = request.app
+    if app.state.media_server.load() is None:
         return None
-    cache = request.app.state.media_server_cache
-    cached = cache.load()
+    cached = app.state.media_server_cache.load()
     if cached is not None:
         snapshot, fetched_at = cached
         if time.time() - fetched_at < LIBRARY_CACHE_TTL_SECONDS:
             return snapshot
-    stale = cached[0] if cached is not None else None
-    backoff = request.app.state.media_server_backoff
-    if backoff.should_skip(MEDIA_SERVER_BACKOFF_KEY):
-        return stale
-    settings = request.app.state.settings
-    try:
-        client = store.build_client(
-            **settings.outbound_tls(),
-            timeout=RENDER_FETCH_TIMEOUT_SECONDS,
+    if not app.state.media_server_backoff.should_skip(MEDIA_SERVER_BACKOFF_KEY):
+        app.state.background.start(
+            MEDIA_SERVER_REFRESH_KEY, lambda: refresh_media_server_snapshot(app)
         )
+    return cached[0] if cached is not None else None
+
+
+async def refresh_media_server_snapshot(app: FastAPI) -> None:
+    """Re-read the media server into the cache — the half of the above nobody waits for.
+
+    Takes the app rather than the request: it runs after the response has gone. Bounded by
+    the client's own per-request timeout, so a server that hangs ends the refresh rather
+    than holding it open.
+    """
+    backoff = app.state.media_server_backoff
+    try:
+        client = app.state.media_server.build_client(**app.state.settings.outbound_tls())
         # Only walk the TV library when there is a Sonarr to compare it against.
         # Otherwise it is a full library read every fifteen minutes to answer a question
         # nobody on this install is asking.
-        include_series = bool(request.app.state.apps.list_apps(KIND_SONARR))
-        fetch = await asyncio.wait_for(
-            client.list_library(include_series=include_series),
-            timeout=RENDER_FETCH_TIMEOUT_SECONDS,
-        )
-    except (MediaServerError, TimeoutError):
+        include_series = bool(app.state.apps.list_apps(KIND_SONARR))
+        fetch = await client.list_library(include_series=include_series)
+    except MediaServerError:
         backoff.note_failure(MEDIA_SERVER_BACKOFF_KEY)
-        return stale
+        return
     backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)
-    await asyncio.to_thread(cache.save, fetch)
-    return snapshot_from_library(
-        fetch.movies, series=fetch.series, truncated=fetch.truncated
-    )
+    await asyncio.to_thread(app.state.media_server_cache.save, fetch)
 
 
 async def load_radarr_options(request: Request, app_id: str | None = None) -> RadarrOptions:

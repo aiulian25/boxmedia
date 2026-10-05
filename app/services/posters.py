@@ -12,11 +12,13 @@ import asyncio
 import hashlib
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 import httpx
 
 from app.core.filestore import atomic_write_bytes, dir_size_bytes
+from app.services.background import SingleFlight
 
 POSTER_SUBDIR = "posters"
 POSTER_SUFFIX = ".jpg"
@@ -169,3 +171,50 @@ class PosterCache:
             return None
         candidate = self._dir / name
         return candidate if candidate.exists() else None
+
+
+# How many posters download at once once a page has moved on without them. A first visit
+# to a large library used to ask for all of them together — 210 here. Bounded, a cold
+# cache asks the image hosts (TMDB's CDN, or a Radarr on the LAN) for no more than a
+# browser would, and memory holds at most this many posters in flight inside a 256 MB
+# container rather than every one at once.
+PREFETCH_CONCURRENCY = 8
+PREFETCH_KEY = "posters"
+
+
+class PosterPrefetcher:
+    """Downloads the posters a page needed but did not wait for.
+
+    A page renders whatever is already cached and a placeholder for the rest, and hands the
+    rest here; they are in place for the next view. Every page shares one queue and one
+    worker, so a URL two pages both asked for is fetched once, and a page that arrives while
+    the worker is busy simply adds to what it is already working through.
+    """
+
+    def __init__(self, cache: PosterCache, background: SingleFlight) -> None:
+        self._cache = cache
+        self._background = background
+        self._pending: set[str] = set()
+
+    def want(self, urls: Iterable[str]) -> None:
+        """Queue every URL not cached yet. Returns at once; the download comes later."""
+        self._pending.update(url for url in urls if not self._cache.is_cached(url))
+        if self._pending:
+            self._background.start(PREFETCH_KEY, self._drain)
+
+    async def _drain(self) -> None:
+        limit = asyncio.Semaphore(PREFETCH_CONCURRENCY)
+
+        async def one(client: httpx.AsyncClient, url: str) -> None:
+            async with limit:
+                await self._cache.ensure(client, url)
+            # Only once it has been tried: work cut short by a shutdown stays queued
+            # rather than being forgotten. A URL that failed is dropped too — the cache
+            # remembers the failure, and the next page that needs it will ask again.
+            self._pending.discard(url)
+
+        async with httpx.AsyncClient() as client:
+            # Re-checked after every batch, so URLs queued while one is downloading are
+            # picked up by this same worker rather than waiting for the next page view.
+            while self._pending:
+                await asyncio.gather(*[one(client, url) for url in list(self._pending)])

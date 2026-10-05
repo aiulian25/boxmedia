@@ -401,3 +401,57 @@ def test_a_submitted_root_folder_never_reaches_radarr(harness: AppHarness) -> No
         follow_redirects=False,
     )
     assert json.loads(route.calls.last.request.content)["rootFolderPath"] == "/movies"
+
+
+# --- the pages reuse Radarr's library for a minute; a write never trusts that copy ---
+
+GLADIATOR = {"tmdbId": 558449, "id": 7, "hasFile": False, "title": "Gladiator II", "year": 2024}
+
+
+@respx.mock
+def test_the_duplicate_check_reads_radarr_fresh_not_the_minute_old_copy(
+    harness: AppHarness,
+) -> None:
+    """The pages reuse a library read for a minute. A WRITE must not: a film added in
+    Radarr's own interface a moment ago has to be caught here as a duplicate, not sent
+    again on the strength of what a page saw before it existed."""
+    _mock_options([{"id": 4, "name": "HD-1080p"}], ["/movies"])
+    library = respx.get(f"{API}/movie").mock(side_effect=[
+        httpx.Response(200, json=[]),           # the page: not there yet
+        httpx.Response(200, json=[GLADIATOR]),  # added in Radarr meanwhile
+    ])
+    add_route = respx.post(f"{API}/movie").mock(return_value=httpx.Response(201, json={}))
+    harness.activate()
+    _configure(harness)
+    _seed_missing_title(harness)
+    harness.client.get(f"/reports/{REPORT_ID}")  # caches the library without it
+
+    response = harness.client.post(
+        "/add-movie", data={"tmdb_id": "558449", "title": "Gladiator II"},
+        follow_redirects=False,
+    )
+
+    assert "status=already_in_radarr" in response.headers["location"]
+    assert not add_route.called
+    assert library.call_count == 2
+
+
+@respx.mock
+def test_after_an_add_the_next_page_reads_radarr_again(harness: AppHarness) -> None:
+    """The film is in the library now, and the page the add lands on must say so rather
+    than show the minute-old copy that predates it."""
+    _mock_options([{"id": 4, "name": "HD-1080p"}], ["/movies"])
+    library = respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{API}/movie").mock(return_value=httpx.Response(201, json=GLADIATOR))
+    harness.activate()
+    _configure(harness)
+    _seed_missing_title(harness)
+
+    harness.client.get(f"/reports/{REPORT_ID}")       # read 1: cached
+    harness.client.post(
+        "/add-movie", data={"tmdb_id": "558449", "title": "Gladiator II"},
+        follow_redirects=False,
+    )                                                  # read 2: the fresh duplicate check
+    harness.client.get(f"/reports/{REPORT_ID}")       # read 3: the add cleared the copy
+
+    assert library.call_count == 3

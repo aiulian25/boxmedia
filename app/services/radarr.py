@@ -10,6 +10,7 @@ pipeline, the Settings "Test Connection" button) can react precisely.
 from __future__ import annotations
 
 import ssl
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -578,3 +579,44 @@ class RadarrClient:
         except (KeyError, TypeError) as exc:
             raise RadarrError("unexpected Radarr root-folder shape") from exc
 
+
+# How long a page may reuse a Radarr library it just read. Every Library, report and search
+# view used to download every film the server holds — the whole of GET /movie, every time,
+# which grows with the library. A minute keeps a film's "in Radarr" state close to live, and
+# every add or upgrade made from this app clears its connection at once, so nothing the user
+# just did waits out the minute. The download queue is never cached; progress stays live.
+LIBRARY_SNAPSHOT_SECONDS = 60.0
+
+
+class LibrarySnapshots:
+    """Recent full-library reads, per connection, for the pages that decorate with them.
+
+    Deliberately NOT used by the weekly run: deciding whether a film is in the library is
+    that run's whole job, and it reads the library fresh. Only successful reads are kept —
+    a connection that failed is the backoff's business, not this cache's.
+
+    Built once per app on `app.state`. `forget` is called from the sync Settings routes in
+    FastAPI's threadpool; a single dict pop is atomic, so that needs no lock.
+    """
+
+    def __init__(self, ttl_seconds: float = LIBRARY_SNAPSHOT_SECONDS) -> None:
+        self._ttl = ttl_seconds
+        self._entries: dict[str, tuple[float, dict[int, RadarrMovie]]] = {}
+
+    def get(self, app_id: str) -> dict[int, RadarrMovie] | None:
+        """A fresh copy of the last read, or None once it is older than the TTL.
+
+        A copy, so a caller that edits what it was handed cannot change what the next
+        page is told. The films themselves are frozen, so a shallow copy is enough.
+        """
+        entry = self._entries.get(app_id)
+        if entry is None or time.monotonic() - entry[0] >= self._ttl:
+            return None
+        return dict(entry[1])
+
+    def put(self, app_id: str, library: dict[int, RadarrMovie]) -> None:
+        self._entries[app_id] = (time.monotonic(), dict(library))
+
+    def forget(self, app_id: str) -> None:
+        """Drop one connection's read — it was just written to, edited, or removed."""
+        self._entries.pop(app_id, None)

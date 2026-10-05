@@ -28,7 +28,7 @@ from app.services.reports import (
 from app.services.sonarr import SonarrSeries
 from app.web.deps import radarr_url_for
 from app.web.library import DEFAULT_LIMIT, PAGE_INCREMENT
-from tests.conftest import AppHarness
+from tests.conftest import AppHarness, fetch_queued_posters
 from tests.integration.conftest import QUEUE_ROUTE, queue_records
 
 RADARR_URL = "http://radarr.local:7878"
@@ -410,9 +410,16 @@ def test_a_library_only_title_keeps_its_poster_and_shows_its_year(harness: AppHa
         _library_entry(5001, "The Thing", year=1982),
     ]))
 
+    def the_thing(page: str) -> str:
+        return page.split('class="poster-title">The Thing')[0].rsplit('class="poster-card"', 1)[1]
+
+    # The page does not wait for a poster it has never shown: had it waited, the poster
+    # would already be cached and in this frame.
+    assert "poster-empty" in the_thing(harness.client.get("/library").text)
+    fetch_queued_posters(harness)
     page = harness.client.get("/library").text
 
-    frame = page.split('class="poster-title">The Thing')[0].rsplit('class="poster-card"', 1)[1]
+    frame = the_thing(page)
     assert "/posters/" in frame          # a real poster, fetched via the local cache
     assert "poster-empty" not in frame
     # The year stands where a box-office figure would be, in the same meta line.
@@ -1131,3 +1138,19 @@ def test_a_real_tvdb_id_on_two_connections_is_still_one_card(harness: AppHarness
     assert "The Hollow Coast" in page
     assert "Attic Sonarr" in page
     assert "Loft Sonarr" not in page, "the duplicate was rendered a second time"
+
+
+@respx.mock
+def test_browsing_reuses_radarr_s_library_instead_of_downloading_it_every_page(
+    harness: AppHarness,
+) -> None:
+    """Every page used to download every film Radarr holds — the whole of GET /movie, which
+    grows with the library. Within a minute the pages share one read."""
+    harness.activate()
+    harness.client.app.state.apps.add(name="Main", url=RADARR_URL, api_key=RADARR_KEY)
+    library = respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[]))
+
+    for _ in range(3):
+        harness.client.get("/library")
+
+    assert library.call_count == 1

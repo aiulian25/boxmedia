@@ -196,7 +196,7 @@ async def _headshots(request: Request, people: list) -> list[dict]:
         {"name": person.name, "role": person.role, "poster_url": person.headshot_url}
         for person in people
     ]
-    await cache_posters(request, views, width=HEADSHOT_WIDTH)
+    await cache_posters(request, views, width=HEADSHOT_WIDTH, wait=True)
     for view in views:
         view["headshot"] = view.pop("poster_local", None)
     return views
@@ -233,7 +233,7 @@ async def show_detail(request: Request, tmdb_id: int) -> HTMLResponse:
     )
 
     poster_holder = [{"poster_url": detail.poster_url}]
-    await cache_posters(request, poster_holder, width=SERIES_POSTER_WIDTH)
+    await cache_posters(request, poster_holder, width=SERIES_POSTER_WIDTH, wait=True)
     cast = await _headshots(request, list(detail.cast[:MAX_CAST]))
     banner = STATUS_MESSAGES.get(request.query_params.get(STATUS_QUERY_KEY, ""))
     targets = _sonarr_targets(request)

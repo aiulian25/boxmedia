@@ -7,6 +7,7 @@ one-time password the test knows (so it can log in).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +64,14 @@ class AppHarness:
             follow_redirects=False,
         )
         return ACTIVE_PASSWORD
+
+
+def fetch_queued_posters(harness: AppHarness) -> None:
+    """Finish the poster downloads the last page handed off, as the server would a moment
+    after responding. TestClient tears its event loop down with each request, so work
+    started there does not reliably run to completion; the queue keeps every URL until it
+    has been tried, so draining it here is exactly what the background would have done."""
+    asyncio.run(harness.client.app.state.poster_prefetcher._drain())
 
 
 def build_harness(tmp_path: Path, **overrides: object) -> AppHarness:

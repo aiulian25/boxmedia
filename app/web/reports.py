@@ -754,7 +754,7 @@ async def search_reports(request: Request, q: str = "", fragment: int = 0) -> ob
         match["locations"] = radarr_locations(
             match["tmdb_id"], libraries, apps_by_id, queues
         )
-    await cache_posters(request, matches)
+    await cache_posters(request, matches, wait=True)
     targets = target_views(request, options_by_app)
 
     return render(
@@ -943,7 +943,7 @@ async def fix_match_form(
     # Through the local cache, like every other poster in the app: the CSP is
     # img-src 'self', so a remote URL would simply not render. At most five candidates,
     # fetched concurrently, and the weekly view has usually cached them already.
-    await cache_posters(request, candidate_views)
+    await cache_posters(request, candidate_views, wait=True)
 
     return render(
         request,
@@ -1051,6 +1051,11 @@ async def add_movie(
     if profile_id is None or not target_folder:
         return back("add_config")
 
+    snapshots = request.app.state.radarr_library_snapshots
+    # A write decides on this, so it reads the library fresh rather than from the
+    # minute-old snapshot the pages share: a film added in Radarr's own interface a
+    # moment ago must still be caught here as a duplicate.
+    snapshots.forget(app_id)
     library = await load_radarr_library(request, app_id)
     if library is not None and tmdb in library:
         return back("already_in_radarr")
@@ -1068,6 +1073,10 @@ async def add_movie(
         # than success. Re-adding is safe: the duplicate check above refuses a second
         # copy, and Radarr rejects one of its own accord.
         return back("add_failed")
+    finally:
+        # Changed — or, after a timeout, possibly changed — so the page this lands on
+        # reads the library fresh and shows the film where it now is.
+        snapshots.forget(app_id)
     request.app.state.audit.record(
         AuditAction.MOVIE_ADDED_MANUAL, actor=user.username,
         tmdb_id=tmdb, quality_profile_id=profile_id, target=app.name,
@@ -1115,6 +1124,9 @@ async def upgrade_movie(
         )
     except (RadarrError, TimeoutError):
         return _redirect_detail(request, report_id, "add_failed")
+    finally:
+        # The film's profile changed, or may have; the next page reads it fresh.
+        request.app.state.radarr_library_snapshots.forget(app_id)
     request.app.state.audit.record(
         AuditAction.MOVIE_ADDED_MANUAL, actor=user.username,
         radarr_id=rid, quality_profile_id=profile_id, action_kind="upgrade",

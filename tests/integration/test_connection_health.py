@@ -8,6 +8,7 @@ import time
 import httpx
 import respx
 
+from app.services.radarr import LibrarySnapshots
 from app.web import settings as settings_routes
 from app.web.deps import RadarrBackoff
 from app.web.settings import SettingsStatus
@@ -252,10 +253,17 @@ def test_editing_a_connection_clears_its_backoff(harness: AppHarness) -> None:
     assert library.call_count == 2
 
 
+def _no_library_reuse(harness: AppHarness) -> None:
+    """Every render really asks Radarr. The minute-long library reuse would otherwise
+    answer the later renders itself, and these tests are about the backoff alone."""
+    harness.client.app.state.radarr_library_snapshots = LibrarySnapshots(ttl_seconds=0)
+
+
 @respx.mock
 def test_a_healthy_connection_is_never_skipped(harness: AppHarness) -> None:
     # The backoff must not accumulate against a box that keeps answering.
     harness.activate()
+    _no_library_reuse(harness)
     _add_app(harness)
     library = respx.get(LIBRARY_URL).mock(return_value=httpx.Response(200, json=[]))
 
@@ -270,6 +278,7 @@ def test_one_dead_connection_does_not_silence_a_healthy_one(harness: AppHarness)
     """Keyed per connection, not per app: the whole point of the multi-Radarr work is
     that one box being down leaves the other usable."""
     harness.activate()
+    _no_library_reuse(harness)
     _add_app(harness)
     second = "http://second.local:7878"
     harness.client.app.state.apps.add(name="Second", url=second, api_key=RADARR_KEY)

@@ -71,9 +71,6 @@ FETCHED_AT_KEY = "fetched_at"
 TRUNCATED_KEY = "truncated"
 
 REQUEST_TIMEOUT_SECONDS = 10.0
-# A page render must never hang on a slow media server; the fetch gets this long in
-# total before the page falls back to the cached snapshot.
-RENDER_FETCH_TIMEOUT_SECONDS = 6.0
 # Refreshed at most this often by page renders; inside the window every render costs
 # zero Plex requests. The Settings button bypasses it for "I just added a film".
 LIBRARY_CACHE_TTL_SECONDS = 900.0

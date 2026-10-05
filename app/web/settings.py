@@ -721,8 +721,10 @@ def update_app(
     except KeyError:
         return _redirect(request, SettingsStatus.APP_INVALID)
     # Fixing the address or the key is the admin saying "try again" — waiting out the
-    # backoff after a correction would look like the correction did not work.
+    # backoff after a correction would look like the correction did not work. The same
+    # for the library read the pages reuse: it may describe the server before the edit.
     radarr_backoff(request).note_success(app_id)
+    request.app.state.radarr_library_snapshots.forget(app_id)
     return _redirect(request, SettingsStatus.APP_UPDATED)
 
 
@@ -804,6 +806,7 @@ def delete_app(request: Request, app_id: str) -> RedirectResponse:
         request.app.state.radarr_options.forget(app_id)
         request.app.state.sonarr_options.forget(app_id)
         request.app.state.series_cache.forget(app_id)
+        request.app.state.radarr_library_snapshots.forget(app_id)
         radarr_backoff(request).forget(app_id)
     except KeyError:
         return _redirect(request, SettingsStatus.APP_INVALID)

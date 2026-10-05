@@ -17,10 +17,12 @@ import trustme
 from app.services.radarr import (
     CONNECT_TIMEOUT_SECONDS,
     QUEUE_PAGE_SIZE,
+    LibrarySnapshots,
     RadarrAuthError,
     RadarrClient,
     RadarrConnectionError,
     RadarrError,
+    RadarrMovie,
     _image_from,
     build_verify,
     home_server_timeout,
@@ -541,3 +543,42 @@ def test_every_home_server_client_connects_fast_and_reads_patiently(client) -> N
 def test_the_connect_limit_never_exceeds_the_whole_request() -> None:
     assert home_server_timeout(1.0).connect == 1.0
 
+
+# --- a page reuses a library it just read, and forgets it the moment it changes ---
+
+
+def _films(*tmdb_ids: int) -> dict:
+    return {tmdb: RadarrMovie(tmdb_id=tmdb, title=f"Film {tmdb}", year=2026, has_file=False)
+            for tmdb in tmdb_ids}
+
+
+def test_a_library_read_is_reused_until_it_expires(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr("app.services.radarr.time.monotonic", lambda: clock[0])
+    snapshots = LibrarySnapshots(ttl_seconds=60.0)
+    snapshots.put("app-1", _films(1, 2))
+
+    clock[0] += 59
+    assert set(snapshots.get("app-1")) == {1, 2}
+    clock[0] += 2
+    assert snapshots.get("app-1") is None
+
+
+def test_forgetting_a_connection_drops_only_that_one() -> None:
+    snapshots = LibrarySnapshots()
+    snapshots.put("app-1", _films(1))
+    snapshots.put("app-2", _films(2))
+
+    snapshots.forget("app-1")
+
+    assert snapshots.get("app-1") is None
+    assert set(snapshots.get("app-2")) == {2}
+
+
+def test_a_page_editing_what_it_was_handed_cannot_change_the_next_page() -> None:
+    snapshots = LibrarySnapshots()
+    snapshots.put("app-1", _films(1))
+
+    snapshots.get("app-1").clear()
+
+    assert set(snapshots.get("app-1")) == {1}
