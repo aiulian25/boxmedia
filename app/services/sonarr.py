@@ -39,7 +39,7 @@ from datetime import datetime
 import httpx
 
 from app.core.values import int_or_none
-from app.services.radarr import build_verify
+from app.services.radarr import build_verify, home_server_timeout
 
 API_PREFIX = "/api/v3"
 REQUEST_TIMEOUT_SECONDS = 15.0
@@ -308,7 +308,7 @@ class SonarrClient:
         return httpx.AsyncClient(
             base_url=f"{self._base_url}{API_PREFIX}",
             headers={API_KEY_HEADER: self._api_key},
-            timeout=self._timeout,
+            timeout=home_server_timeout(self._timeout),
             verify=self._httpx_verify(),
         )
 

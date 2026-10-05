@@ -15,6 +15,7 @@ import respx
 import trustme
 
 from app.services.radarr import (
+    CONNECT_TIMEOUT_SECONDS,
     QUEUE_PAGE_SIZE,
     RadarrAuthError,
     RadarrClient,
@@ -22,6 +23,7 @@ from app.services.radarr import (
     RadarrError,
     _image_from,
     build_verify,
+    home_server_timeout,
 )
 
 BASE_URL = "http://radarr.local:7878"
@@ -510,3 +512,32 @@ async def test_the_queue_is_asked_for_one_bounded_page() -> None:
     await _client().queue()
 
     assert route.calls.last.request.url.params["pageSize"] == str(QUEUE_PAGE_SIZE)
+
+
+# --- a dead home server is found out fast, and read time is left alone ---
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        pytest.param(lambda: RadarrClient("http://r.local", "k", timeout=4.0), id="radarr"),
+        pytest.param(lambda: __import__("app.services.sonarr", fromlist=["SonarrClient"])
+                     .SonarrClient("http://s.local", "k", timeout=4.0), id="sonarr"),
+        pytest.param(lambda: __import__("app.services.mediaserver", fromlist=["PlexClient"])
+                     .PlexClient("http://p.local", "t", timeout=4.0), id="plex"),
+        pytest.param(lambda: __import__("app.services.mediaserver", fromlist=["JellyfinClient"])
+                     .JellyfinClient("http://j.local", "t", timeout=4.0), id="jellyfin"),
+    ],
+)
+def test_every_home_server_client_connects_fast_and_reads_patiently(client) -> None:
+    """One number for both made a box that was not there cost the whole read budget to
+    discover — measured at 3.1s for a LAN address with nothing behind it, on every page."""
+    timeout = client()._client().timeout
+
+    assert timeout.connect == CONNECT_TIMEOUT_SECONDS
+    assert timeout.read == 4.0
+
+
+def test_the_connect_limit_never_exceeds_the_whole_request() -> None:
+    assert home_server_timeout(1.0).connect == 1.0
+

@@ -12,11 +12,11 @@ import threading
 import time
 
 # How long a connection that just failed is left alone before a caller bothers it again.
-# Shorter than the poster cache's 300s equivalent: a Radarr comes back on a timescale a
-# person notices, and the cost of guessing wrong is only that one page renders without a
-# library it could have had. Long enough that a dead box costs one timeout a minute
-# rather than one per page view.
-RETRY_AFTER_SECONDS = 60.0
+# Five minutes, matching the poster cache's equivalent. At one minute a dead box was still
+# the slowest thing on the page: browsing for longer than that paid its timeout over and
+# over. Recovery is not hidden by the wait — editing a connection's details clears it
+# (`note_success`), and the Settings health dots and Test Connection never consult it.
+RETRY_AFTER_SECONDS = 300.0
 
 
 class RadarrBackoff:

@@ -34,7 +34,7 @@ from app.core import crypto, filestore
 from app.core.audit import AuditAction, AuditLog
 from app.services.apps import API_KEY_MASK, InvalidAppError, normalize_url
 from app.services.matcher import normalize_title
-from app.services.radarr import build_verify
+from app.services.radarr import build_verify, home_server_timeout
 
 MEDIA_SERVER_SCHEMA_VERSION = 1
 MEDIA_SERVER_FILENAME = "mediaserver.yml"
@@ -372,7 +372,7 @@ class PlexClient:
             base_url=self._base_url,
             headers={"X-Plex-Token": self._token, "Accept": "application/json"},
             verify=self._verify,
-            timeout=self._timeout,
+            timeout=home_server_timeout(self._timeout),
         )
 
     async def _get_json(self, client: httpx.AsyncClient, path: str, **params: object) -> dict:
@@ -540,7 +540,7 @@ class JellyfinClient:
             base_url=self._base_url,
             headers={"X-Emby-Token": self._token, "Accept": "application/json"},
             verify=self._verify,
-            timeout=self._timeout,
+            timeout=home_server_timeout(self._timeout),
         )
 
     async def _items(

@@ -139,6 +139,22 @@ class RadarrLookupResult:
     rating: float | None = None
 
 
+# Connecting to a server on your own network takes milliseconds; READING a large library
+# can legitimately take seconds. One number for both meant a box that was not there cost
+# the whole read budget to discover — measured at 3.1s for a LAN address with nothing
+# behind it, the kernel giving up on its own, on every page that asked. Connect gets a
+# short limit of its own, with headroom for HTTPS to a box that is not on the LAN;
+# reading keeps the caller's.
+CONNECT_TIMEOUT_SECONDS = 1.5
+
+
+def home_server_timeout(total: float) -> httpx.Timeout:
+    """The timeout for a client talking to one of the user's own servers: `total` for
+    the request, and never more than `CONNECT_TIMEOUT_SECONDS` to find it is there.
+    Shared by Radarr, Sonarr and the media servers, like `build_verify` beside it."""
+    return httpx.Timeout(total, connect=min(total, CONNECT_TIMEOUT_SECONDS))
+
+
 def build_verify(*, tls_verify: bool, ca_file: str | None) -> bool | str:
     """Translate config into httpx's `verify` argument."""
     if not tls_verify:
@@ -261,7 +277,7 @@ class RadarrClient:
         return httpx.AsyncClient(
             base_url=f"{self._base_url}{API_PREFIX}",
             headers={API_KEY_HEADER: self._api_key},
-            timeout=self._timeout,
+            timeout=home_server_timeout(self._timeout),
             verify=self._httpx_verify(),
         )
 
@@ -561,3 +577,4 @@ class RadarrClient:
             return [item["path"] for item in self._json_list(response)]
         except (KeyError, TypeError) as exc:
             raise RadarrError("unexpected Radarr root-folder shape") from exc
+
