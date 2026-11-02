@@ -20,17 +20,18 @@
    only produce a redirect the poller cannot use. #}
 <body class="bg-background text-on-background min-h-screen font-body-md antialiased"{% if current_user %} data-progress-url="{{ url_base }}/progress"{% endif %}>
 {% if current_user %}
+<a class="skip-link" href="#main">Skip to content</a>
 <header class="topnav">
   <a class="brand" href="{{ url_base }}/library">
     <img class="brand-mark" src="{{ url_base }}/static/logo.png?v={{ asset_version }}" alt="" width="32" height="32">
     <span>{{ brand }}</span>
   </a>
-  <nav class="navlinks">
-    <a href="{{ url_base }}/library" class="{% if active_nav == 'library' %}active{% endif %}">Library</a>
-    <a href="{{ url_base }}/reports" class="{% if active_nav == 'boxoffice' %}active{% endif %}">Box Office</a>
-    <a href="{{ url_base }}/discover" class="{% if active_nav == 'discover' %}active{% endif %}">Discover</a>
-    <a href="{{ url_base }}/calendar" class="{% if active_nav == 'calendar' %}active{% endif %}">Calendar</a>
-    <a href="{{ url_base }}/settings" class="{% if active_nav == 'settings' %}active{% endif %}">Settings</a>
+  <nav class="navlinks" aria-label="Main">
+    <a href="{{ url_base }}/library" class="{% if active_nav == 'library' %}active{% endif %}"{% if active_nav == 'library' %} aria-current="page"{% endif %}>Library</a>
+    <a href="{{ url_base }}/reports" class="{% if active_nav == 'boxoffice' %}active{% endif %}"{% if active_nav == 'boxoffice' %} aria-current="page"{% endif %}>Box Office</a>
+    <a href="{{ url_base }}/discover" class="{% if active_nav == 'discover' %}active{% endif %}"{% if active_nav == 'discover' %} aria-current="page"{% endif %}>Discover</a>
+    <a href="{{ url_base }}/calendar" class="{% if active_nav == 'calendar' %}active{% endif %}"{% if active_nav == 'calendar' %} aria-current="page"{% endif %}>Calendar</a>
+    <a href="{{ url_base }}/settings" class="{% if active_nav == 'settings' %}active{% endif %}"{% if active_nav == 'settings' %} aria-current="page"{% endif %}>Settings</a>
   </nav>
   {# One group so the bar keeps three flex children and justify-between spaces the
      links exactly as it did before the chip existed. #}
@@ -48,7 +49,7 @@
   </div>
 </header>
 {% endif %}
-<main class="content">
+<main id="main" class="content" tabindex="-1">
   {% block content %}{% endblock %}
 </main>
 {# Every transient message in the app lands here, so they all share one size, one corner
@@ -90,7 +91,7 @@
 {% if current_user %}
 {# Native <dialog>: no library, no inline script, so script-src 'self' is untouched.
    Empty until app.js fills it from /movies/<id>?fragment=1. #}
-<dialog id="movie-dialog" class="movie-dialog" aria-label="Movie details">
+<dialog id="movie-dialog" class="movie-dialog" aria-label="Title details">
   <form method="dialog" class="movie-dialog-close"><button type="submit" aria-label="Close">&times;</button></form>
   <div data-movie-body></div>
 </dialog>

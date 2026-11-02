@@ -81,7 +81,7 @@ html.light {
   --bm-on-surface: #1a1c1c;
   --bm-on-surface-variant: #444748;
   --bm-primary: #131313;
-  --bm-outline: #5f6365;
+  --bm-outline: #5c6062;
   --bm-outline-variant: #c4c7c8;
   --bm-error: #b3261e;
   --bm-slate-panel: #e2e8f0;
@@ -176,19 +176,47 @@ html.light {
     @apply bg-surface-container-low border border-slate-border text-primary px-3 py-2 w-full;
   }
   select:focus { @apply outline-none border-primary; }
+  /* After the rules above, which it overrides for the keyboard only: a 1px border change is
+     not enough to find your place by. Primary is the strongest ink in either theme. */
+  a:focus-visible, button:focus-visible, summary:focus-visible,
+  input:focus-visible, select:focus-visible, textarea:focus-visible {
+    @apply outline outline-2 outline-offset-2 outline-primary;
+  }
 }
 
 @layer components {
-  .topnav {
-    @apply flex items-center justify-between h-16 px-margin border-b border-outline-variant
-           bg-surface sticky top-0 z-40;
+  /* Off the top until it is focused, so it is the first stop for the keyboard and nothing
+     for anyone else. Up rather than sideways, which could widen the page. */
+  .skip-link {
+    @apply absolute left-2 top-2 z-50 -translate-y-24 px-4 py-2 no-underline bg-surface
+           border border-primary text-primary focus:translate-y-0;
   }
-  .brand { @apply flex items-center gap-2 text-headline-sm font-semibold text-primary no-underline; }
+  /* In markup order below `md`, so the keyboard meets things where the eye does: the brand,
+     the links, which wrap if they must, then the account. Sticky only from `md`, because these
+     rows would hide too much of a phone screen, and they would be taller than the scroll
+     margin that clears a linked card from the bar. */
+  .topnav {
+    @apply flex flex-wrap items-center justify-between gap-x-4 gap-y-2 min-h-16 py-2 px-gutter
+           border-b border-outline-variant bg-surface z-40
+           md:flex-nowrap md:h-16 md:py-0 md:px-margin md:sticky md:top-0;
+  }
+  .brand {
+    @apply flex items-center gap-2 shrink-0 w-full text-headline-sm font-semibold text-primary
+           no-underline md:w-auto;
+  }
   .brand-mark { @apply w-8 h-8 shrink-0; }
-  .navlinks { @apply flex gap-6; }
-  .navlinks a { @apply text-body-md text-outline no-underline hover:text-primary; }
+  .navlinks {
+    @apply flex flex-wrap gap-x-4 gap-y-1 w-full md:w-auto md:flex-nowrap md:shrink-0 md:gap-6;
+  }
+  .navlinks a {
+    @apply inline-block py-1 whitespace-nowrap text-body-md text-outline no-underline
+           hover:text-primary;
+  }
   .navlinks a.active { @apply text-primary; }
-  .topnav-account { @apply flex items-center gap-4 min-w-0; }
+  .topnav-account { @apply flex items-center justify-between gap-4 min-w-0 w-full md:w-auto; }
+  /* What the TMDB licence asks for: its logo beside the notice, and quieter than our own brand. */
+  .tmdb-attribution { @apply flex flex-wrap items-center gap-3 mt-4; }
+  .tmdb-attribution img { @apply h-3 w-auto; }
   .user-chip { @apply flex items-center gap-2 min-w-0; }
   .avatar {
     @apply grid place-items-center w-8 h-8 shrink-0 rounded-full select-none
@@ -197,9 +225,10 @@ html.light {
   /* Truncates rather than pushes Logout off the bar when a display name is long or
      a translation runs wide; the disc alone identifies the account below `sm`. */
   .user-name { @apply hidden sm:block truncate max-w-[12rem] text-body-md text-outline; }
+  .logout { @apply shrink-0; }
   .logout button { @apply bg-transparent border border-outline-variant text-primary text-label-md px-4 py-2 hover:bg-surface-container-high; }
 
-  .content { @apply px-margin py-8 max-w-6xl mx-auto; }
+  .content { @apply px-gutter md:px-margin py-8 max-w-6xl mx-auto focus:outline-none; }
 
   /* Movie detail — used both inside the dialog and as a standalone page. */
   .movie-dialog {
@@ -450,7 +479,7 @@ html.light {
   .gross-weeks { @apply text-label-sm text-outline; }
 
   .run-actions { @apply flex flex-wrap items-center gap-3 mb-8; }
-  .run-week { @apply flex items-center gap-3; }
+  .run-week { @apply flex flex-wrap items-center gap-3; }
   /* One 40px row: every control shares a height and a minimum width so they read as a
      matched set (btn-* carry py-3 + mt-2, which offset them otherwise).
      `a` is in here because the weekly view's week nav renders a LINK when that week
@@ -467,7 +496,7 @@ html.light {
   /* Mirrors .run-week so the search shares the row's alignment and 40px control height;
      ml-auto puts it at the right end, and .run-actions' flex-wrap drops it to its own
      line on a narrow window rather than overflowing. */
-  .run-search { @apply flex items-center gap-3 ml-auto; }
+  .run-search { @apply flex flex-wrap items-center gap-3 ml-auto; }
   .run-search input { @apply w-60; }
 
   /* Search results — used inside the dialog and as a standalone page, like .movie-detail. */

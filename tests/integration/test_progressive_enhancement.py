@@ -289,3 +289,14 @@ def test_closing_the_modal_spends_the_entry_it_pushed() -> None:
     closer = source.split('dialog.addEventListener("close"')[1].split("});")[0]
 
     assert "window.history.back()" in closer
+
+
+def test_the_dialog_stays_an_enhancement_with_a_name_of_its_own(harness: AppHarness) -> None:
+    """app.js replaces the name with the title it opened. Until then it must not claim a kind:
+    the same dialog shows films, series and search results."""
+    harness.activate()
+
+    page = harness.client.get("/library").text
+
+    assert '<dialog id="movie-dialog" class="movie-dialog" aria-label="Title details">' in page
+

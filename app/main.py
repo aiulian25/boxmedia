@@ -14,11 +14,11 @@ from datetime import timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
-from app.core import crypto, security
+from app.core import crypto, filestore, security
 from app.core.audit import AUDIT_FILENAME, AuditLog
 from app.core.config import Settings, get_settings
 from app.core.security import LoginRateLimiter
@@ -33,6 +33,8 @@ from app.services.corrections import CorrectionStore
 from app.services.discovery import DiscoverCache, DiscoveryStore
 from app.services.filters import FiltersStore
 from app.services.ignore import IgnoreStore
+from app.services.ingestion_state import IngestionStateStore
+from app.services.maintenance import MaintenanceGate, recover_interrupted_restore
 from app.services.mediaserver import MediaServerLibraryCache, MediaServerStore
 from app.services.pipeline import Pipeline
 from app.services.posters import PosterCache, PosterPrefetcher
@@ -44,6 +46,7 @@ from app.services.reports import ReportsStore
 from app.services.scheduler import BoxMediaScheduler
 from app.services.series import SeriesLibraryCache
 from app.services.sonarr_options import SonarrOptionsCache
+from app.services.upcoming import UpcomingCache
 from app.services.users import UserStore
 from app.web import (
     auth,
@@ -67,8 +70,13 @@ FAVICON_MEDIA_TYPE = "image/vnd.microsoft.icon"
 FAVICON_FILENAME = "favicon.ico"
 STATIC_MOUNT = "/static"
 SEE_OTHER = 303
+SERVICE_UNAVAILABLE = 503
+RETRY_AFTER_SECONDS = "15"
+MAINTENANCE_MESSAGE = "BoxMedia is restoring a backup. Try again in a moment."
 _STATIC_DIR = str(Path(__file__).resolve().parent / "static")
-_VERSIONED_ASSETS = (("css", "app.css"), ("js", "app.js"), ("logo.png",), (FAVICON_FILENAME,))
+_VERSIONED_ASSETS = (
+    ("css", "app.css"), ("js", "app.js"), ("img", "tmdb.svg"), ("logo.png",), (FAVICON_FILENAME,),
+)
 ASSET_VERSION_LENGTH = 8
 
 
@@ -104,6 +112,12 @@ def _print_bootstrap_banner(password: str) -> None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    # Before anything reads or repairs this directory: recovery would otherwise "undo" a
+    # restore another live process was in the middle of.
+    filestore.claim_data_dir(settings.data_dir)
+    # Next: an interrupted restore can leave config/ missing, and both lines below
+    # would answer that by creating an empty one and a brand new admin inside it.
+    recover_interrupted_restore(settings.data_dir)
     settings.ensure_data_dirs()
 
     # Build the audit log from THIS settings object (composition root), not the
@@ -132,6 +146,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             reports=running_app.state.reports,
             refresher=running_app.state.refresher,
             backfill=running_app.state.backfill,
+            maintenance=running_app.state.maintenance,
+            ingestion=running_app.state.ingestion,
         )
         scheduler.start()
         running_app.state.scheduler = scheduler
@@ -156,10 +172,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.apps = AppsStore(settings.config_dir, key=encryption_key, audit=audit)
     app.state.filters = FiltersStore(settings.config_dir, audit=audit)
     app.state.reports = ReportsStore(settings.history_dir)
+    app.state.ingestion = IngestionStateStore(settings.config_dir)
     app.state.posters = PosterCache(settings.cache_dir)
     # Work a page starts and does not wait for: posters it had not shown before, and the
     # media server's library once its snapshot is stale.
-    app.state.background = SingleFlight()
+    app.state.maintenance = MaintenanceGate()
+    app.state.background = SingleFlight(app.state.maintenance)
     app.state.poster_prefetcher = PosterPrefetcher(app.state.posters, app.state.background)
     app.state.release_ids = ReleaseIdCache(settings.cache_dir)
     app.state.ignore = IgnoreStore(settings.config_dir, audit=audit)
@@ -186,6 +204,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.media_server_cache = MediaServerLibraryCache(settings.cache_dir)
     # The two Trakt shelves. The Discover page renders from here and only from here.
     app.state.discover_cache = DiscoverCache(settings.cache_dir)
+    app.state.upcoming_cache = UpcomingCache(settings.cache_dir)
     # One week, both media. Merged rather than per connection: a day column shows
     # everything arriving that day, whichever server it came from.
     app.state.calendar_cache = CalendarCache(settings.cache_dir)
@@ -202,7 +221,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         backoff=app.state.radarr_backoff,
     )
     app.state.backups = BackupService(
-        settings.data_dir, settings.backups_dir, key=encryption_key, audit=audit
+        settings.data_dir,
+        settings.backups_dir,
+        key=encryption_key,
+        audit=audit,
+        maintenance=app.state.maintenance,
     )
     app.state.pipeline = Pipeline(
         apps=app.state.apps,
@@ -230,7 +253,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lock_seconds=settings.login_lock_seconds,
     )
     app.state.scheduler = None  # populated at Step 15
-    app.state.backfill = BackfillRunner(app.state.pipeline)
+    app.state.backfill = BackfillRunner(
+        app.state.pipeline, app.state.maintenance, app.state.ingestion
+    )
+    # What a restore stops rather than waits for: these would outlast its patience, and they
+    # are offered again afterwards. A scheduled job or a request is waited for instead.
+    app.state.maintenance.add_stop_hook(app.state.backfill.cancel)
+    app.state.maintenance.add_stop_hook(app.state.background.cancel_all)
     app.state.asset_version = _asset_version()
 
     app.mount(
@@ -303,6 +332,22 @@ def _register_gate(app: FastAPI, settings: Settings) -> None:
         if path in {HEALTH_PATH, FAVICON_PATH} or path.startswith(static_prefix):
             return await call_next(request)
 
+        # Counted until the handler has finished, so a restore can wait for it, and refused
+        # while one runs, so nothing can read or write across the swap.
+        maintenance = app.state.maintenance
+        if not maintenance.try_enter():
+            return PlainTextResponse(
+                maintenance.refusal or MAINTENANCE_MESSAGE,
+                status_code=SERVICE_UNAVAILABLE,
+                headers={"Retry-After": RETRY_AFTER_SECONDS},
+            )
+        try:
+            return await _authorized(request, call_next)
+        finally:
+            maintenance.leave()
+
+    async def _authorized(request: Request, call_next):  # type: ignore[no-untyped-def]
+        path = request.url.path
         session = app.state.sessions.get(request.cookies.get(COOKIE_NAME))
         request.state.session = session
         request.state.user = (

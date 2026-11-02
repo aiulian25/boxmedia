@@ -16,10 +16,23 @@
   var TESTING_LABEL = "Testing…";
   var SAVING_LABEL = "Saving…";
   var SAVED_ALL_STATUS = "settings_saved";
-  var SAVE_FAILED_STATUS = "settings_save_failed";
+  var STATUS_KIND_SUCCESS = "success";
+  var SAVED_PREFIX = "Saved: ";
+  var NOT_SAVED_PREFIX = "Not saved: ";
+  var NOTHING_SAVED_PREFIX = "Nothing was saved. Check ";
+  var INVALID_SUFFIX = ", which has a field that needs correcting.";
+  var SAVE_REFUSED_REASON =
+    "BoxMedia refused this. Your edits are still here, so note them before reloading if it keeps happening.";
+  var SESSION_ENDED_REASON =
+    "Your session has ended, so this was not saved. Sign in again in another tab, then press Save here.";
+  var CSRF_REFUSED_STATUS = 403;
+  var SAVE_UNCONFIRMED_REASON =
+    "BoxMedia did not confirm this was saved. Reload the page to check what is stored.";
+  var UNREACHABLE_REASON = "Could not reach BoxMedia. Your edits are still here, so try again.";
   // Marks the history entry the modal pushes for itself, so Back closes the modal
   // instead of leaving the shelf the reader was on.
   var MODAL_STATE_KEY = "boxmediaModal";
+  var DIALOG_HEADING_SELECTOR = "h1, h2, h3";
 
   function readStored(key) {
     try {
@@ -95,8 +108,28 @@
   // out does not also fire a history.back() and race the assignment.
   var leavingForFallback = false;
 
+  // The request allowed to speak for the dialog. Only ever the newest one: the dialog is
+  // shared, so a slow answer about the last title would otherwise replace this title, and
+  // a slow failure would navigate away from it.
+  var currentOpening = null;
+  var dialogLoadingLabel = dialog && dialog.getAttribute("aria-label");
+
+  function abandonOpening() {
+    if (currentOpening) {
+      currentOpening.abort();
+      currentOpening = null;
+    }
+  }
+
   function openModal(url, fallbackHref) {
+    abandonOpening();
+    var opening = new AbortController();
+    currentOpening = opening;
+    var stillCurrent = function () {
+      return currentOpening === opening && dialog.open;
+    };
     dialogBody.textContent = "Loading…";
+    dialog.setAttribute("aria-label", dialogLoadingLabel);
     dialog.showModal();
     // A history entry of its own, at the SAME url — the address bar does not change,
     // but Back now has something to consume. Without it, Back dismisses the modal by
@@ -108,7 +141,7 @@
       window.history.pushState(pushed, "");
     }
     window
-      .fetch(url, { credentials: "same-origin" })
+      .fetch(url, { credentials: "same-origin", signal: opening.signal })
       .then(function (response) {
         if (!response.ok) {
           throw new Error(String(response.status));
@@ -116,11 +149,21 @@
         return response.text();
       })
       .then(function (html) {
+        if (!stillCurrent()) {
+          return;
+        }
         // Server-rendered, same-origin, already autoescaped by Jinja.
         dialogBody.innerHTML = html;
         dialog.scrollTop = 0;
+        var heading = dialogBody.querySelector(DIALOG_HEADING_SELECTOR);
+        if (heading) {
+          dialog.setAttribute("aria-label", heading.textContent.trim());
+        }
       })
       .catch(function () {
+        if (!stillCurrent()) {
+          return;
+        }
         // Never strand the user in an empty modal — fall back to the real page.
         leavingForFallback = true;
         dialog.close();
@@ -172,6 +215,11 @@
       }
     });
     dialog.addEventListener("close", function () {
+      // This event is queued, so it can arrive after the next title has already opened.
+      if (dialog.open) {
+        return;
+      }
+      abandonOpening();
       dialogBody.textContent = "";
       // Closed by Escape, the × or the backdrop: the entry opening it pushed is still
       // current, so spend it. Otherwise the reader would have to press Back twice to
@@ -350,6 +398,12 @@
     // here: this file has no idea what url_base is, which is why every address it uses
     // comes from the markup.
     var settingsUrl = saveBar.getAttribute("data-settings-url");
+    var saveBarText = saveBar.querySelector("[data-save-text]");
+    var saveBarDefaultText = saveBarText.textContent;
+    var saveLabel = saveButton.textContent;
+    // The server's own table of what each status means, so there is one list of them.
+    var saveStatuses = JSON.parse(saveBar.getAttribute("data-save-statuses"));
+    var savedDuringThisPage = false;
 
     var showBar = function (visible) {
       saveBar.hidden = !visible;
@@ -386,22 +440,92 @@
       initial.set(form, snapshot(form));
       form.addEventListener("input", function () { recheck(form); });
       form.addEventListener("change", function () { recheck(form); });
+      // An edit is the reader answering the error, so it stops standing over the card.
+      form.addEventListener("input", function () {
+        var note = form.previousElementSibling;
+        if (note && note.hasAttribute("data-save-error")) {
+          note.parentNode.removeChild(note);
+        }
+      });
     });
 
     discardButton.addEventListener("click", function () {
+      // reset() goes back to what was rendered, which a card saved since no longer matches.
+      if (savedDuringThisPage) {
+        window.location.href = settingsUrl;
+        return;
+      }
       // Back to what the server rendered, which for every field on this page is what is
       // stored. No request: discarding a change that was never sent is a local matter.
       Array.prototype.forEach.call(dirty, function (form) { form.reset(); });
       dirty = [];
+      clearErrors();
+      saveBarText.textContent = saveBarDefaultText;
       showBar(false);
       // reset() fires no input event, so nothing above re-reads the forms; they now hold
       // exactly what was rendered, which is what `initial` already remembers.
     });
 
+    // Why a response counts as saved. Only a known success status on the Settings page
+    // itself: a login page, a proxy's page or a status nobody knows are all things that are
+    // not "saved", and a save reported wrongly is worse than one reported as failed.
+    var outcomeOf = function (response) {
+      if (!response.ok) {
+        return { saved: false, reason: SAVE_REFUSED_REASON };
+      }
+      var landed = new URL(response.url);
+      if (landed.pathname !== new URL(settingsUrl, window.location.href).pathname) {
+        return { saved: false, reason: SESSION_ENDED_REASON };
+      }
+      var known = saveStatuses[landed.searchParams.get(STATUS_PARAM)];
+      if (!known) {
+        return { saved: false, reason: SAVE_UNCONFIRMED_REASON };
+      }
+      return { saved: known[0] === STATUS_KIND_SUCCESS, reason: known[1] };
+    };
+
+    var clearErrors = function () {
+      Array.prototype.forEach.call(document.querySelectorAll("[data-save-error]"), function (node) {
+        node.parentNode.removeChild(node);
+      });
+    };
+
+    var showCardError = function (form, reason) {
+      var note = document.createElement("p");
+      note.className = "banner-warn";
+      note.setAttribute("data-save-error", "");
+      note.setAttribute("role", "alert");
+      // textContent, because a card's name is whatever someone called their connection.
+      note.textContent = cardName(form) + ": " + reason;
+      form.parentNode.insertBefore(note, form);
+      note.scrollIntoView({ block: "center" });
+    };
+
+    var cardName = function (form) {
+      return form.getAttribute("data-settings-form");
+    };
+
+    var stopSaving = function (message) {
+      saveBarText.textContent = message;
+      saveButton.disabled = false;
+      discardButton.disabled = false;
+      saveButton.textContent = saveLabel;
+    };
+
     saveButton.addEventListener("click", function () {
       if (saveButton.disabled || !dirty.length) {
         return;
       }
+      clearErrors();
+      // All of them before any of them, so an invalid last card cannot leave the first
+      // ones written and the rest not.
+      var invalid = dirty.filter(function (form) { return !form.checkValidity(); })[0];
+      if (invalid) {
+        stopSaving(NOTHING_SAVED_PREFIX + cardName(invalid) + INVALID_SUFFIX);
+        invalid.reportValidity();
+        return;
+      }
+      saveBarText.textContent = saveBarDefaultText;
       saveButton.disabled = true;
       discardButton.disabled = true;
       saveButton.textContent = SAVING_LABEL;
@@ -409,16 +533,45 @@
       // One at a time, in page order: two of these write the same filters file, and
       // firing them together would let the later read clobber the earlier write.
       var pending = dirty.slice();
-      var problem = null;
+      var savedNames = [];
+
+      // A form's token belongs to the session that rendered it, so signing back in elsewhere
+      // leaves this page's stale. Take the new one from the Settings page, once per save.
+      var renewedToken = false;
+      var renewTokens = function () {
+        return fetch(settingsUrl, { credentials: "same-origin" })
+          .then(function (response) { return response.text(); })
+          .then(function (html) {
+            var fresh = new DOMParser()
+              .parseFromString(html, "text/html")
+              .querySelector("input[name=csrf_token]");
+            if (!fresh) {
+              throw new Error("no token");
+            }
+            Array.prototype.forEach.call(
+              document.querySelectorAll("input[name=csrf_token]"),
+              function (input) { input.value = fresh.value; }
+            );
+            Array.prototype.forEach.call(settingsForms, function (form) {
+              if (dirty.indexOf(form) === -1) {
+                initial.set(form, snapshot(form));
+              }
+            });
+          });
+      };
+
+      var failed = function (form, reason) {
+        var saved = savedNames.length ? SAVED_PREFIX + savedNames.join(", ") + ". " : "";
+        stopSaving(saved + NOT_SAVED_PREFIX + cardName(form) + ".");
+        showCardError(form, reason);
+      };
 
       var next = function () {
         var form = pending.shift();
         if (!form) {
-          // Reload so every card shows what is stored rather than what was typed, with
-          // one banner for the lot. A form that objected names ITS status instead, since
-          // "Settings saved" over a rejected value would be a lie.
+          // Reload so every card shows what is stored rather than what was typed.
           window.location.href = settingsUrl + "?" + STATUS_PARAM + "=" +
-            encodeURIComponent(problem || SAVED_ALL_STATUS);
+            encodeURIComponent(SAVED_ALL_STATUS);
           return;
         }
         fetch(form.getAttribute("action"), {
@@ -426,17 +579,34 @@
           body: new FormData(form),
           credentials: "same-origin",
           headers: { "X-Requested-With": "fetch" }
-        })
-          .then(function (response) {
-            var status = new URL(response.url).searchParams.get(STATUS_PARAM);
-            if (!problem && status && !/saved|_ok$|updated/.test(status)) {
-              problem = status;
+        }).then(
+          function (response) {
+            if (response.status === CSRF_REFUSED_STATUS && !renewedToken) {
+              renewedToken = true;
+              pending.unshift(form);
+              renewTokens().then(next, function () {
+                pending.shift();
+                failed(form, SAVE_REFUSED_REASON);
+              });
+              return;
             }
-          })
-          .catch(function () {
-            problem = problem || SAVE_FAILED_STATUS;
-          })
-          .then(next);
+            var outcome = outcomeOf(response);
+            if (!outcome.saved) {
+              failed(form, outcome.reason);
+              return;
+            }
+            // This one is stored now: it stops being a pending edit, so trying again after
+            // a later card's failure does not post it twice.
+            initial.set(form, snapshot(form));
+            dirty.splice(dirty.indexOf(form), 1);
+            savedNames.push(cardName(form));
+            savedDuringThisPage = true;
+            next();
+          },
+          function () {
+            failed(form, UNREACHABLE_REASON);
+          }
+        );
       };
       next();
     });
@@ -495,9 +665,10 @@
    * line and the movie modal's held line without knowing which it is looking at.
    *
    * Polite about it, because each poll is one queue request per configured Radarr:
-   *   - nothing on the page to update -> never starts;
+   *   - nothing on the page to update -> does not start, until something arrives;
    *   - tab in the background -> stops, and catches up when it comes back;
-   *   - nothing left downloading -> stops until the next page load.
+   *   - a server not answering -> keeps its last figures, and asks less often;
+   *   - nothing left downloading -> stops, until something arrives.
    * Fifteen seconds because that is the granularity the figure actually has; faster only
    * redraws the same number.
    */
@@ -505,7 +676,9 @@
   // every other URL it uses comes off an element for the same reason.
   var PROGRESS_URL = document.body.getAttribute("data-progress-url");
   var PROGRESS_INTERVAL_MS = 15000;
+  var PROGRESS_LONGEST_INTERVAL_MS = 120000;
   var progressTimer = null;
+  var progressFailures = 0;
 
   function progressNodes() {
     return document.querySelectorAll("[data-progress]");
@@ -539,22 +712,45 @@
     }
   }
 
-  function applyProgress(live) {
+  function isConfirmedGone(key, sources) {
+    // Only a connection that answered with its whole queue can say a film has left it. One
+    // that is down, or whose queue is longer than the page, can only say it does not know.
+    var source = sources[key.slice(0, key.indexOf(":"))];
+    return Boolean(source && source.available && source.complete);
+  }
+
+  function applyProgress(answer) {
     var remaining = 0;
     Array.prototype.forEach.call(progressNodes(), function (node) {
       var key = node.getAttribute("data-progress");
-      var percent = Object.prototype.hasOwnProperty.call(live, key) ? live[key] : null;
-      paintProgress(node, percent);
-      if (percent !== null) {
+      if (Object.prototype.hasOwnProperty.call(answer.progress, key)) {
+        paintProgress(node, answer.progress[key]);
         remaining += 1;
+      } else if (isConfirmedGone(key, answer.sources)) {
+        paintProgress(node, null);
+      } else {
+        remaining += 1; // the last figure stands, and is still worth asking about
       }
     });
     return remaining;
   }
 
+  function everySourceAnswered(sources) {
+    return Object.keys(sources).every(function (id) {
+      return sources[id].available;
+    });
+  }
+
+  function progressDelay() {
+    return Math.min(
+      PROGRESS_INTERVAL_MS * Math.pow(2, progressFailures), PROGRESS_LONGEST_INTERVAL_MS
+    );
+  }
+
   function pollProgress() {
-    if (document.hidden) {
-      return; // a background tab must not keep asking Radarr
+    progressTimer = null;
+    if (document.hidden || !progressNodes().length) {
+      return; // a background tab, or a closed dialog, must not keep asking Radarr
     }
     window
       .fetch(PROGRESS_URL, { credentials: "same-origin", headers: { Accept: "application/json" } })
@@ -564,38 +760,42 @@
         }
         return response.json();
       })
-      .then(function (live) {
-        if (applyProgress(live) === 0) {
-          stopProgress(); // everything landed; nothing left to watch
+      .then(function (answer) {
+        progressFailures = everySourceAnswered(answer.sources) ? 0 : progressFailures + 1;
+        if (applyProgress(answer) > 0) {
+          scheduleProgress();
         }
       })
       .catch(function () {
         /* A failed poll says nothing about the download — leave the last figures alone
-         * and try again on the next tick. */
+         * and try again, less often. */
+        progressFailures += 1;
+        scheduleProgress();
       });
   }
 
-  function startProgress() {
-    if (progressTimer === null && progressNodes().length) {
-      progressTimer = window.setInterval(pollProgress, PROGRESS_INTERVAL_MS);
+  function scheduleProgress() {
+    if (progressTimer === null && !document.hidden && progressNodes().length) {
+      progressTimer = window.setTimeout(pollProgress, progressDelay());
     }
   }
 
   function stopProgress() {
     if (progressTimer !== null) {
-      window.clearInterval(progressTimer);
+      window.clearTimeout(progressTimer);
       progressTimer = null;
     }
   }
 
-  if (PROGRESS_URL && window.fetch && progressNodes().length) {
-    startProgress();
+  if (PROGRESS_URL && window.fetch) {
+    scheduleProgress();
+    // Indicators arrive after load too — the movie dialog, the search results — and whichever
+    // poll finds none left is the last, so closing a dialog needs no handling of its own.
+    new MutationObserver(scheduleProgress).observe(document.body, { childList: true, subtree: true });
     document.addEventListener("visibilitychange", function () {
-      if (document.hidden) {
-        stopProgress();
-      } else {
+      stopProgress();
+      if (!document.hidden) {
         pollProgress(); // catch up on what changed while the tab was away
-        startProgress();
       }
     });
   }

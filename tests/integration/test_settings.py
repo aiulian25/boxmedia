@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import re
+import time
+from datetime import UTC, datetime
+
 import httpx
 import respx
 
+from app.services.calendar import KIND_SERIES, STATE_MONITORED, CalendarEntry
 from app.web.settings import SettingsStatus
 from tests.conftest import AppHarness
 
@@ -93,8 +98,10 @@ def test_status_renders_as_autodismissing_toast(harness: AppHarness) -> None:
     assert "toast-region" in page.text
     assert "data-toast" in page.text
     assert "Backup created." in page.text
-    # The message lives only in the toast — no inline banner above the page content.
-    assert page.text.count("Backup created.") == 1
+    # The message lives only in the toast — no inline banner above the page content. The Save
+    # bar's table of outcomes holds every message too, in an attribute nobody sees.
+    rendered = re.sub(r"data-save-statuses='[^']*'", "", page.text)
+    assert rendered.count("Backup created.") == 1
 
 
 def test_static_script_is_served_and_versioned(harness: AppHarness) -> None:
@@ -969,7 +976,7 @@ def test_an_unreachable_provider_says_so(harness: AppHarness) -> None:
 def test_the_discovery_probe_ignores_the_home_server_tls_escape_hatch(
     tmp_path, monkeypatch
 ) -> None:
-    """Both Test buttons probe against the system trust store.
+    """Both Test buttons probe against the pinned CA bundle.
 
     They used to carry the app's outbound-TLS settings, which are for the user's OWN
     servers: `BM_TLS_CA_FILE` builds a context trusting only that CA, so the button
@@ -1233,3 +1240,74 @@ def test_a_refresh_that_fails_keeps_the_last_known_library(harness: AppHarness) 
     cached = harness.client.app.state.series_cache.load(app_id)
     assert cached is not None, "a failed refresh wiped the cache"
     assert [item.title for item in cached[0]] == ["The Hollow Coast"]
+
+
+# --- a connection's cached answers follow what it points at ---
+
+
+def _post_connection(harness: AppHarness, app_id: str, *, name: str, url: str) -> None:
+    harness.client.post(
+        f"/settings/apps/{app_id}", data={"name": name, "url": url}, follow_redirects=False,
+    )
+
+
+def _two_cached_connections(harness: AppHarness) -> tuple[str, str]:
+    state = harness.client.app.state
+    first = state.apps.add(
+        name="First", url="http://first.local:8989", api_key="a" * 32, kind="sonarr"
+    )
+    second = state.apps.add(
+        name="Second", url="http://second.local:8989", api_key="b" * 32, kind="sonarr"
+    )
+    state.calendar_cache.merge(
+        [_calendar_row(first.id), _calendar_row(second.id)],
+        answered={first.id, second.id}, unanswered=set(), legacy_names={}, now=time.time(),
+    )
+    state.series_cache.save(first.id, ())
+    state.series_cache.save(second.id, ())
+    return first.id, second.id
+
+
+def _calendar_row(connection: str) -> CalendarEntry:
+    return CalendarEntry(
+        kind=KIND_SERIES, title=connection, sub="S01E01",
+        when=datetime(2026, 8, 3, 21, 0, tzinfo=UTC), state=STATE_MONITORED, connection=connection,
+    )
+
+
+def _calendar_owners(harness: AppHarness) -> set[str]:
+    return {entry.connection for entry in harness.client.app.state.calendar_cache.load()}
+
+
+def test_a_new_address_forgets_only_that_connections_answers(harness: AppHarness) -> None:
+    harness.activate()
+    first, second = _two_cached_connections(harness)
+
+    _post_connection(harness, first, name="First", url="http://elsewhere.local:8989")
+
+    state = harness.client.app.state
+    assert state.apps.get(first).url.startswith("http://elsewhere.local")
+    assert _calendar_owners(harness) == {second}
+    assert state.series_cache.load(first) is None
+    assert state.series_cache.load(second) is not None
+
+
+def test_a_rename_keeps_what_the_connection_told_us(harness: AppHarness) -> None:
+    harness.activate()
+    first, second = _two_cached_connections(harness)
+
+    _post_connection(harness, first, name="Renamed", url="http://first.local:8989")
+
+    state = harness.client.app.state
+    assert state.apps.get(first).name == "Renamed"
+    assert _calendar_owners(harness) == {first, second}
+    assert state.series_cache.load(first) is not None
+
+
+def test_deleting_a_connection_removes_only_its_rows_at_once(harness: AppHarness) -> None:
+    harness.activate()
+    first, second = _two_cached_connections(harness)
+
+    harness.client.post(f"/settings/apps/{first}/delete", follow_redirects=False)
+
+    assert _calendar_owners(harness) == {second}

@@ -58,13 +58,17 @@ def test_the_poster_action_block_is_pinned_to_the_bottom_of_its_card() -> None:
 
 
 def test_a_linked_card_clears_the_sticky_header() -> None:
-    """The week chips link to #movie-<rank>. The topnav is `sticky top-0 h-16`, so
+    """The week chips link to #movie-<rank>. From `md` the topnav is `sticky top-0 h-16`, so
     without scroll margin the browser lands the card exactly underneath it and the one
-    title the user asked for is the one hidden behind the bar.
+    title the user asked for is the one hidden behind the bar. Below that it has two rows,
+    taller than this margin, which is why it is only sticky from `md`.
     """
     applied = _applied_to(".poster-card")
+    bar = _applied_to(".topnav")
 
     assert "scroll-mt-24" in applied  # 96px > the 64px bar
+    assert "md:sticky" in bar and "md:h-16" in bar
+    assert " sticky" not in f" {bar}"
 
 
 def test_the_arrival_flash_is_marked_and_survives_reduced_motion() -> None:
@@ -218,9 +222,10 @@ _CONTRAST_PAIRS = (
     ("--bm-warn", "--bm-surface-container-low"),   # .guess-hint on a weekly card
     # The calendar. A day sits on -lowest and a film entry on -high, so the muted and
     # state colours are read against two grounds the pairs above never covered — and
-    # --bm-outline on -high is 4.44:1 in the light theme, which is how the film entry
+    # --bm-outline on -high was once 4.44:1 in the light theme, which is how the film entry
     # came to use the brighter muted token.
     ("--bm-outline", "--bm-surface-container-lowest"),   # a day head, and an empty day
+    ("--bm-outline", "--bm-surface-container-high"),     # muted text on the highest surface
     ("--bm-primary", "--bm-surface-container-lowest"),   # the day's date
     ("--bm-ok", "--bm-surface-container-high"),          # a film entry's state line
     ("--bm-warn", "--bm-surface-container-high"),
@@ -482,3 +487,24 @@ def test_anything_that_ships_hidden_stays_hidden() -> None:
             f"{selector} sets its own display and ships hidden, so it needs "
             f"`{guard} {{ @apply hidden; }}` — without it the element paints anyway"
         )
+
+
+def test_the_box_office_controls_can_wrap_on_a_phone() -> None:
+    """Measured at 390px: these two forms made the page 455px wide. A rendered page is needed
+    to see that, so the browser check is by hand, and this keeps the cause from returning."""
+    assert "flex-wrap" in _applied_to(".run-week")
+    assert "flex-wrap" in _applied_to(".run-search")
+
+
+def test_every_badge_dot_the_review_page_can_use_is_a_literal_it_can_keep() -> None:
+    """Tailwind drops any class it never sees written out, and the template used to build this
+    one from a variable, which left `dot-missing` and `dot-ignored` out of the stylesheet."""
+    template = (STYLESHEET.parent.parent / "app" / "templates" / "report_detail.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "dot-{{" not in template
+    for dot in ("dot-in-library", "dot-wanted", "dot-ignored", "dot-missing"):
+        assert dot in template
+        assert _applied_to(f".{dot}")
+
