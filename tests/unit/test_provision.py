@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,8 @@ def owned(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     calls: list[Path] = []
 
     def _chown(path, uid: int, gid: int) -> None:  # noqa: ANN001
+        if (uid, gid) == (os.getuid(), os.getgid()):
+            return  # init taking a directory back for the length of its own work
         assert (uid, gid) == (provision.APP_UID, provision.APP_GID)
         calls.append(Path(path))
 
@@ -70,6 +73,80 @@ def test_a_directory_already_owned_by_the_app_is_left_alone(
 
     assert provision.prepare_data_dir(data) is False
     assert owned == []
+
+
+def test_the_key_directory_is_handed_over_so_a_rotation_can_create_its_key(
+    tmp_path: Path, owned
+) -> None:
+    """Docker creates a missing mount source as root. Handing over only the key left the
+    README's `genkey` next to it failing with PermissionError as uid 65532."""
+    key_file = tmp_path / "secrets" / "boxmedia.key"
+
+    provision.prepare_key(key_file, tmp_path / "data")
+
+    assert key_file.parent in owned
+
+
+def test_the_key_directory_is_held_while_writing_and_handed_over_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Init is root without DAC_OVERRIDE, so it cannot write into a directory it does not
+    own. Handing it over first failed every fresh install, and only a real container showed
+    that, because a stubbed chown cannot refuse anything. This pins the order that needs."""
+    key_file = tmp_path / "secrets" / "boxmedia.key"
+    events: list[str] = []
+    real_write = Path.write_bytes
+
+    def chown(path, uid: int, gid: int) -> None:  # noqa: ANN001
+        if Path(path) == key_file.parent:
+            events.append("held" if uid == os.getuid() else "handed-over")
+
+    def write(self: Path, data: bytes) -> int:
+        events.append("written")
+        return real_write(self, data)
+
+    monkeypatch.setattr(provision.os, "chown", chown)
+    monkeypatch.setattr(Path, "write_bytes", write)
+    monkeypatch.setattr(provision, "APP_UID", os.getuid() + 1)
+
+    provision.prepare_key(key_file, tmp_path / "data")
+
+    assert events == ["held", "written", "handed-over"]
+
+
+def test_the_key_directory_is_handed_back_even_when_the_key_is_lost(
+    tmp_path: Path, owned
+) -> None:
+    key_file = tmp_path / "secrets" / "boxmedia.key"
+    (tmp_path / "data" / "config").mkdir(parents=True)
+    (tmp_path / "data" / "config" / "user.yml").write_text("x", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        provision.prepare_key(key_file, tmp_path / "data")
+
+    assert key_file.parent in owned
+
+
+def test_an_existing_install_gets_its_key_directory_handed_over_too(
+    tmp_path: Path, owned
+) -> None:
+    key_file = tmp_path / "secrets" / "boxmedia.key"
+    key_file.parent.mkdir()
+    key_file.write_bytes(b"existing")
+
+    provision.prepare_key(key_file, tmp_path / "data")
+
+    assert key_file.parent in owned
+
+
+def test_a_key_at_the_filesystem_root_does_not_take_the_root_with_it(owned, monkeypatch) -> None:
+    key_file = Path("/boxmedia-test-that-is-not-created.key")
+    monkeypatch.setattr(Path, "write_bytes", lambda *_: None)
+    monkeypatch.setattr(Path, "chmod", lambda *_: None)
+
+    provision.prepare_key(key_file, Path("/nonexistent-data"))
+
+    assert Path("/") not in owned
 
 
 def test_a_first_run_gets_a_usable_key(tmp_path: Path, owned) -> None:
@@ -276,7 +353,7 @@ def _forwarded_allow_ips_default(compose: dict) -> str:
     """What uvicorn is given when BM_FORWARDED_ALLOW_IPS is unset."""
     setting = compose["services"]["boxmedia"]["environment"]["FORWARDED_ALLOW_IPS"]
     variable, separator, default = setting.partition(":-")
-    assert variable == "${BM_FORWARDED_ALLOW_IPS", setting
+    assert variable in {"${BM_FORWARDED_ALLOW_IPS", "${BM_DEV_FORWARDED_ALLOW_IPS"}, setting
     assert separator, f"no default to fall back on: {setting}"
     return default.rstrip("}")
 
@@ -335,3 +412,82 @@ def test_the_dev_services_cannot_be_pointed_at_different_directories() -> None:
     assert "./data:/data" not in _mount(services["boxmedia"], "/data")
     assert _mount(services["init"], "/secrets").endswith(":/secrets")
     assert _mount(services["boxmedia"], "/secrets:ro").endswith(":ro")
+
+
+# --- the dev stack shares no persisted state with the published one ---
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+COMPOSE_VARIABLE = re.compile(r"\$\{(\w+)(?::-([^}]*))?\}")
+DEV_VARIABLE_PREFIX = "BM_DEV_"
+DEV_ENV_FILE = ".env.dev"
+
+
+def _template(name: str) -> dict[str, str]:
+    """A KEY=value env template, as Compose would load it."""
+    lines = (REPO_ROOT / name).read_text(encoding="utf-8").splitlines()
+    pairs = (line.split("=", 1) for line in lines if "=" in line and not line.startswith("#"))
+    return {key: value for key, value in pairs}
+
+
+def _render(value: str, env: dict[str, str]) -> str:
+    """Compose's `${VAR:-default}`: the default applies when VAR is unset or empty."""
+    return COMPOSE_VARIABLE.sub(lambda m: env.get(m[1]) or m[2] or "", value)
+
+
+def _host_state(compose: dict, env: dict[str, str]) -> dict[str, str]:
+    app = compose["services"]["boxmedia"]
+    return {
+        "data": _render(_mount(app, "/data"), env).split(":")[0],
+        "secrets": _render(_mount(app, "/secrets:ro"), env).split(":")[0],
+        "port": _render(app["ports"][0], env).rsplit(":", 2)[-2],
+    }
+
+
+@pytest.mark.parametrize(
+    "dev_env",
+    [
+        pytest.param(".env.dev.example", id="with the dev env file passed"),
+        pytest.param(".env.example", id="with only a production .env beside it"),
+    ],
+)
+def test_the_two_stacks_render_to_different_data_keys_and_ports(dev_env: str) -> None:
+    """The second case is the trap: Compose loads a `.env` beside the file whether asked or
+    not, and the template's port and paths used to override every dev default. Sharing them
+    means two processes and two schedulers writing one set of flat files."""
+    published = _host_state(_compose(), _template(".env.example"))
+    dev = _host_state(_dev_compose(), _template(dev_env))
+
+    for what in ("data", "secrets", "port"):
+        assert dev[what] != published[what], what
+
+
+def test_a_production_env_cannot_steer_the_dev_stack() -> None:
+    """Whatever production has been configured to, including trusting every proxy peer,
+    which on the dev stack's 0.0.0.0 bind would let anyone forge X-Forwarded-For."""
+    text = (REPO_ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8")
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+    variables = {match[0] for match in COMPOSE_VARIABLE.findall(code)}
+    assert variables
+    assert {name for name in variables if not name.startswith(DEV_VARIABLE_PREFIX)} == set()
+
+
+def test_the_dev_stack_cannot_inherit_production_credentials() -> None:
+    """`env_file` is what reaches the app, session secret included."""
+    for name, service in _dev_compose()["services"].items():
+        assert service["env_file"] == DEV_ENV_FILE, name
+
+
+def test_the_dev_template_starts_clean_and_runs_over_plain_http() -> None:
+    template = _template(".env.dev.example")
+
+    assert template["BM_SESSION_SECRET"] == ""
+    assert template["BM_SECURE_COOKIES"] == "false"
+    assert template["BM_DEV_FORWARDED_ALLOW_IPS"] != TRUST_EVERY_PEER
+
+
+@pytest.mark.parametrize("ignore_file", [".gitignore", ".dockerignore"])
+@pytest.mark.parametrize("entry", ["/data-dev/", "/secrets-dev/", DEV_ENV_FILE])
+def test_dev_state_stays_out_of_git_and_image_layers(ignore_file: str, entry: str) -> None:
+    lines = (REPO_ROOT / ignore_file).read_text(encoding="utf-8").splitlines()
+    assert entry in lines

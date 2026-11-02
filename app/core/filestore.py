@@ -13,6 +13,8 @@ backup never observes a torn file:
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 import tempfile
@@ -30,12 +32,76 @@ SCHEMA_VERSION_KEY = "schema_version"
 _write_lock = threading.Lock()
 
 
+# What a filesystem says when it has no way to sync a directory, which some network mounts
+# do not. Nothing can be done about that, and the write itself has already succeeded.
+_DIRECTORY_SYNC_UNSUPPORTED = (errno.EINVAL, errno.ENOTSUP, errno.EISDIR)
+
+
+# Where the running process holds its claim on a data directory.
+OWNER_LOCK_FILENAME = ".data-owner.lock"
+# The claims this process holds, by data directory, kept open for its whole life: the lock
+# lasts exactly as long as the descriptor, so the kernel frees it however the process dies.
+_owned_data_dirs: dict[Path, int] = {}
+
+
+class DataDirInUseError(Exception):
+    """Another running process owns this data directory."""
+
+
 class SchemaVersionError(ValueError):
     """A file's schema_version is newer than this build knows how to read."""
 
 
+def claim_data_dir(data_dir: Path) -> None:
+    """Refuse to share a data directory with another running process.
+
+    Flat files, in-memory sessions and an in-process scheduler all assume one owner, and two
+    would overwrite each other without any error at all: a second uvicorn worker, a second
+    replica, or a dev stack pointed at production's files. A second call from the same
+    process is the same owner.
+
+    Skipped where it cannot work. An unwritable directory is reported better by
+    `Settings.ensure_data_dirs`, and some network mounts have no flock; neither is a reason
+    to stop an install that has only one process anyway.
+    """
+    resolved = data_dir.resolve()
+    if resolved in _owned_data_dirs:
+        return
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(resolved / OWNER_LOCK_FILENAME, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(descriptor)
+        raise DataDirInUseError(
+            f"another BoxMedia process is using {resolved}. BoxMedia runs as exactly one "
+            "process per data directory: run a single uvicorn worker and a single replica, "
+            "and give a second stack its own data directory."
+        ) from exc
+    except OSError:
+        os.close(descriptor)
+        return
+    _owned_data_dirs[resolved] = descriptor
+
+
+def fsync_directory(path: Path) -> None:
+    """Make a rename inside `path` survive a power cut. Syncing the file is not enough: the
+    name that points at it lives in the directory."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        if exc.errno not in _DIRECTORY_SYNC_UNSUPPORTED:
+            raise
+    finally:
+        os.close(descriptor)
+
+
 def atomic_write_bytes(path: Path, payload: bytes) -> None:
-    """Write bytes via temp file + fsync + atomic rename (crash-safe)."""
+    """Write bytes via temp file + fsync + atomic rename + directory fsync (crash-safe)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     tmp_path = Path(tmp_name)
@@ -45,6 +111,7 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
+        fsync_directory(path.parent)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise

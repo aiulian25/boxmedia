@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tarfile
 import threading
 import time
@@ -17,7 +18,7 @@ from app.services.backup import (
     _CONSISTENT_SUBDIRS,
     BACKUP_TIMESTAMP_FORMAT,
     MANIFEST_NAME,
-    MAX_UPLOAD_BYTES,
+    PARTIAL_SUFFIX,
     BackupCorruptError,
     BackupError,
     BackupKeyError,
@@ -54,6 +55,9 @@ def _make_settings(tmp_path: Path, name: str) -> tuple[Settings, bytes]:
         data_dir=tmp_path / name,
     )
     settings.ensure_data_dirs()
+    # As on any real install, which bootstraps its account before anything can back it up.
+    audit = AuditLog(settings.logs_dir / "audit.jsonl")
+    UserStore(settings.config_dir, audit=audit).bootstrap_if_missing()
     return settings, crypto.load_key(key_file)
 
 
@@ -215,11 +219,13 @@ def test_external_restore_rejects_tampered(tmp_path: Path) -> None:
         backups.restore_external(bytes(blob))
 
 
-def test_external_restore_rejects_oversized(tmp_path: Path) -> None:
+def test_external_restore_rejects_oversized(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
     settings, key = _make_settings(tmp_path, "data")
     backups = _service(settings, key)
+    monkeypatch.setattr("app.services.backup.MAX_UPLOAD_BYTES", 8)
     with pytest.raises(BackupError):
-        backups.restore_external(b"x" * (MAX_UPLOAD_BYTES + 1))
+        backups.restore_external(b"x" * 9)
+    assert not list(settings.data_dir.glob(".import-staging-*"))
 
 
 def test_external_restore_rejects_path_traversal(tmp_path: Path) -> None:
@@ -274,9 +280,9 @@ def test_the_write_lock_is_released_before_the_archive_is_packed(tmp_path: Path)
     held_during_pack: list[bool] = []
     original_pack = service._pack
 
-    def recording_pack(files):
+    def recording_pack(files, output):
         held_during_pack.append(filestore.write_lock().locked())
-        return original_pack(files)
+        return original_pack(files, output)
 
     service._pack = recording_pack
     name = service.create()
@@ -367,11 +373,11 @@ def test_the_lock_is_released_after_a_failed_swap(tmp_path: Path) -> None:
     assert not filestore.write_lock().locked()
 
 
-def test_a_swap_that_fails_partway_leaves_every_original_recoverable(tmp_path: Path) -> None:
+def test_a_swap_that_fails_partway_puts_every_original_back(tmp_path: Path) -> None:
     """There is no atomic multi-directory rename, so a partial swap is possible.
 
-    Deleting each retired directory inside the loop destroyed the originals of the
-    subdirs already swapped, while the restore as a whole had failed.
+    It used to leave restored config/ live beside old history/, with the originals in
+    `.retired-*` for somebody to find, under a banner saying nothing had changed.
     """
     settings, key = _make_settings(tmp_path, "partial")
     service = _service(settings, key)
@@ -396,11 +402,8 @@ def test_a_swap_that_fails_partway_leaves_every_original_recoverable(tmp_path: P
     finally:
         Path.rename = real_rename
 
-    retired = list(settings.data_dir.glob(".config.retired-*"))
-    assert retired, "config/'s original was deleted despite the restore failing"
-    survivor = retired[0] / marker.name
-    assert survivor.exists()
-    assert "must survive" in survivor.read_text(encoding="utf-8")
+    assert list(settings.data_dir.glob(".*.retired-*")) == []
+    assert "must survive" in marker.read_text(encoding="utf-8")
 
 
 def test_a_successful_restore_leaves_no_retired_directories(tmp_path: Path) -> None:
@@ -493,7 +496,8 @@ def test_a_report_from_a_newer_build_is_refused_before_the_swap(tmp_path: Path) 
     with pytest.raises(BackupError) as caught:
         _service(target, key).restore_external(blob)
 
-    assert "unreadable report" in str(caught.value)
+    assert "unreadable store" in str(caught.value)
+    assert "report-20990101-000000-beef.json" in str(caught.value)
     assert marker.read_text(encoding="utf-8") == "untouched"  # nothing was swapped
     assert list(target.data_dir.glob(".*.retired-*")) == []
 
@@ -542,16 +546,12 @@ def test_a_healthy_archive_still_restores(tmp_path: Path) -> None:
 
 
 def test_the_mirrored_filters_constants_match_the_real_ones() -> None:
-    """app.services.filters imports backup, so its schema version is mirrored here
-    rather than imported. Pinned equal so the mirror cannot silently drift."""
+    """app.services.filters imports backup, so its filename is mirrored here rather than
+    imported. Pinned equal so the mirror cannot silently drift."""
     from app.services import backup as backup_module
     from app.services import filters as filters_module
 
     assert backup_module.MIRRORED_FILTERS_FILENAME == filters_module.FILTERS_FILENAME
-    assert (
-        backup_module.MIRRORED_FILTERS_SCHEMA_VERSION
-        == filters_module.FILTERS_SCHEMA_VERSION
-    )
 
 
 def test_the_running_version_matches_the_one_the_project_ships() -> None:
@@ -584,9 +584,11 @@ def test_every_schema_stamped_store_is_covered(tmp_path: Path) -> None:
     it did not know about could not fail it. Both hold encrypted credentials.
     """
     from app.services.apps import APPS_FILENAME
-    from app.services.backup import _STORE_VERSIONS
+    from app.services.backup import _STORE_LOADERS
+    from app.services.corrections import CORRECTIONS_FILENAME
     from app.services.discovery import DISCOVERY_FILENAME
     from app.services.ignore import IGNORE_FILENAME
+    from app.services.ingestion_state import INGESTION_FILENAME
     from app.services.mediaserver import MEDIA_SERVER_FILENAME
     from app.services.radarr_options import RADARR_OPTIONS_FILENAME
     from app.services.sonarr_options import SONARR_OPTIONS_FILENAME
@@ -602,13 +604,13 @@ def test_every_schema_stamped_store_is_covered(tmp_path: Path) -> None:
         (SONARR_OPTIONS_FILENAME, "schema_version: 2\nby_app: {}\n"),
         (MEDIA_SERVER_FILENAME, "schema_version: 1\nserver: {}\n"),
         (DISCOVERY_FILENAME, "schema_version: 1\n"),
+        (CORRECTIONS_FILENAME, "schema_version: 1\nby_title: {}\n"),
+        (INGESTION_FILENAME, "schema_version: 1\n"),
     ):
         (settings.config_dir / name).write_text(body, encoding="utf-8")
 
-    checked = {relative for relative, _, _ in _STORE_VERSIONS}
-    on_disk = {
-        f"config/{path.name}" for path in settings.config_dir.iterdir() if path.is_file()
-    }
+    checked = {filename for filename, _ in _STORE_LOADERS}
+    on_disk = {path.name for path in settings.config_dir.iterdir() if path.is_file()}
     assert on_disk <= checked, f"unvalidated store(s): {on_disk - checked}"
 
 
@@ -658,3 +660,151 @@ def test_verify_leaves_no_staging_directory_behind(tmp_path: Path) -> None:
 
     assert not list(settings.data_dir.glob(".verify-staging-*"))
     assert not list(settings.data_dir.glob(".restore-staging-*"))
+
+
+# --- archives stream, in the chunked format ---
+
+
+def _populated(tmp_path: Path, name: str = "data") -> tuple[Settings, bytes, BackupService]:
+    settings, key = _make_settings(tmp_path, name)
+    posters = settings.cache_dir / "posters"
+    posters.mkdir(parents=True, exist_ok=True)
+    (posters / "a.jpg").write_bytes(os.urandom(3 * crypto.CHUNK_PLAINTEXT_BYTES))
+    return settings, key, _service(settings, key)
+
+
+def test_a_new_archive_is_chunked_and_round_trips(tmp_path: Path) -> None:
+    settings, key, service = _populated(tmp_path)
+    original = (settings.cache_dir / "posters" / "a.jpg").read_bytes()
+
+    name = service.create()
+    assert crypto.archive_version(service.path_for(name)) == crypto.FILE_VERSION_CHUNKED
+    service.verify(name)
+
+    (settings.cache_dir / "posters" / "a.jpg").unlink()
+    service.restore_internal(name)
+
+    assert (settings.cache_dir / "posters" / "a.jpg").read_bytes() == original
+
+
+def test_an_archive_from_before_chunking_still_verifies_and_restores(tmp_path: Path) -> None:
+    settings, key, service = _populated(tmp_path)
+    path = service.path_for(service.create())
+    single_block = crypto.encrypt_bytes(crypto.decrypt_bytes(path.read_bytes(), key), key)
+    path.write_bytes(single_block)
+    assert crypto.archive_version(path) == crypto.FILE_VERSION
+
+    service.verify(path.name)
+    (settings.cache_dir / "posters" / "a.jpg").unlink()
+    service.restore_internal(path.name)
+
+    assert (settings.cache_dir / "posters" / "a.jpg").exists()
+    assert not list(settings.data_dir.glob(".*-staging-*"))
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda blob: blob[:-1],
+        lambda blob: blob[:len(blob) // 2],
+        lambda blob: blob[: crypto.CHUNK_PLAINTEXT_BYTES + 100],
+        lambda blob: blob + b"x",
+        lambda blob: blob[:200] + bytes([blob[200] ^ 1]) + blob[201:],
+        lambda blob: blob[:-5] + bytes([blob[-5] ^ 1]) + blob[-4:],
+    ],
+    ids=["last-byte", "half", "after-first-chunk", "extra", "early-bit", "late-bit"],
+)
+def test_a_damaged_chunked_archive_is_refused(tmp_path: Path, damage) -> None:  # noqa: ANN001
+    _, _, service = _populated(tmp_path)
+    path = service.path_for(service.create())
+    path.write_bytes(damage(path.read_bytes()))
+
+    with pytest.raises(BackupError):
+        service.verify(path.name)
+
+
+def test_a_chunked_archive_cut_exactly_between_chunks_is_refused(tmp_path: Path) -> None:
+    """The cut a length check cannot see. Only the end marker in the last chunk reveals it."""
+    key = crypto.generate_key()
+    sink = io.BytesIO()
+    writer = crypto.ChunkedWriter(sink, key)
+    writer.write(b"x" * (crypto.CHUNK_PLAINTEXT_BYTES * 2))
+    first_chunk_end = 12 + 4 + crypto.CHUNK_PLAINTEXT_BYTES + crypto.GCM_TAG_BYTES
+    writer.finish()
+
+    cut = crypto.ChunkedReader(io.BytesIO(sink.getvalue()[:first_chunk_end]), key)
+    with pytest.raises(crypto.DecryptionError):
+        cut.read()
+
+
+def test_chunks_cannot_be_swapped(tmp_path: Path) -> None:
+    key = crypto.generate_key()
+    sink = io.BytesIO()
+    writer = crypto.ChunkedWriter(sink, key)
+    writer.write(b"a" * crypto.CHUNK_PLAINTEXT_BYTES + b"b" * crypto.CHUNK_PLAINTEXT_BYTES)
+    writer.write(b"c")
+    writer.finish()
+    blob = sink.getvalue()
+    size = 4 + crypto.CHUNK_PLAINTEXT_BYTES + crypto.GCM_TAG_BYTES
+    first, second = blob[12 : 12 + size], blob[12 + size : 12 + 2 * size]
+    swapped = blob[:12] + second + first + blob[12 + 2 * size :]
+
+    with pytest.raises(crypto.DecryptionError):
+        crypto.ChunkedReader(io.BytesIO(swapped), key).read()
+
+
+def test_the_wrong_key_says_so(tmp_path: Path) -> None:
+    settings, _, service = _populated(tmp_path)
+    name = service.create()
+    other = _service(settings, crypto.generate_key())
+
+    with pytest.raises(BackupKeyError):
+        other.verify(name)
+
+
+def test_a_format_from_a_newer_build_says_to_upgrade(tmp_path: Path) -> None:
+    _, _, service = _populated(tmp_path)
+    path = service.path_for(service.create())
+    blob = bytearray(path.read_bytes())
+    blob[len(crypto.FILE_MAGIC)] = crypto.FILE_VERSION_CHUNKED + 1
+    path.write_bytes(bytes(blob))
+
+    with pytest.raises(BackupSchemaError):
+        service.verify(path.name)
+
+
+def test_a_failed_create_leaves_no_partial_or_archive(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    settings, _, service = _populated(tmp_path)
+
+    def fail(*_args: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service, "_pack", fail)
+
+    with pytest.raises(OSError, match="disk full"):
+        service.create()
+
+    assert list(settings.backups_dir.iterdir()) == []
+
+
+def test_a_partial_left_by_a_killed_process_is_cleared_at_startup(tmp_path: Path) -> None:
+    settings, key, service = _populated(tmp_path)
+    kept = service.create()
+    (settings.backups_dir / f".boxmedia-x.backup{PARTIAL_SUFFIX}").write_bytes(b"half")
+
+    fresh = _service(settings, key)
+
+    assert [info.name for info in fresh.list_backups()] == [kept]
+    assert sorted(path.name for path in settings.backups_dir.iterdir()) == [kept]
+
+
+def test_an_upload_can_be_a_file_and_larger_than_the_old_cap(tmp_path: Path) -> None:
+    source, key, service = _populated(tmp_path, "source")
+    blob = service.path_for(service.create()).read_bytes()
+    target, _ = _make_settings(tmp_path, "target")
+
+    _service(target, key).restore_external(io.BytesIO(blob))
+
+    assert (target.cache_dir / "posters" / "a.jpg").exists()
+    assert not list(target.data_dir.glob(".import-staging-*"))
+

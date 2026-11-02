@@ -8,13 +8,15 @@ one-time password the test knows (so it can log in).
 from __future__ import annotations
 
 import asyncio
+import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core import crypto, security
+from app.core import crypto, filestore, security
 from app.core.audit import AuditLog
 from app.core.config import Settings
 from app.core.sessions import COOKIE_NAME
@@ -38,6 +40,16 @@ class CsrfClient(TestClient):
         payload = dict(data or {})
         payload.setdefault("csrf_token", token)
         return super().request("POST", url, data=payload, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _release_data_dir_claims() -> Iterator[None]:
+    """A real process holds its claim for life; this one builds a new app per test, and each
+    would otherwise keep a descriptor open until the suite ran out of them."""
+    yield
+    for descriptor in filestore._owned_data_dirs.values():
+        os.close(descriptor)
+    filestore._owned_data_dirs.clear()
 
 
 @dataclass

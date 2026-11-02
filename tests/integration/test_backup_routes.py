@@ -55,10 +55,8 @@ def test_import_rejects_garbage_file(harness: AppHarness) -> None:
 def test_import_rejects_oversized_file(
     harness: AppHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Patch the cap tiny so we exercise the bounded read + rejection without pushing
-    # 100 MB through the suite. The route reads MAX_UPLOAD_BYTES+1 bytes; restore_external
-    # then rejects len(blob) > MAX_UPLOAD_BYTES.
-    monkeypatch.setattr("app.web.settings.MAX_UPLOAD_BYTES", 8)
+    # Patch the cap tiny so we exercise the rejection without pushing gigabytes through the
+    # suite. restore_external enforces it as it copies the upload to disk.
     monkeypatch.setattr("app.services.backup.MAX_UPLOAD_BYTES", 8)
     harness.activate()
     response = harness.client.post(
@@ -430,3 +428,89 @@ def test_the_backup_row_offers_verify_without_a_confirm_step(harness: AppHarness
     assert 'name="csrf_token"' in verify_form
     # ...and not wrapped in a <details> confirm, unlike the two beside it.
     assert "<details" not in row.split("/verify", 1)[0].rsplit("<form", 1)[1]
+
+
+# --- an intact archive the app could not run on ---
+
+
+def _seal_with_own_key(harness: AppHarness, name: str, plaintext: bytes) -> None:
+    from app.core import crypto
+
+    service = harness.client.app.state.backups
+    service.path_for(name).write_bytes(crypto.encrypt_bytes(plaintext, service._key))
+
+
+def _archive_with_an_unusable_account(harness: AppHarness, name: str) -> None:
+    """The audit's reproduction: nothing but the stamp, listed and checksummed correctly."""
+    import hashlib
+    import io
+    import json
+    import tarfile
+
+    from app.core import crypto
+    from app.services.backup import MANIFEST_NAME
+
+    service = harness.client.app.state.backups
+    plaintext = crypto.decrypt_bytes(service.path_for(name).read_bytes(), service._key)
+    with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r:gz") as tar:
+        members = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+    stripped = b"schema_version: 1\n"
+    members["config/user.yml"] = stripped
+    manifest = json.loads(members[MANIFEST_NAME])
+    manifest["files"]["config/user.yml"] = hashlib.sha256(stripped).hexdigest()
+    members[MANIFEST_NAME] = json.dumps(manifest).encode()
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for arcname, data in members.items():
+            info = tarfile.TarInfo(name=arcname)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    _seal_with_own_key(harness, name, buffer.getvalue())
+
+
+def test_an_archive_nobody_could_log_in_from_fails_every_route_and_login_survives(
+    harness: AppHarness,
+) -> None:
+    """It used to verify and restore, and only then did login start raising."""
+    active = harness.activate()
+    name = _one_backup(harness)
+    _archive_with_an_unusable_account(harness, name)
+    before = _stores_hash(harness.settings.data_dir)
+    service = harness.client.app.state.backups
+
+    verified = harness.client.post(f"/settings/backups/{name}/verify", follow_redirects=False)
+    restored = harness.client.post(f"/settings/backups/{name}/restore", follow_redirects=False)
+    imported = harness.client.post(
+        "/settings/backups/import",
+        files={"backup_file": (name, service.path_for(name).read_bytes())},
+        follow_redirects=False,
+    )
+
+    for response in (verified, restored, imported):
+        assert response.status_code == 303
+        assert SettingsStatus.BACKUP_CORRUPT in response.headers["location"]
+    assert _stores_hash(harness.settings.data_dir) == before
+    assert harness.users.verify_password(active) is True
+    assert not list(harness.settings.data_dir.glob(".*-staging-*"))
+
+
+def test_authentic_bytes_that_are_not_a_tar_get_the_banner_not_a_500(harness: AppHarness) -> None:
+    harness.activate()
+    name = _one_backup(harness)
+    _seal_with_own_key(harness, name, b"not a gzip stream")
+
+    response = harness.client.post(f"/settings/backups/{name}/verify", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert SettingsStatus.BACKUP_CORRUPT in response.headers["location"]
+
+
+def test_the_corrupt_banner_covers_what_it_now_reports(harness: AppHarness) -> None:
+    harness.activate()
+    page = harness.client.get(
+        f"/settings?status={SettingsStatus.BACKUP_CORRUPT}"
+    ).text
+
+    assert "could not run on" in page
+    assert "Nothing was changed." in page

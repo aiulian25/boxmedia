@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -337,7 +338,283 @@ def test_rotate_constants_match_the_stores() -> None:
 
     assert crypto.DISCOVERY_CONFIG_PATH[-1] == discovery_store.DISCOVERY_FILENAME
     assert crypto.DISCOVERY_SCHEMA_VERSION == discovery_store.DISCOVERY_SCHEMA_VERSION
+    from app.services import maintenance as maintenance_module
+
+    assert crypto.RESTORE_JOURNAL_FILENAME == maintenance_module.JOURNAL_FILENAME
+
     assert crypto.DISCOVERY_FIELDS == (
         discovery_store.TMDB_KEY_FIELD,
         discovery_store.TRAKT_KEY_FIELD,
     )
+
+
+# --- an interrupted rotation is resumed, not stranded ---
+
+CRASH_EXIT_CODE = 9
+# Far past the last durable step of a rotation, so the sweep knows it reached the end.
+MAX_CRASH_POINTS = 40
+# How many stores `_seed_every_store` writes.
+STORE_COUNT = 3
+
+
+def _seed_every_store(tmp_path: Path) -> tuple[Path, Path, Path]:
+    old_file, new_file = _two_keys(tmp_path)
+    old_key = crypto.load_key(old_file)
+    data_dir = tmp_path / "data"
+    _seed_apps(data_dir, old_key, SECRET_API_KEY, SECOND_API_KEY)
+    _seed_media_server(data_dir, old_key, PLEX_TOKEN)
+    _seed_discovery(
+        data_dir, old_key, tmdb_key_encrypted=TMDB_KEY, trakt_client_id_encrypted=TRAKT_ID
+    )
+    return old_file, new_file, data_dir
+
+
+def _assert_the_app_reads_every_credential_with(key_file: Path, data_dir: Path) -> None:
+    """Through the stores the app reads with, holding the key the app would be given."""
+    from app.core.audit import AuditLog
+    from app.services.apps import AppsStore
+    from app.services.discovery import DiscoveryStore
+    from app.services.mediaserver import MediaServerStore
+
+    key = crypto.load_key(key_file)
+    config = data_dir / "config"
+    audit = AuditLog(data_dir / "audit.jsonl")
+    apps = AppsStore(config, key=key, audit=audit)
+    assert [apps.decrypt_key(app.id) for app in apps.list_apps()] == [
+        SECRET_API_KEY,
+        SECOND_API_KEY,
+    ]
+    assert MediaServerStore(config, key=key, audit=audit).decrypt_token() == PLEX_TOKEN
+    discovery = DiscoveryStore(config, key=key, audit=audit)
+    assert discovery.decrypt("tmdb") == TMDB_KEY
+    assert discovery.decrypt("trakt") == TRAKT_ID
+
+
+def _rotate(old_file: Path, new_file: Path, data_dir: Path) -> int:
+    return crypto._main(["rotate", str(old_file), str(new_file), str(data_dir)])
+
+
+def _fail_write(monkeypatch: pytest.MonkeyPatch, failing_write: int) -> None:
+    from app.core import filestore
+
+    calls = [0]
+    real_write = filestore.write_yaml
+
+    def write(*args: object, **kwargs: object) -> None:
+        calls[0] += 1
+        if calls[0] == failing_write:
+            raise OSError(28, "No space left on device")
+        real_write(*args, **kwargs)
+
+    monkeypatch.setattr(filestore, "write_yaml", write)
+
+
+@pytest.mark.parametrize("failing_write", range(1, STORE_COUNT + 1))
+def test_a_write_failing_anywhere_says_what_to_do_and_a_rerun_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failing_write: int,
+) -> None:
+    """The audit's reproduction: the second write failing left the first store on the new
+    key, and a retry returned 1 because that store no longer opened with the old one."""
+    old_file, new_file, data_dir = _seed_every_store(tmp_path)
+
+    with monkeypatch.context() as patched:
+        _fail_write(patched, failing_write)
+        assert _rotate(old_file, new_file, data_dir) == 1
+    message = capsys.readouterr().err
+    assert "KEEP BOTH KEY FILES" in message
+    assert "run this same command again" in message
+
+    assert _rotate(old_file, new_file, data_dir) == 0
+    _assert_the_app_reads_every_credential_with(new_file, data_dir)
+
+
+@pytest.mark.parametrize("failing_write", range(1, STORE_COUNT + 1))
+def test_an_interrupted_rotation_can_be_undone_by_swapping_the_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_write: int
+) -> None:
+    old_file, new_file, data_dir = _seed_every_store(tmp_path)
+
+    with monkeypatch.context() as patched:
+        _fail_write(patched, failing_write)
+        assert _rotate(old_file, new_file, data_dir) == 1
+
+    assert _rotate(new_file, old_file, data_dir) == 0
+    _assert_the_app_reads_every_credential_with(old_file, data_dir)
+
+
+def test_a_process_killed_at_any_durable_step_resumes_with_the_same_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real forked process, killed with nothing allowed to clean up, at each sync and
+    rename in turn. It cannot show what a disk does across a power cut."""
+    swept_past_the_end = False
+    for crash_point in range(1, MAX_CRASH_POINTS):
+        old_file, new_file, data_dir = _seed_every_store(tmp_path / str(crash_point))
+        child = os.fork()
+        if child == 0:
+            _rotate_and_die_at(monkeypatch, crash_point, old_file, new_file, data_dir)
+
+        _, status = os.waitpid(child, 0)
+        crashed = os.waitstatus_to_exitcode(status) == CRASH_EXIT_CODE
+
+        assert _rotate(old_file, new_file, data_dir) == 0, f"crash point {crash_point}"
+        _assert_the_app_reads_every_credential_with(new_file, data_dir)
+        if not crashed:
+            swept_past_the_end = True
+            break
+
+    assert swept_past_the_end, "the sweep never reached the end of a rotation"
+
+
+def _rotate_and_die_at(
+    monkeypatch: pytest.MonkeyPatch,
+    crash_point: int,
+    old_file: Path,
+    new_file: Path,
+    data_dir: Path,
+) -> None:
+    seen = [0]
+
+    def counting(real):  # noqa: ANN001, ANN202
+        def step(*args: object, **kwargs: object) -> object:
+            seen[0] += 1
+            if seen[0] == crash_point:
+                os._exit(CRASH_EXIT_CODE)
+            return real(*args, **kwargs)
+
+        return step
+
+    monkeypatch.setattr(os, "fsync", counting(os.fsync))
+    monkeypatch.setattr(os, "replace", counting(os.replace))
+    try:
+        _rotate(old_file, new_file, data_dir)
+    finally:
+        os._exit(0)
+
+
+def test_a_rotation_that_already_finished_can_be_run_again(tmp_path: Path) -> None:
+    """Somebody unsure whether it worked should be able to just run it, and the ciphertext
+    already under the new key is left byte-identical rather than churned."""
+    old_file, new_file, data_dir = _seed_every_store(tmp_path)
+    assert _rotate(old_file, new_file, data_dir) == 0
+    apps_path = data_dir.joinpath(*crypto.APPS_CONFIG_PATH)
+    tokens = _stored_tokens(apps_path)
+
+    assert _rotate(old_file, new_file, data_dir) == 0
+
+    assert _stored_tokens(apps_path) == tokens
+    _assert_the_app_reads_every_credential_with(new_file, data_dir)
+
+
+def test_an_install_stranded_by_an_older_version_can_be_finished(tmp_path: Path) -> None:
+    """Nothing about the fix depends on a journal, so a mixed state written before it existed
+    resumes the same way."""
+    old_file, new_file = _two_keys(tmp_path)
+    old_key, new_key = crypto.load_key(old_file), crypto.load_key(new_file)
+    data_dir = tmp_path / "data"
+    _seed_apps(data_dir, new_key, SECRET_API_KEY, SECOND_API_KEY)
+    _seed_media_server(data_dir, old_key, PLEX_TOKEN)
+    _seed_discovery(
+        data_dir, old_key, tmdb_key_encrypted=TMDB_KEY, trakt_client_id_encrypted=TRAKT_ID
+    )
+
+    assert _rotate(old_file, new_file, data_dir) == 0
+
+    _assert_the_app_reads_every_credential_with(new_file, data_dir)
+
+
+def test_a_credential_neither_key_opens_still_stops_everything(tmp_path: Path) -> None:
+    """Accepting the new key must not widen into accepting anything."""
+    old_file, new_file, data_dir = _seed_every_store(tmp_path)
+    stranger = tmp_path / "stranger.key"
+    assert crypto._main(["genkey", str(stranger)]) == 0
+    apps_before = data_dir.joinpath(*crypto.APPS_CONFIG_PATH).read_bytes()
+
+    assert _rotate(stranger, new_file, data_dir) == 1
+
+    assert data_dir.joinpath(*crypto.APPS_CONFIG_PATH).read_bytes() == apps_before
+
+
+def test_the_new_key_is_durable_before_anything_depends_on_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Credentials under a key a power cut then lost would be gone for good."""
+    from app.core import filestore
+
+    old_file, new_file, data_dir = _seed_every_store(tmp_path)
+    events: list[str] = []
+    real_sync, real_write = crypto._sync_file, filestore.write_yaml
+
+    def sync(path: Path) -> None:
+        events.append(f"sync:{path.name}")
+        real_sync(path)
+
+    def write(*args: object, **kwargs: object) -> None:
+        events.append("write")
+        real_write(*args, **kwargs)
+
+    monkeypatch.setattr(crypto, "_sync_file", sync)
+    monkeypatch.setattr(filestore, "write_yaml", write)
+
+    assert _rotate(old_file, new_file, data_dir) == 0
+
+    assert events[0] == f"sync:{new_file.name}"
+    assert events.count("write") == STORE_COUNT
+
+
+def test_a_key_that_cannot_be_made_durable_stops_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_file, new_file, data_dir = _seed_every_store(tmp_path)
+    apps_before = data_dir.joinpath(*crypto.APPS_CONFIG_PATH).read_bytes()
+
+    def fail(_: Path) -> None:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(crypto, "_sync_file", fail)
+
+    assert _rotate(old_file, new_file, data_dir) == 1
+    assert data_dir.joinpath(*crypto.APPS_CONFIG_PATH).read_bytes() == apps_before
+
+
+def test_rotation_waits_for_an_interrupted_restore_to_be_recovered(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The restore's rollback would put old-key config/ back after this moved the rest."""
+    old_file, new_file, data_dir = _seed_every_store(tmp_path)
+    (data_dir / crypto.RESTORE_JOURNAL_FILENAME).write_text("{}", encoding="utf-8")
+    apps_before = data_dir.joinpath(*crypto.APPS_CONFIG_PATH).read_bytes()
+
+    assert _rotate(old_file, new_file, data_dir) == 1
+
+    assert "interrupted restore" in capsys.readouterr().err
+    assert data_dir.joinpath(*crypto.APPS_CONFIG_PATH).read_bytes() == apps_before
+
+
+def test_genkey_explains_a_directory_it_cannot_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from app.core import filestore
+
+    def refused(*_: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(filestore, "atomic_write_bytes", refused)
+
+    assert crypto._main(["genkey", str(tmp_path / "new.key")]) == 1
+
+    message = capsys.readouterr().err
+    assert "65532" in message
+    assert "init" in message
+
+
+def test_genkey_still_writes_a_private_usable_key(tmp_path: Path) -> None:
+    key_file = tmp_path / "nested" / "new.key"
+
+    assert crypto._main(["genkey", str(key_file)]) == 0
+
+    assert crypto.load_key(key_file)
+    assert key_file.stat().st_mode & 0o777 == 0o600

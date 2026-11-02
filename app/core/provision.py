@@ -13,6 +13,9 @@ Two jobs, both idempotent:
   genuinely new install. A key missing from an install that already has data is not a
   first run, it is a lost key, and generating a fresh one there would turn recoverable
   ciphertext into permanent noise. That case stops with an error naming the backup.
+* Hand the key's directory to the app's uid as well, or the documented rotation cannot
+  create its new key beside the old one. This costs nothing: the app itself mounts that
+  directory read-only.
 
 Both live here, in the image, rather than as a shell one-liner in the compose file:
 distroless has no shell, and this is logic worth testing.
@@ -70,11 +73,28 @@ def has_existing_install(data_dir: Path = DATA_DIR) -> bool:
 
 
 def prepare_key(key_file: Path = KEY_FILE, data_dir: Path = DATA_DIR) -> bool:
-    """Ensure an encryption key exists. True when one was generated.
+    """Ensure an encryption key exists, in a directory the app's uid owns. True when one
+    was generated.
 
     Raises when the key is missing but the data directory is not: see the module
     docstring — that is a lost key, and the only safe move is to stop and say so.
+
+    Held by this process while it works. It is root, but compose drops DAC_OVERRIDE, so it
+    can only write into a directory it owns, and an earlier start handed this one over.
     """
+    key_directory = key_file.parent
+    key_directory.mkdir(parents=True, exist_ok=True)
+    # Never the filesystem root, should the key ever be configured to sit directly in it.
+    if key_directory == Path(key_file.anchor):
+        return _place_key(key_file, data_dir)
+    os.chown(key_directory, os.getuid(), os.getgid())
+    try:
+        return _place_key(key_file, data_dir)
+    finally:
+        _own(key_directory)
+
+
+def _place_key(key_file: Path, data_dir: Path) -> bool:
     # Docker creates a missing bind-mount SOURCE as a directory, so a compose file that
     # mounted the key as a file left `boxmedia.key/` behind on the host. The public
     # compose mounts the directory now; this clears the wreckage of the older one.
@@ -98,7 +118,6 @@ def prepare_key(key_file: Path = KEY_FILE, data_dir: Path = DATA_DIR) -> bool:
             "  fresh — a new key here would make that data permanently unreadable."
         )
 
-    key_file.parent.mkdir(parents=True, exist_ok=True)
     key_file.write_bytes(base64.urlsafe_b64encode(generate_key()))
     key_file.chmod(KEY_MODE)
     _own(key_file)

@@ -172,6 +172,12 @@ class Settings(BaseSettings):
     def backups_dir(self) -> Path:
         return self.data_dir / "backups"
 
+    @property
+    def upload_spool_dir(self) -> Path:
+        """Where the image points TMPDIR. /tmp is a tmpfs, which counts against the container's
+        memory limit, so a large upload spooled there would be killed on its way in."""
+        return self.data_dir / ".tmp"
+
     def ensure_data_dirs(self) -> None:
         """Create the runtime directory layout if missing (idempotent).
 
@@ -188,6 +194,7 @@ class Settings(BaseSettings):
             self.logs_dir,
             self.cache_dir / "posters",
             self.backups_dir,
+            self.upload_spool_dir,
         ):
             try:
                 directory.mkdir(parents=True, exist_ok=True)

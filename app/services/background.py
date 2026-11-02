@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
+from app.services.maintenance import MaintenanceGate
+
 
 class SingleFlight:
     """At most one running task per key, kept referenced until it finishes.
@@ -24,15 +26,23 @@ class SingleFlight:
     that dies with the process, which the lifespan cancels on the way out.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, maintenance: MaintenanceGate | None = None) -> None:
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._maintenance = maintenance or MaintenanceGate()
 
     def start(self, key: str, work: Callable[[], Awaitable[None]]) -> bool:
-        """Begin `work` unless the same key is already running. True when it started."""
+        """Begin `work` unless the same key is running or a maintenance has the door closed.
+        True when it started."""
         running = self._tasks.get(key)
         if running is not None and not running.done():
             return False
-        self._tasks[key] = asyncio.create_task(self._guarded(key, work))
+        if not self._maintenance.try_enter():
+            return False
+        task = asyncio.create_task(self._guarded(key, work))
+        # A callback rather than a `finally`: a task cancelled before its first step never
+        # enters the coroutine, and the gate would wait for it for ever.
+        task.add_done_callback(lambda _: self._maintenance.leave())
+        self._tasks[key] = task
         return True
 
     async def _guarded(self, key: str, work: Callable[[], Awaitable[None]]) -> None:
@@ -49,5 +59,12 @@ class SingleFlight:
             await asyncio.gather(*running, return_exceptions=True)
 
     def cancel_all(self) -> None:
+        """Request cancellation, from any thread: a restore calls this from a worker. That
+        it has finished is what the maintenance gate's count says, not this."""
         for task in self._tasks.values():
-            task.cancel()
+            if task.done():
+                continue
+            try:
+                task.get_loop().call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                continue  # its loop has closed, and nothing on a closed loop is still running

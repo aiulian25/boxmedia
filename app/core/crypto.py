@@ -7,8 +7,8 @@ manager to invoke external binaries (Step 4 rationale). The key is loaded from
 
 Three stores hold ciphertext under that key — the Radarr/Sonarr API keys, the
 media-server token, and the discovery credentials — and `rotate` moves all three
-together. Rotating only some of them would leave an install half under each key,
-and the half that moved could no longer be rotated back with the old one.
+together. It is safe to interrupt: GCM proves which key a field is under, so re-running
+the same command finishes the job from wherever it stopped.
 
 Field format:  gcm:v1:<b64url(nonce)>:<b64url(ciphertext+tag)>
 File format:   4-byte magic | 1-byte version | 12-byte nonce | ciphertext+tag
@@ -17,10 +17,13 @@ File format:   4-byte magic | 1-byte version | 12-byte nonce | ciphertext+tag
 from __future__ import annotations
 
 import base64
+import io
 import os
 from pathlib import Path
+from typing import BinaryIO
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 KEY_LENGTH_BYTES = 32  # AES-256
@@ -29,6 +32,17 @@ FIELD_PREFIX = "gcm"
 FIELD_VERSION = "v1"
 FILE_MAGIC = b"BMB1"  # BoxMedia Backup, format 1
 FILE_VERSION = 1
+# Version 2 encrypts in chunks, so an archive of any size needs one chunk of memory. Version 1,
+# one AES-GCM block over the whole file, needs all of it, and stays readable.
+FILE_VERSION_CHUNKED = 2
+CHUNK_PLAINTEXT_BYTES = 1024 * 1024
+_CHUNK_NONCE_PREFIX_BYTES = 7
+_CHUNK_COUNTER_BYTES = 4
+_CHUNK_LENGTH_BYTES = 4
+_FINAL_CHUNK = b"\x01"
+_NOT_FINAL_CHUNK = b"\x00"
+GCM_TAG_BYTES = 16
+_READ_BYTES = 1024 * 1024
 
 # Where the encrypted Radarr keys live, relative to the data dir. Deliberately mirrored
 # from the apps store rather than imported — core must never import services — and a test
@@ -53,6 +67,9 @@ DISCOVERY_SCHEMA_VERSION = 1
 DISCOVERY_FIELDS = ("tmdb_key_encrypted", "trakt_client_id_encrypted")
 # Every stored credential field ends with it; stripped to name one in an error.
 ENCRYPTED_FIELD_SUFFIX = "_encrypted"
+# An interrupted restore's journal, mirrored from app.services.maintenance. While it exists
+# config/ may be about to be swapped back, which would undo a rotation for that half only.
+RESTORE_JOURNAL_FILENAME = ".restore-journal.json"
 
 # What a store says when its ciphertext will not open with the key this build is holding.
 # One sentence in one place: three stores raise it as three different typed errors, and
@@ -68,7 +85,7 @@ USAGE = (
     "  python -m app.core.crypto rotate <old-key-file> <new-key-file> <data-dir>\n"
     "\n"
     "rotate re-encrypts the stored Radarr/Sonarr API keys, the media-server token and\n"
-    "the discovery keys. Stop BoxMedia first."
+    "the discovery keys. Stop BoxMedia first. If it is interrupted, run it again."
 )
 
 
@@ -139,12 +156,150 @@ def encrypt_bytes(plaintext: bytes, key: bytes) -> bytes:
     return FILE_MAGIC + bytes([FILE_VERSION]) + nonce + ciphertext
 
 
+def _chunk_nonce(prefix: bytes, counter: int, final: bool) -> bytes:
+    """Prefix, position, and whether this is the end. Authenticating the position and the end
+    in every chunk means chunks cannot be reordered, dropped or cut short unnoticed."""
+    position = counter.to_bytes(_CHUNK_COUNTER_BYTES, "big")
+    return prefix + position + (_FINAL_CHUNK if final else _NOT_FINAL_CHUNK)
+
+
+class ChunkedWriter:
+    """Encrypts what is written to it into the version 2 file format, one chunk at a time."""
+
+    def __init__(self, sink: BinaryIO, key: bytes) -> None:
+        self._sink = sink
+        self._aead = AESGCM(key)
+        self._prefix = os.urandom(_CHUNK_NONCE_PREFIX_BYTES)
+        self._header = FILE_MAGIC + bytes([FILE_VERSION_CHUNKED]) + self._prefix
+        self._counter = 0
+        self._pending = bytearray()
+        sink.write(self._header)
+
+    def write(self, data: bytes) -> int:
+        self._pending += data
+        while len(self._pending) > CHUNK_PLAINTEXT_BYTES:
+            self._emit(bytes(self._pending[:CHUNK_PLAINTEXT_BYTES]), final=False)
+            del self._pending[:CHUNK_PLAINTEXT_BYTES]
+        return len(data)
+
+    def finish(self) -> None:
+        """Write the last chunk, which always exists, even empty: it is what proves the end."""
+        self._emit(bytes(self._pending), final=True)
+        self._pending.clear()
+
+    def _emit(self, chunk: bytes, *, final: bool) -> None:
+        nonce = _chunk_nonce(self._prefix, self._counter, final)
+        sealed = self._aead.encrypt(nonce, chunk, self._header)
+        self._sink.write(len(sealed).to_bytes(_CHUNK_LENGTH_BYTES, "big") + sealed)
+        self._counter += 1
+
+
+class ChunkedReader:
+    """Reads the version 2 format as plaintext, authenticating each chunk before handing it on.
+
+    A reader that stops early has not proved the file's end, so a caller parsing it must read
+    to the end before trusting the whole.
+    """
+
+    def __init__(self, source: BinaryIO, key: bytes) -> None:
+        self._source = source
+        self._aead = AESGCM(key)
+        self._header = source.read(len(FILE_MAGIC) + 1 + _CHUNK_NONCE_PREFIX_BYTES)
+        expected_start = FILE_MAGIC + bytes([FILE_VERSION_CHUNKED])
+        full_length = len(expected_start) + _CHUNK_NONCE_PREFIX_BYTES
+        if len(self._header) != full_length or not self._header.startswith(expected_start):
+            raise DecryptionError("not a chunked BoxMedia backup archive")
+        self._prefix = self._header[len(expected_start) :]
+        self._counter = 0
+        self._next_frame = self._read_frame()
+        self._plain = bytearray()
+        self._ended = False
+
+    def _read_frame(self) -> bytes | None:
+        length_bytes = self._source.read(_CHUNK_LENGTH_BYTES)
+        if not length_bytes:
+            return None
+        length = int.from_bytes(length_bytes, "big")
+        if (
+            len(length_bytes) != _CHUNK_LENGTH_BYTES
+            or length > CHUNK_PLAINTEXT_BYTES + GCM_TAG_BYTES
+        ):
+            raise DecryptionError("archive authentication failed (malformed chunk)")
+        frame = self._source.read(length)
+        if len(frame) != length:
+            raise DecryptionError("archive authentication failed (cut short)")
+        return frame
+
+    def _open_next_chunk(self) -> None:
+        frame = self._next_frame
+        if frame is None:
+            raise DecryptionError("archive authentication failed (no end marker)")
+        self._next_frame = self._read_frame()
+        final = self._next_frame is None
+        nonce = _chunk_nonce(self._prefix, self._counter, final)
+        try:
+            self._plain += self._aead.decrypt(nonce, frame, self._header)
+        except InvalidTag as exc:
+            raise DecryptionError(
+                "archive authentication failed (wrong key or tampered)"
+            ) from exc
+        self._counter += 1
+        self._ended = final
+
+    def read(self, size: int = -1) -> bytes:
+        while (size < 0 or len(self._plain) < size) and not self._ended:
+            self._open_next_chunk()
+        taken = len(self._plain) if size < 0 else min(size, len(self._plain))
+        data = bytes(self._plain[:taken])
+        del self._plain[:taken]
+        return data
+
+
+def archive_version(path: Path) -> int:
+    """Which file format an archive is in, from its header alone."""
+    with path.open("rb") as source:
+        header = source.read(len(FILE_MAGIC) + 1)
+    if len(header) != len(FILE_MAGIC) + 1 or not header.startswith(FILE_MAGIC):
+        raise DecryptionError("not a BoxMedia backup archive")
+    return header[-1]
+
+
+def decrypt_single_block_file(path: Path, sink: BinaryIO, key: bytes) -> None:
+    """Decrypt a version 1 archive to `sink` without holding it in memory.
+
+    Authenticated only when the end is reached, so the caller must not read `sink` until this
+    returns, and must discard it if this raises.
+    """
+    header_length = len(FILE_MAGIC) + 1 + NONCE_LENGTH_BYTES
+    remaining = path.stat().st_size - header_length - GCM_TAG_BYTES
+    if remaining < 0:
+        raise DecryptionError("not a BoxMedia backup archive")
+    with path.open("rb") as source:
+        nonce = source.read(header_length)[-NONCE_LENGTH_BYTES:]
+        source.seek(-GCM_TAG_BYTES, os.SEEK_END)
+        tag = source.read(GCM_TAG_BYTES)
+        source.seek(header_length)
+        decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+        while remaining:
+            block = source.read(min(_READ_BYTES, remaining))
+            remaining -= len(block)
+            sink.write(decryptor.update(block))
+    try:
+        sink.write(decryptor.finalize())
+    except InvalidTag as exc:
+        raise DecryptionError("archive authentication failed (wrong key or tampered)") from exc
+
+
 def decrypt_bytes(blob: bytes, key: bytes) -> bytes:
     header_len = len(FILE_MAGIC) + 1 + NONCE_LENGTH_BYTES
     if len(blob) < header_len or blob[: len(FILE_MAGIC)] != FILE_MAGIC:
         raise DecryptionError("not a BoxMedia backup archive")
+    if blob[len(FILE_MAGIC)] == FILE_VERSION_CHUNKED:
+        return ChunkedReader(io.BytesIO(blob), key).read()
     nonce = blob[len(FILE_MAGIC) + 1 : header_len]
-    ciphertext = blob[header_len:]
+    # A view, not a slice: a slice would hold a second copy of a whole archive in memory,
+    # alongside the blob and the plaintext, at the moment an import is at its largest.
+    ciphertext = memoryview(blob)[header_len:]
     try:
         return AESGCM(key).decrypt(nonce, ciphertext, None)
     except InvalidTag as exc:
@@ -154,12 +309,25 @@ def decrypt_bytes(blob: bytes, key: bytes) -> bytes:
 def _genkey(key_file: Path) -> int:
     import sys
 
+    from app.core import filestore
+
     if key_file.exists():
         print(f"refusing to overwrite existing key file: {key_file}", file=sys.stderr)
         return 1
-    key_file.parent.mkdir(parents=True, exist_ok=True)
-    key_file.write_bytes(base64.urlsafe_b64encode(generate_key()))
-    key_file.chmod(0o600)
+    try:
+        # Atomic and synced, because ciphertext is about to depend on this file: a key lost
+        # to a power cut after a rotation is every credential lost with it.
+        filestore.atomic_write_bytes(key_file, base64.urlsafe_b64encode(generate_key()))
+        key_file.chmod(0o600)
+    except PermissionError as exc:
+        print(
+            f"error: cannot create {key_file}: {exc}\n"
+            "  The directory must be writable by the user running this (uid 65532 in the\n"
+            "  image). Start the stack once with the current docker-compose.yml, whose init\n"
+            "  service hands it over, then run this again.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"wrote new 256-bit key to {key_file} (mode 600)")
     return 0
 
@@ -176,13 +344,28 @@ class _RotationAborted(Exception):
     """
 
 
+def _opens_with(token: str, key: bytes) -> bool:
+    try:
+        decrypt_field(token, key)
+    except DecryptionError:
+        return False
+    return True
+
+
 def _rotated_field(token: object, label: str, old_key: bytes, new_key: bytes) -> str:
-    """One credential moved from the old key to the new one, or an abort naming it."""
+    """One credential under the new key, or an abort naming it.
+
+    Already under the new key is success, not failure, and GCM's tag is what makes that safe
+    to conclude. This is the whole of resuming: an interrupted run left each field under
+    one key or the other, so running again finishes it, and swapping the two keys undoes it.
+    """
     if not isinstance(token, str):
         raise _RotationAborted(f"{label} is missing or is not an encrypted field")
     try:
         plaintext = decrypt_field(token, old_key)
     except DecryptionError as exc:
+        if _opens_with(token, new_key):
+            return token
         raise _RotationAborted(f"could not decrypt {label}: {exc}") from exc
     return encrypt_field(plaintext, new_key)
 
@@ -242,6 +425,17 @@ def _existing(data_dir: Path, *relative_paths: tuple[str, ...]) -> list[Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _sync_file(path: Path) -> None:
+    from app.core import filestore
+
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    filestore.fsync_directory(path.parent)
+
+
 def _rotate(old_key_file: Path, new_key_file: Path, data_dir: Path) -> int:
     """Re-encrypt every stored credential from the old key to the new one.
 
@@ -249,13 +443,13 @@ def _rotate(old_key_file: Path, new_key_file: Path, data_dir: Path) -> int:
     old-key ciphertext back over the rotated files.
 
     Every field in all three stores is decrypted and re-encrypted in memory before ANY
-    file is written, so one bad field aborts with every file untouched. See the module
-    docstring for why a partial rotation is worse than none.
+    file is written, so one field neither key opens aborts with every file untouched.
 
-    The writes themselves are atomic per file but not as a group. The app is stopped for
-    the whole operation and the files are small, so the window is a few milliseconds
-    across three renames; a crash inside it is recovered by re-running with whichever key
-    each remaining file still holds.
+    The writes are atomic per file but not as a group, so a crash or a full disk can leave
+    some stores under each key. No journal is needed to get out of that: see
+    `_rotated_field`. Re-running the same command finishes the rotation, and swapping the
+    two keys undoes it. Either way both key files must survive, so the new one is made
+    durable before anything starts to depend on it.
     """
     import sys
 
@@ -266,6 +460,14 @@ def _rotate(old_key_file: Path, new_key_file: Path, data_dir: Path) -> int:
         new_key = load_key(new_key_file)
     except EncryptionKeyError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if (data_dir / RESTORE_JOURNAL_FILENAME).exists():
+        print(
+            f"error: {data_dir} holds an interrupted restore. Start BoxMedia once so it can "
+            "recover, stop it, then rotate.",
+            file=sys.stderr,
+        )
         return 1
 
     apps_path = data_dir.joinpath(*APPS_CONFIG_PATH)
@@ -315,13 +517,26 @@ def _rotate(old_key_file: Path, new_key_file: Path, data_dir: Path) -> int:
         )
         return 1
 
-    for path, document, schema_version in pending:
-        filestore.write_yaml(path, document, schema_version=schema_version)
+    written = 0
+    try:
+        _sync_file(new_key_file)
+        for path, document, schema_version in pending:
+            filestore.write_yaml(path, document, schema_version=schema_version)
+            written += 1
+    except OSError as exc:
+        print(
+            f"error: rotation stopped after {written} of {len(pending)} file(s): {exc}\n"
+            "  Some credentials may now be under each key. KEEP BOTH KEY FILES, fix the\n"
+            "  problem and run this same command again: it finishes from where it stopped.\n"
+            "  To go back to the old key instead, run it with the two keys swapped.",
+            file=sys.stderr,
+        )
+        return 1
 
-    print(f"re-encrypted {len(rotated_apps)} connection API key(s) in {apps_path}")
+    print(f"{len(rotated_apps)} connection API key(s) in {apps_path} are under the new key")
     for path, _document, _schema_version in pending:
         if path != apps_path:
-            print(f"re-encrypted the stored credentials in {path}")
+            print(f"the stored credentials in {path} are under the new key")
     print(f"next: point BM_ENCRYPTION_KEY_FILE at {new_key_file} and start BoxMedia again.")
     print(
         "keep the old key until every backup taken with it is gone — existing .backup "
