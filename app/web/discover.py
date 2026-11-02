@@ -8,8 +8,9 @@ rather than implying a parity that does not exist: there is no television box of
 
 Every row renders from something already on disk:
 
-* the film shelf from the latest stored report — zero fetches, and it is the same data
-  the weekly view already shows;
+* the film shelf from the newest chart week stored — zero fetches, and it is the same data
+  the weekly view already shows. Its library states come from Radarr reads other pages have
+  just made, and otherwise from what the week recorded, and the page says which;
 * the two Trakt shelves from `DiscoverCache`.
 
 External calls live in the Refresh action alone: session-gated, CSRF-guarded, audited,
@@ -29,16 +30,20 @@ hours later.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
+from datetime import UTC, date, datetime
 
 from fastapi import APIRouter, Form, Request
 from fastapi import status as http_status
 from fastapi.responses import RedirectResponse
 
 from app.core.audit import AuditAction
+from app.services.apps import KIND_SONARR
 from app.services.boxoffice import week_start
 from app.services.discovery import (
     ANTICIPATED_KEY,
+    DISCOVER_FETCH_SIZE,
     DISCOVER_ROW_SIZE,
     PROVIDER_TMDB,
     PROVIDER_TRAKT,
@@ -46,11 +51,24 @@ from app.services.discovery import (
     DiscoverShow,
     DiscoveryError,
 )
+from app.services.filters import FiltersConfig
+from app.services.ignore import IgnoreSnapshot
+from app.services.matcher import normalize_title
 from app.services.mediaserver import HOLDS_PROBABLY, HOLDS_YES
 from app.services.posters import SERIES_POSTER_WIDTH
-from app.services.reports import MovieStatus, RunStatus, imdb_url
+from app.services.radarr import LIBRARY_SNAPSHOT_SECONDS, RadarrMovie
+from app.services.reports import (
+    MATCHED_AMBIGUOUS,
+    MATCHED_BY_GUESS,
+    MovieAction,
+    MovieResult,
+    MovieStatus,
+    Report,
+    imdb_url,
+)
 from app.services.tmdb import TmdbClient, TmdbError
 from app.services.trakt import TraktClient, TraktError
+from app.services.upcoming import TERRITORIES, window_from
 from app.web.deps import (
     MEDIA_TYPES,
     TYPE_ALL,
@@ -59,7 +77,10 @@ from app.web.deps import (
     cache_posters,
     client_ip,
     current_user,
+    format_timestamp,
+    parse_timestamp,
     render,
+    series_holder,
     validated_media_type,
 )
 from app.web.profile import STATUS_QUERY_KEY
@@ -67,8 +88,12 @@ from app.web.profile import STATUS_QUERY_KEY
 router = APIRouter()
 
 NAV_KEY = "discover"
+# How old a Radarr read may be and still decide a card, with its age shown. A library changes
+# slowly, and without this a page opened on its own has nothing but the week's record.
+LIBRARY_READ_MAX_AGE_SECONDS = 24 * 60 * 60
 DISCOVER_PATH = "/discover"
 REFRESH_PATH = "/discover/refresh"
+UPCOMING_REFRESH_PATH = "/discover/upcoming/refresh"
 # The chip the page is showing, in the URL so it survives a refresh and a bookmark.
 TYPE_QUERY_KEY = "type"
 
@@ -76,14 +101,19 @@ TYPE_QUERY_KEY = "type"
 # took too long", which is true and actionable, rather than a spinner nobody can cancel.
 REFRESH_TIMEOUT_SECONDS = 12.0
 
-# How a card reads. Four states, and each one is a different next action: open it where
-# it already is, add it, verify a guess, or find it by hand because nothing can add it.
+# How a card reads. Each state is a different next action: open it where it already is,
+# add it, verify a guess, or find it by hand because nothing can add it.
 STATE_IN_SONARR = "in_sonarr"
+STATE_MAYBE_IN_SONARR = "maybe_in_sonarr"
 STATE_ON_SERVER = "on_server"
 STATE_MAYBE_ON_SERVER = "maybe_on_server"
-# The film shelf's bottom rung. "Wanted" is Radarr's own word for a title that IS in
-# your library and awaiting a release, which is what it means here too.
+STATE_IN_LIBRARY = "in_library"
+# "Wanted" is Radarr's own word for a title that IS in your library and awaiting a release,
+# which is what it means on the film shelf too. It never means "not in your library".
 STATE_WANTED = "wanted"
+STATE_IGNORED = "ignored"
+STATE_NO_MATCH = "no_match"
+STATE_UNKNOWN = "unknown"
 # The TELEVISION shelf's bottom rung, and a different claim: not in your library at all.
 # It read "Wanted" until someone pointed out that on a Discover card that says the
 # opposite of what Sonarr means by it — a show nobody has added, labelled as one already
@@ -93,24 +123,109 @@ STATE_MISSING = "missing"
 STATE_NO_TVDB = "no_tvdb"
 
 
-def _film_views(request: Request) -> tuple[list[dict], str | None]:
-    """The chart shelf, from the latest COMPLETED report. No fetches.
+_FILM_STATE_LABELS = {
+    STATE_IN_LIBRARY: "In Library",
+    STATE_WANTED: "Wanted",
+    STATE_MISSING: "Missing",
+    STATE_IGNORED: "Ignored",
+    STATE_NO_MATCH: "No match",
+    STATE_UNKNOWN: "Unknown",
+}
+_RECORDED_FILM_STATES = {
+    MovieStatus.IN_LIBRARY: STATE_IN_LIBRARY,
+    MovieStatus.WANTED: STATE_WANTED,
+    MovieStatus.MISSING: STATE_MISSING,
+}
 
-    Returns the cards and the week they came from. A report-less install gets an empty
+
+def _last_reads(request: Request) -> dict[str, tuple[dict[int, RadarrMovie], float] | None]:
+    """What each connection last told any page, if that is recent enough to mean anything.
+    Never asks Radarr: this page's promise is that opening it makes no request."""
+    snapshots = request.app.state.radarr_library_snapshots
+    cutoff = time.time() - LIBRARY_READ_MAX_AGE_SECONDS
+    reads = {app.id: snapshots.last_read(app.id) for app in request.app.state.apps.list_apps()}
+    return {
+        app_id: read if read is not None and read[1] >= cutoff else None
+        for app_id, read in reads.items()
+    }
+
+
+def _recent_libraries(request: Request) -> dict[str, dict[int, RadarrMovie] | None]:
+    return {
+        app_id: read[0] if read else None for app_id, read in _last_reads(request).items()
+    }
+
+
+def _library_as_of(request: Request) -> str | None:
+    """When the oldest read in use was made, if any is past what a page would treat as fresh.
+    Said on the page, because this status may be up to a day old."""
+    read_times = [read[1] for read in _last_reads(request).values() if read]
+    if not read_times or time.time() - min(read_times) < LIBRARY_SNAPSHOT_SECONDS:
+        return None
+    return format_timestamp(datetime.fromtimestamp(min(read_times), UTC))
+
+
+def _held_state(
+    tmdb_id: int | None, libraries: dict[str, dict[int, RadarrMovie] | None]
+) -> str | None:
+    """In Library or Wanted, if a connection read recently holds it."""
+    held = [library[tmdb_id] for library in libraries.values() if library and tmdb_id in library]
+    if not held:
+        return None
+    return STATE_IN_LIBRARY if any(copy.has_file for copy in held) else STATE_WANTED
+
+
+def _every_library_answered(libraries: dict[str, dict[int, RadarrMovie] | None]) -> bool:
+    return bool(libraries) and all(library is not None for library in libraries.values())
+
+
+def _film_state(
+    movie: MovieResult,
+    libraries: dict[str, dict[int, RadarrMovie] | None],
+    ignored: IgnoreSnapshot,
+) -> tuple[str, bool]:
+    """What a film is now, and whether that is only what its week recorded.
+
+    In the review page's order, so one film cannot read differently between the two. "Missing"
+    is only claimed live once every connection has answered: one silent box could hold it.
+    """
+    held = _held_state(movie.tmdb_id, libraries)
+    if held:
+        return held, False
+    if ignored.is_ignored(movie.tmdb_id, movie.normalized_title):
+        return STATE_IGNORED, False
+    if movie.action == MovieAction.NO_MATCH:
+        return STATE_NO_MATCH, False
+    if _every_library_answered(libraries):
+        return STATE_MISSING, False
+    if movie.action == MovieAction.ERROR:
+        return STATE_UNKNOWN, False  # the run could not look, so its "missing" says nothing
+    return _RECORDED_FILM_STATES.get(movie.status, STATE_UNKNOWN), True
+
+
+def _film_views(request: Request) -> tuple[list[dict], Report | None]:
+    """The chart shelf, from the newest COMPLETED chart week. No fetches.
+
+    By the week and not by when it ran, so re-running an old week cannot take over the shelf.
+
+    Returns the cards and the report they came from. A report-less install gets an empty
     shelf and a caption saying so — the television rows still render, which is the whole
     point of the two halves being independent.
     """
-    reports = request.app.state.reports.list_reports()
-    latest = next((report for report in reports if report.status == RunStatus.OK), None)
-    if latest is None:
+    weeks = request.app.state.reports.completed_weeks()
+    if not weeks:
         return [], None
+    latest = weeks[0]
+    libraries = _recent_libraries(request)
+    ignored = request.app.state.ignore.snapshot()
     views = []
     for movie in latest.movies[:DISCOVER_ROW_SIZE]:
+        state, recorded = _film_state(movie, libraries, ignored)
         views.append({
             "kind": TYPE_MOVIES,
             "title": movie.title,
             "rank": movie.rank,
-            "meta": f"{movie.gross_display} · Wk {movie.weeks_in_release}",
+            "meta": _movie_meta(movie.gross_display, movie.weeks_in_release),
             "facts": _facts(movie.rating, movie.genres),
             "poster_url": movie.poster_url,
             "tmdb_id": movie.tmdb_id,
@@ -119,13 +234,82 @@ def _film_views(request: Request) -> tuple[list[dict], str | None]:
             # add control, its fix-match and its ignore. Sending people there beats
             # growing a second, thinner copy of all three here, so a film card links to
             # its week rather than carrying its own Add.
-            "state": (
-                STATE_IN_SONARR
-                if movie.status == MovieStatus.IN_LIBRARY
-                else STATE_WANTED
-            ),
+            "state": state,
+            "state_label": _FILM_STATE_LABELS[state],
+            "recorded": recorded,
+            "report_id": latest.id,
+            # When the film itself is in doubt, as the review page words it: a guess that is
+            # already held has been accepted, but an ambiguous title may hold the wrong one.
+            "verify": movie.detail == MATCHED_AMBIGUOUS
+            or (movie.detail == MATCHED_BY_GUESS and state not in (STATE_IN_LIBRARY, STATE_WANTED)),
         })
-    return views, latest.week
+    return views, latest
+
+
+def _upcoming_view(request: Request, filters: FiltersConfig) -> dict | None:
+    """The shelf, from the cache, or None when it has not been turned on.
+
+    What has already charted is left out, since this shelf exists to show films before that
+    happens, and so is what you ignored. Both are counted, so a shorter shelf says why. Library
+    state comes from recent reads, as on the film shelf above: unknown until there is one.
+    """
+    if not filters.upcoming_enabled:
+        return None
+    shelf = request.app.state.upcoming_cache.load()
+    view = {
+        "has_key": request.app.state.discovery.load().has_tmdb,
+        "fetched": shelf is not None,
+        "cards": [],
+        "left_out": 0,
+        "any_unknown": False,
+        "settings_changed": False,
+    }
+    if shelf is None:
+        return view
+    charted = {
+        movie.tmdb_id
+        for report in request.app.state.reports.completed_weeks()
+        for movie in report.movies
+    }
+    ignored = request.app.state.ignore.snapshot()
+    libraries = _recent_libraries(request)
+    answered = _every_library_answered(libraries)
+    for film in shelf.films:
+        if film.tmdb_id in charted or ignored.is_ignored(
+            film.tmdb_id, normalize_title(film.title)
+        ):
+            view["left_out"] += 1
+            continue
+        if len(view["cards"]) >= DISCOVER_ROW_SIZE:
+            break
+        state = _held_state(film.tmdb_id, libraries) or (
+            STATE_MISSING if answered else STATE_UNKNOWN
+        )
+        view["any_unknown"] = view["any_unknown"] or state == STATE_UNKNOWN
+        view["cards"].append({
+            "kind": TYPE_MOVIES,
+            "title": film.title,
+            "tmdb_id": film.tmdb_id,
+            "poster_url": film.poster_url,
+            "state": state,
+            "state_label": _FILM_STATE_LABELS[state],
+            "date": _date_display(film.release_date),
+        })
+    view["territory"] = TERRITORIES[shelf.territory]
+    view["window_days"] = shelf.window_days
+    view["fetched_at"] = format_timestamp(datetime.fromtimestamp(shelf.fetched_at, UTC))
+    view["settings_changed"] = (shelf.territory, shelf.window_days) != (
+        filters.upcoming_territory, filters.upcoming_window_days,
+    )
+    return view
+
+
+def _date_display(day: date) -> str:
+    return f"{day.day}/{day.month}/{day.year}"
+
+
+def _movie_meta(gross_display: str, weeks: int | None) -> str:
+    return gross_display if weeks is None else f"{gross_display} · Wk {weeks}"
 
 
 def _facts(rating: float | None, genres: list[str] | tuple[str, ...]) -> str:
@@ -140,6 +324,35 @@ def _facts(rating: float | None, genres: list[str] | tuple[str, ...]) -> str:
     if genres:
         parts.append(" · ".join(genres))
     return " · ".join(parts)
+
+
+def _shelf(
+    request: Request,
+    row_id: str,
+    title: str,
+    source: str,
+    shows: tuple[DiscoverShow, ...],
+    count_label: str,
+    ignored: IgnoreSnapshot,
+) -> dict:
+    """One Trakt shelf, without the shows you have dismissed.
+
+    Filtered here and not in the cache, so Un-ignore brings a show straight back with no
+    request to Trakt. Counted, so a shelf with gaps says why.
+    """
+    wanted = [
+        show
+        for show in shows
+        if not ignored.is_series_ignored(show.tmdb_id, normalize_title(show.title))
+    ]
+    return {
+        "id": row_id,
+        "title": title,
+        "source": source,
+        "ignored_count": len(shows) - len(wanted),
+        # Fetched with room to spare, so dismissing shows does not leave a short shelf.
+        "cards": _show_views(request, tuple(wanted[:DISCOVER_ROW_SIZE]), count_label=count_label),
+    }
 
 
 def _show_views(
@@ -181,6 +394,7 @@ def _show_views(
             "tvdb_id": show.tvdb_id,
             "imdb_url": imdb_url(show.imdb_id),
             "server_name": server_name,
+            **series_holder(request, held),
             **_show_state(show, held, on_server),
         })
     return views
@@ -202,10 +416,12 @@ def _show_state(show: DiscoverShow, held: object, on_server: str | None) -> dict
 
     The ladder is deliberate. Already in Sonarr wins outright — it is the answer that
     changes what you would do. Then "your server has it, Sonarr does not", which is the
-    mockup's most valuable state and the reason the show library exists. Then the honest
-    refusal for a show nothing can add. Then plain wanted.
+    mockup's most valuable state and the reason the show library exists. A name match in
+    Sonarr comes after that, because a fact beats a guess, and it claims no episode counts:
+    they would be counts of a show nothing says is this one. Then the honest refusal for a
+    show nothing can add. Then plain wanted.
     """
-    if held is not None:
+    if held is not None and held.state == HOLDS_YES:
         missing = held.series.missing_episode_count
         return {
             "state": STATE_IN_SONARR,
@@ -214,10 +430,12 @@ def _show_state(show: DiscoverShow, held: object, on_server: str | None) -> dict
                 if held.series.complete
                 else f"Missing {missing} episode{'s' if missing != 1 else ''}"
             ),
-            "guess": held.state == HOLDS_PROBABLY,
+            "guess": False,
         }
     if on_server == HOLDS_YES:
         return {"state": STATE_ON_SERVER, "state_text": None, "guess": False}
+    if held is not None:
+        return {"state": STATE_MAYBE_IN_SONARR, "state_text": None, "guess": True}
     if on_server == HOLDS_PROBABLY:
         return {"state": STATE_MAYBE_ON_SERVER, "state_text": None, "guess": True}
     if not show.addable:
@@ -240,31 +458,30 @@ async def discover(request: Request, type: str = TYPE_ALL) -> object:  # noqa: A
     cache = request.app.state.discover_cache
     rows = cache.load()
 
-    films, week = _film_views(request) if media_type != TYPE_TV else ([], None)
+    films, chart = _film_views(request) if media_type != TYPE_TV else ([], None)
+    upcoming = (
+        _upcoming_view(request, request.app.state.filters.load())
+        if media_type != TYPE_TV
+        else None
+    )
+    week = chart.week if chart else None
     show_rows = []
     if media_type != TYPE_MOVIES:
+        ignored = request.app.state.ignore.snapshot()
         show_rows = [
-            {
-                "id": TRENDING_KEY,
-                "title": "Trending now",
-                "source": "Trakt · artwork from TMDB",
-                "cards": _show_views(
-                    request, rows[TRENDING_KEY], count_label="watching"
-                ),
-            },
-            {
-                "id": ANTICIPATED_KEY,
-                "title": "Anticipated",
-                "source": "Trakt · not aired yet",
-                "cards": _show_views(
-                    request, rows[ANTICIPATED_KEY], count_label="waiting"
-                ),
-            },
+            _shelf(
+                request, TRENDING_KEY, "Trending now", "Trakt · artwork from TMDB",
+                rows[TRENDING_KEY], "watching", ignored,
+            ),
+            _shelf(
+                request, ANTICIPATED_KEY, "Anticipated", "Trakt · not aired yet",
+                rows[ANTICIPATED_KEY], "waiting", ignored,
+            ),
         ]
 
     # One pass over every card on the page, so the posters download concurrently rather
     # than shelf by shelf. Series at their own width — see posters.SERIES_POSTER_WIDTH.
-    await cache_posters(request, films)
+    await cache_posters(request, films + (upcoming["cards"] if upcoming else []))
     await cache_posters(
         request,
         [card for row in show_rows for card in row["cards"]],
@@ -282,14 +499,29 @@ async def discover(request: Request, type: str = TYPE_ALL) -> object:  # noqa: A
         media_types=MEDIA_TYPES,
         discover_path=DISCOVER_PATH,
         refresh_path=REFRESH_PATH,
+        upcoming=upcoming,
+        upcoming_refresh_path=UPCOMING_REFRESH_PATH,
         keys=keys.public(),
         films=films,
         film_week=week,
+        unread_sonarr=_unread_sonarr(request) if media_type != TYPE_MOVIES else [],
         film_week_date=_week_display(week),
+        film_chart=chart.chart_scope.chart_name if chart else None,
+        film_recorded_at=format_timestamp(parse_timestamp(chart.run_at)) if chart else None,
+        film_any_recorded=any(film["recorded"] for film in films),
+        film_library_as_of=_library_as_of(request) if films else None,
         show_rows=show_rows,
         fetched_at=cache.fetched_at(),
         stale=cache.is_stale(),
     )
+
+
+def _unread_sonarr(request: Request) -> list[str]:
+    """Sonarr connections with no library on disk at all. Until one is read, "Missing" on a
+    card only means the others do not have it."""
+    cache = request.app.state.series_cache
+    apps = request.app.state.apps.list_apps(KIND_SONARR)
+    return [app.name for app in apps if cache.load(app.id) is None]
 
 
 def _week_display(week: str | None) -> str | None:
@@ -344,6 +576,49 @@ async def refresh(
     return _redirect(request, DiscoverStatus.REFRESHED, type)
 
 
+@router.post(UPCOMING_REFRESH_PATH)
+async def refresh_upcoming(
+    request: Request, type: str = Form(TYPE_ALL)  # noqa: A002 — the query key
+) -> RedirectResponse:
+    """Ask TMDB for the upcoming shelf. The only thing that ever does.
+
+    Two pages at most, session-gated, CSRF-guarded, audited and bounded. A failure keeps the
+    last shelf, labelled with when it was fetched.
+    """
+    user = current_user(request)
+    filters = request.app.state.filters.load()
+    if not filters.upcoming_enabled:
+        return _redirect(request, DiscoverStatus.UPCOMING_OFF, type)
+    try:
+        tmdb_key = request.app.state.discovery.decrypt(PROVIDER_TMDB)
+    except DiscoveryError:
+        return _redirect(request, DiscoverStatus.KEYS_UNREADABLE, type)
+    if not tmdb_key:
+        return _redirect(request, DiscoverStatus.UPCOMING_NO_KEY, type)
+    start, end = window_from(datetime.now(UTC).date(), filters.upcoming_window_days)
+    try:
+        films = await asyncio.wait_for(
+            TmdbClient(tmdb_key).upcoming_films(
+                territory=filters.upcoming_territory, start=start, end=end
+            ),
+            timeout=REFRESH_TIMEOUT_SECONDS,
+        )
+    except (TmdbError, TimeoutError):
+        return _redirect(request, DiscoverStatus.UPCOMING_FAILED, type)
+    await asyncio.to_thread(
+        request.app.state.upcoming_cache.save,
+        films, filters.upcoming_territory, filters.upcoming_window_days,
+    )
+    request.app.state.audit.record(
+        AuditAction.UPCOMING_REFRESHED,
+        actor=user.username,
+        source_ip=client_ip(request),
+        territory=filters.upcoming_territory,
+        films=len(films),
+    )
+    return _redirect(request, DiscoverStatus.UPCOMING_REFRESHED, type)
+
+
 async def _fetch_rows(
     client_id: str, tmdb: TmdbClient | None
 ) -> dict[str, tuple[DiscoverShow, ...]]:
@@ -356,8 +631,8 @@ async def _fetch_rows(
     """
     client = TraktClient(client_id)
     trending, anticipated = await asyncio.gather(
-        client.trending_shows(DISCOVER_ROW_SIZE),
-        client.anticipated_shows(DISCOVER_ROW_SIZE),
+        client.trending_shows(DISCOVER_FETCH_SIZE),
+        client.anticipated_shows(DISCOVER_FETCH_SIZE),
     )
     rows = {
         TRENDING_KEY: tuple(_from_trakt(show) for show in trending),
@@ -428,10 +703,21 @@ class DiscoverStatus:
     # Stored, but this install's encryption key cannot open them. A different fact from
     # "no keys" and from "Trakt is down", and the only one whose fix is the key file.
     KEYS_UNREADABLE = "discover_keys_unreadable"
+    UPCOMING_REFRESHED = "upcoming_refreshed"
+    UPCOMING_FAILED = "upcoming_refresh_failed"
+    UPCOMING_NO_KEY = "upcoming_no_key"
+    UPCOMING_OFF = "upcoming_off"
 
 
 STATUS_MESSAGES = {
     DiscoverStatus.REFRESHED: ("success", "Discover refreshed."),
+    DiscoverStatus.UPCOMING_REFRESHED: ("success", "Upcoming films refreshed."),
+    DiscoverStatus.UPCOMING_FAILED: (
+        "error",
+        "Could not get upcoming films from TMDB. Anything shown is the last fetch.",
+    ),
+    DiscoverStatus.UPCOMING_NO_KEY: ("error", "Add a TMDB API key in Settings first."),
+    DiscoverStatus.UPCOMING_OFF: ("error", "Turn on Upcoming Films in Settings first."),
     DiscoverStatus.REFRESH_FAILED: (
         "error",
         "Could not reach Trakt — the shelves below are the last ones fetched.",

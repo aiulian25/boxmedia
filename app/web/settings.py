@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 from fastapi import APIRouter, Form, Request, Response, UploadFile, status
@@ -28,7 +29,7 @@ from app.services.apps import (
     InvalidAppError,
 )
 from app.services.backup import (
-    MAX_UPLOAD_BYTES,
+    BackupBusyError,
     BackupCorruptError,
     BackupError,
     BackupInfo,
@@ -65,7 +66,7 @@ from app.services.filters import (
     SCHEDULE_MODES,
     FiltersConfig,
 )
-from app.services.ignore import IgnoredMovie
+from app.services.ignore import KIND_MOVIE, IgnoredMovie
 from app.services.mediaserver import (
     KIND_PLEX,
     MEDIA_SERVER_KINDS,
@@ -99,8 +100,14 @@ from app.services.sonarr import (
     SonarrConnectionError,
     SonarrError,
 )
+from app.services.upcoming import (
+    DEFAULT_TERRITORY,
+    DEFAULT_WINDOW_DAYS,
+    TERRITORIES,
+    WINDOW_CHOICES_DAYS,
+)
+from app.web.auth import LOGIN_PATH, clear_session_cookie
 from app.web.deps import (
-    MEDIA_SERVER_BACKOFF_KEY,
     client_ip,
     current_user,
     format_timestamp,
@@ -110,6 +117,7 @@ from app.web.deps import (
     radarr_backoff,
     radarr_client_for,
     radarr_client_for_credentials,
+    refresh_media_server_snapshot,
     refresh_series_library,
     render,
     sonarr_client_for,
@@ -126,6 +134,8 @@ from app.web.profile import (
 router = APIRouter()
 
 SETTINGS_PATH = "/settings"
+# How much of the maintenance gate's count is the restore route itself.
+THIS_REQUEST = 1
 TEST_CREDENTIALS_PATH = "/settings/apps/test"
 SERVER_TEST_CREDENTIALS_PATH = "/settings/media-server/test-credentials"
 DISCOVERY_PATH = "/settings/discovery"
@@ -175,6 +185,7 @@ class SettingsStatus:
     BACKUP_BAD_KEY = "backup_bad_key"
     BACKUP_NEWER_SCHEMA = "backup_newer_schema"
     BACKUP_CORRUPT = "backup_corrupt"
+    BACKUP_BUSY = "backup_busy"
     BACKUP_SCHEDULE_SAVED = "backup_schedule_saved"
     BACKUP_SCHEDULE_INVALID = "backup_schedule_invalid"
     UNIGNORED = "unignored"
@@ -187,11 +198,11 @@ class SettingsStatus:
     SERVER_TEST_CONN = "server_test_conn"
     SERVER_REFRESHED = "server_refreshed"
     # What the page reloads with after the one Save button has written every edited
-    # card. A rejected card names its own status instead — "Settings saved" over a
-    # value the server refused would be a lie.
+    # card. A rejected card stays on the page with its reason, so there is no second one.
     SETTINGS_SAVED = "settings_saved"
-    SETTINGS_SAVE_FAILED = "settings_save_failed"
     SERVER_REFRESH_FAILED = "server_refresh_failed"
+    UPCOMING_SAVED = "upcoming_saved"
+    UPCOMING_INVALID = "upcoming_invalid"
     DISCOVERY_SAVED = "discovery_saved"
     DISCOVERY_REMOVED = "discovery_removed"
     DISCOVERY_INVALID = "discovery_invalid"
@@ -256,6 +267,8 @@ STATUS_MESSAGES: dict[str, tuple[str, str]] = {
         _ERROR,
         "Could not read the library — check the connection and try Test.",
     ),
+    SettingsStatus.UPCOMING_SAVED: (_SUCCESS, "Upcoming films settings saved."),
+    SettingsStatus.UPCOMING_INVALID: (_ERROR, "Choose a listed territory and window."),
     SettingsStatus.DISCOVERY_SAVED: (_SUCCESS, "Discovery keys saved."),
     SettingsStatus.DISCOVERY_REMOVED: (_SUCCESS, "Key deleted."),
     SettingsStatus.DISCOVERY_INVALID: (
@@ -263,10 +276,6 @@ STATUS_MESSAGES: dict[str, tuple[str, str]] = {
         "That key could not be saved — check it and try again.",
     ),
     SettingsStatus.SETTINGS_SAVED: (_SUCCESS, "Settings saved."),
-    SettingsStatus.SETTINGS_SAVE_FAILED: (
-        _ERROR,
-        "Something did not save — check the values and try again.",
-    ),
     SettingsStatus.REGION_INVALID: (
         _ERROR,
         "That is not a region this build supports. Nothing was changed.",
@@ -298,8 +307,12 @@ STATUS_MESSAGES: dict[str, tuple[str, str]] = {
     ),
     SettingsStatus.BACKUP_CORRUPT: (
         _ERROR,
-        "Incomplete archive — a listed file is missing or fails its checksum. "
-        "Nothing was changed.",
+        "Unusable archive — it is incomplete, damaged or too large, or holds data BoxMedia "
+        "could not run on. Nothing was changed.",
+    ),
+    SettingsStatus.BACKUP_BUSY: (
+        _ERROR,
+        "BoxMedia is still finishing other work. Nothing was changed — try again shortly.",
     ),
     SettingsStatus.UNIGNORED: (_SUCCESS, "Removed from your ignore list."),
     SettingsStatus.CLEANED: (_SUCCESS, "Cleanup complete."),
@@ -328,6 +341,7 @@ _BACKUP_FAILURE_STATUS = {
     BackupKeyError: SettingsStatus.BACKUP_BAD_KEY,
     BackupSchemaError: SettingsStatus.BACKUP_NEWER_SCHEMA,
     BackupCorruptError: SettingsStatus.BACKUP_CORRUPT,
+    BackupBusyError: SettingsStatus.BACKUP_BUSY,
 }
 
 
@@ -399,6 +413,8 @@ async def settings_page(request: Request) -> object:
         filters=filters,
         chart_size_bounds=(MIN_CHART_SIZE, MAX_CHART_SIZE),
         regions=REGIONS,
+        upcoming_territories=TERRITORIES,
+        upcoming_windows=WINDOW_CHOICES_DAYS,
         server=(lambda stored: stored.public() if stored else None)(
             request.app.state.media_server.load()
         ),
@@ -415,6 +431,8 @@ async def settings_page(request: Request) -> object:
         discovery_path=DISCOVERY_PATH,
         discovery_test_path=DISCOVERY_TEST_PATH,
         ignored=ignored,
+        # What the Save bar reads a card's answer against, so app.js has no list of its own.
+        save_statuses=STATUS_MESSAGES,
         app_kinds=[
             {"value": kind, "name": KIND_NAMES[kind], "media": KIND_MEDIA[kind]}
             for kind in APP_KINDS
@@ -430,8 +448,11 @@ def _weeks_of(entry: IgnoredMovie, reports: list[Report]) -> list[dict[str, obje
     """The weeks one ignored title charted in, in the order the reports are given.
 
     Matched by the entry's own identity rule, so an ignored 1970 original never borrows
-    the weeks of a 2026 remake that normalizes to the same title.
+    the weeks of a 2026 remake that normalizes to the same title. A series never charts, so
+    it has none: the numbers it shares with a film say nothing about it.
     """
+    if entry.kind != KIND_MOVIE:
+        return []
     weeks = [
         {"week": report.week, "rank": movie.rank, "report_id": report.id}
         for report in reports
@@ -462,6 +483,7 @@ def _ignored_views(
             "title": entry.title,
             "tmdb_id": entry.tmdb_id,
             "normalized_title": entry.normalized_title,
+            "kind": entry.kind,
             "weeks": _weeks_of(entry, reports),
         }
         for entry in ignored
@@ -714,7 +736,8 @@ def update_app(
     if defaults is None:
         return _redirect(request, SettingsStatus.APP_INVALID)
     try:
-        request.app.state.apps.update(app_id, name=name, url=url, api_key=api_key)
+        previous_url = request.app.state.apps.get(app_id).url
+        updated = request.app.state.apps.update(app_id, name=name, url=url, api_key=api_key)
         request.app.state.apps.set_defaults(app_id, **defaults)
     except InvalidAppError:
         return _redirect(request, SettingsStatus.APP_INVALID)
@@ -725,6 +748,10 @@ def update_app(
     # for the library read the pages reuse: it may describe the server before the edit.
     radarr_backoff(request).note_success(app_id)
     request.app.state.radarr_library_snapshots.forget(app_id)
+    # A new address may be a different server, whose series and week these are not. A rename
+    # or a new key is the same server, and keeps what it has.
+    if updated.url != previous_url:
+        _forget_what_a_server_told_us(request, app_id)
     return _redirect(request, SettingsStatus.APP_UPDATED)
 
 
@@ -796,16 +823,21 @@ def _kind_of(request: Request, app_id: str) -> str:
         return KIND_RADARR
 
 
+def _forget_what_a_server_told_us(request: Request, app_id: str) -> None:
+    """Whichever cache holds it — forgetting from the wrong one would leave a removed
+    connection's profiles on disk forever. Other connections' data is left alone."""
+    request.app.state.radarr_options.forget(app_id)
+    request.app.state.sonarr_options.forget(app_id)
+    request.app.state.series_cache.forget(app_id)
+    request.app.state.calendar_cache.forget_connection(app_id)
+
+
 @router.post("/settings/apps/{app_id}/delete")
 def delete_app(request: Request, app_id: str) -> RedirectResponse:
     current_user(request)
     try:
         request.app.state.apps.remove(app_id)
-        # Whichever cache holds it — forgetting from the wrong one would leave a
-        # removed connection's profiles on disk forever.
-        request.app.state.radarr_options.forget(app_id)
-        request.app.state.sonarr_options.forget(app_id)
-        request.app.state.series_cache.forget(app_id)
+        _forget_what_a_server_told_us(request, app_id)
         request.app.state.radarr_library_snapshots.forget(app_id)
         radarr_backoff(request).forget(app_id)
     except KeyError:
@@ -966,6 +998,11 @@ def remove_discovery_key(request: Request, provider: str) -> RedirectResponse:
         request.app.state.discovery.remove(provider)
     except DiscoveryError:
         return _redirect(request, SettingsStatus.DISCOVERY_INVALID)
+    # Rows fetched with a key that is gone do not stay. Either key can have filled the TV
+    # shelves: Trakt the rows, TMDB their artwork.
+    request.app.state.discover_cache.forget()
+    if provider == PROVIDER_TMDB:
+        request.app.state.upcoming_cache.forget()
     return _redirect(request, SettingsStatus.DISCOVERY_REMOVED)
 
 
@@ -1021,7 +1058,7 @@ async def test_discovery_key(
             "_connection_test.html",
             result={"state": ProbeResult.AUTH, "version": None, "app_name": app_name},
         )
-    # Probed against the system trust store, NOT the app's outbound-TLS settings. Those
+    # Probed against the pinned CA bundle, NOT the app's outbound-TLS settings. Those
     # exist for the user's own servers: `BM_TLS_CA_FILE` builds a context trusting only
     # that CA, so passing it here made both Test buttons fail on exactly the installs the
     # CA file was added for, and `BM_OUTBOUND_TLS_VERIFY=false` silently stopped verifying
@@ -1129,13 +1166,11 @@ async def refresh_media_server(request: Request) -> RedirectResponse:
     current_user(request)
     if request.app.state.media_server.load() is None:
         return _redirect(request, SettingsStatus.SERVER_REFRESH_FAILED)
-    try:
-        fetch = await _server_client(request).list_movies()
-    except MediaServerError:
-        return _redirect(request, SettingsStatus.SERVER_REFRESH_FAILED)
-    request.app.state.media_server_cache.save(fetch)
-    request.app.state.media_server_backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)
-    return _redirect(request, SettingsStatus.SERVER_REFRESHED)
+    refreshed = await refresh_media_server_snapshot(request.app)
+    return _redirect(
+        request,
+        SettingsStatus.SERVER_REFRESHED if refreshed else SettingsStatus.SERVER_REFRESH_FAILED,
+    )
 
 
 @router.post("/settings/media-server/remove")
@@ -1169,6 +1204,37 @@ def save_region(request: Request, boxoffice_region: str = Form("")) -> RedirectR
         _filters_with(stored, boxoffice_region=boxoffice_region)
     )
     return _redirect(request, SettingsStatus.REGION_SAVED)
+
+
+@router.post("/settings/upcoming")
+def save_upcoming(
+    request: Request,
+    upcoming_enabled: str = Form(""),
+    upcoming_territory: str = Form(DEFAULT_TERRITORY),
+    upcoming_window_days: str = Form(str(DEFAULT_WINDOW_DAYS)),
+) -> RedirectResponse:
+    """The opt-in, and what it covers. Saving fetches nothing: Refresh on Discover does.
+
+    Strict, unlike the model's validators, for the region's reason. Turning it off also
+    drops what was fetched, so off leaves nothing of it behind.
+    """
+    current_user(request)
+    window_days = optional_int(upcoming_window_days)
+    if upcoming_territory not in TERRITORIES or window_days not in WINDOW_CHOICES_DAYS:
+        return _redirect(request, SettingsStatus.UPCOMING_INVALID)
+    enabled = bool(upcoming_enabled)
+    stored = request.app.state.filters.load()
+    request.app.state.filters.save(
+        _filters_with(
+            stored,
+            upcoming_enabled=enabled,
+            upcoming_territory=upcoming_territory,
+            upcoming_window_days=window_days,
+        )
+    )
+    if not enabled:
+        request.app.state.upcoming_cache.forget()
+    return _redirect(request, SettingsStatus.UPCOMING_SAVED)
 
 
 @router.post("/settings/filters")
@@ -1281,11 +1347,15 @@ def verify_backup(request: Request, name: str) -> RedirectResponse:
 def restore_backup(request: Request, name: str) -> RedirectResponse:
     current_user(request)
     try:
-        request.app.state.backups.restore_internal(name)
+        request.app.state.backups.restore_internal(
+            name,
+            callers_in_flight=THIS_REQUEST,
+            on_activated=partial(_forget_the_state_before_a_restore, request),
+        )
     except BackupError as exc:
         return _redirect(request, _backup_failure_status(exc))
     _reschedule_from_filters(request)
-    return _redirect(request, SettingsStatus.BACKUP_RESTORED)
+    return _to_login_after_restore(request, SettingsStatus.BACKUP_RESTORED)
 
 
 @router.post("/settings/backups/{name}/delete")
@@ -1301,16 +1371,44 @@ def delete_backup(request: Request, name: str) -> RedirectResponse:
 @router.post("/settings/backups/import")
 def import_backup(request: Request, backup_file: UploadFile) -> RedirectResponse:
     # Sync def so FastAPI runs the CPU-heavy restore (decrypt/untar/checksum/swap) in the
-    # threadpool instead of on the event loop. Read at most one byte over the cap so an
-    # oversized upload is rejected by restore_external without buffering it all in RAM.
+    # threadpool instead of on the event loop. The file, not its bytes: restore_external copies
+    # it to disk and enforces the cap, so its size costs no memory.
     current_user(request)
-    blob = backup_file.file.read(MAX_UPLOAD_BYTES + 1)
     try:
-        request.app.state.backups.restore_external(blob)
+        request.app.state.backups.restore_external(
+            backup_file.file,
+            callers_in_flight=THIS_REQUEST,
+            on_activated=partial(_forget_the_state_before_a_restore, request),
+        )
     except BackupError as exc:
         return _redirect(request, _backup_failure_status(exc))
     _reschedule_from_filters(request)
-    return _redirect(request, SettingsStatus.BACKUP_IMPORTED)
+    return _to_login_after_restore(request, SettingsStatus.BACKUP_IMPORTED)
+
+
+def _forget_the_state_before_a_restore(request: Request) -> None:
+    """Everything in memory that described the data just replaced.
+
+    Sessions above all: they were granted by the password that was just replaced, and the
+    restored account may not even have the same name. The rest hold connection ids and URLs
+    from before, which could now mean something else or nothing.
+    """
+    state = request.app.state
+    state.sessions.delete_all()
+    state.radarr_library_snapshots.clear()
+    state.radarr_backoff.clear()
+    state.media_server_backoff.clear()
+    state.poster_prefetcher.clear()
+
+
+def _to_login_after_restore(request: Request, code: str) -> RedirectResponse:
+    url_base = request.app.state.settings.url_base
+    response = RedirectResponse(
+        url=f"{url_base}{LOGIN_PATH}?{STATUS_QUERY_KEY}={code}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+    clear_session_cookie(request, response)
+    return response
 
 
 def _reschedule_from_filters(request: Request) -> None:

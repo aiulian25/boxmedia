@@ -5,7 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.core.audit import AuditLog
-from app.services.ignore import IgnoredMovie, IgnoreSnapshot, IgnoreStore
+from app.services.ignore import (
+    KIND_MOVIE,
+    KIND_SERIES,
+    IgnoredMovie,
+    IgnoreSnapshot,
+    IgnoreStore,
+)
 from app.services.reports import (
     MovieAction,
     MovieResult,
@@ -386,3 +392,76 @@ def test_ignored_chips_stay_compact_within_one_year(harness: AppHarness) -> None
     chips = _chips(harness.client.get("/settings").text)
 
     assert chips == ["W31 · #3", "W29 · #3"]
+
+
+# --- the Settings list holds series too ---
+
+
+def _un_ignore(harness: AppHarness, **fields: str) -> None:
+    harness.client.post(
+        "/unignore",
+        data={"normalized_title": "a title", "tmdb_id": "1396", "next": "settings", **fields},
+        follow_redirects=False,
+    )
+
+
+def _same_number_film_and_show(harness: AppHarness) -> IgnoreStore:
+    store = harness.client.app.state.ignore
+    store.add(tmdb_id=1396, title="A Title", normalized_title="a title")
+    store.add(tmdb_id=1396, title="A Title", normalized_title="a title", kind=KIND_SERIES)
+    return store
+
+
+def test_the_settings_list_can_un_ignore_a_series(harness: AppHarness) -> None:
+    """It posted no kind, which means a film, so a series there could not be removed. Now that
+    a dismissed show leaves Discover, this list is how it comes back."""
+    harness.activate()
+    store = _same_number_film_and_show(harness)
+
+    _un_ignore(harness, kind=KIND_SERIES)
+
+    assert store.is_ignored(1396, "a title", KIND_SERIES) is False
+    assert store.is_ignored(1396, "a title") is True  # the film of that number stays
+
+
+def test_each_row_of_the_settings_list_names_its_kind(harness: AppHarness) -> None:
+    harness.activate()
+    _same_number_film_and_show(harness)
+
+    page = harness.client.get("/settings").text
+
+    assert f'name="kind" value="{KIND_MOVIE}"' in page
+    assert f'name="kind" value="{KIND_SERIES}"' in page
+
+
+def test_a_report_form_sending_no_kind_still_means_a_film(harness: AppHarness) -> None:
+    harness.activate()
+    store = _same_number_film_and_show(harness)
+
+    _un_ignore(harness)
+
+    assert store.is_ignored(1396, "a title") is False
+    assert store.is_ignored(1396, "a title", KIND_SERIES) is True
+
+
+def test_an_unknown_kind_means_a_film_and_not_every_kind(harness: AppHarness) -> None:
+    harness.activate()
+    store = _same_number_film_and_show(harness)
+
+    _un_ignore(harness, kind="anything")
+
+    assert store.is_ignored(1396, "a title") is False
+    assert store.is_ignored(1396, "a title", KIND_SERIES) is True
+
+
+def test_a_series_row_never_borrows_a_films_weeks(harness: AppHarness) -> None:
+    """TMDB numbers films and series separately, so a shared number says nothing."""
+    harness.activate()
+    state = harness.client.app.state
+    state.reports.save(_report("2026W28", [_movie(1, "A Film", 1396)]))
+    state.ignore.add(
+        tmdb_id=1396, title="A Show", normalized_title="a show", kind=KIND_SERIES
+    )
+
+    assert _chips(harness.client.get("/settings").text) == []
+

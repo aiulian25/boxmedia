@@ -38,6 +38,7 @@ from app.services.discovery import (
 )
 from app.services.posters import HEADSHOT_WIDTH, POSTER_WIDTH
 from app.services.reports import youtube_url
+from app.services.upcoming import UpcomingFilm
 
 REQUEST_TIMEOUT_SECONDS = 10.0
 # TMDB answers in the language you ask for. One constant so a future locale is a single
@@ -57,6 +58,9 @@ DEFAULT_RETRY_AFTER_SECONDS = 1.0
 # `/discover/tv` accepts (tv-discovery.md §4.1): every one of them is a control somebody
 # has to understand, and these four answer the questions the mockup's bar asks.
 SORT_POPULARITY = "popularity.desc"
+# Theatrical, then limited: TMDB returns the first date matching, so the order is meaningful.
+UPCOMING_RELEASE_TYPES = "3|2"
+UPCOMING_MAX_PAGES = 2
 SORT_FIRST_AIR_DATE = "first_air_date.desc"
 SORT_RATING = "vote_average.desc"
 SORT_OPTIONS = (SORT_POPULARITY, SORT_FIRST_AIR_DATE, SORT_RATING)
@@ -211,6 +215,19 @@ def _show_from(item: dict) -> TmdbShow:
         rating=float_or_none(item.get("vote_average")),
         original_language=item.get("original_language") or None,
     )
+
+
+def _upcoming_from(item: dict, start: date, end: date) -> UpcomingFilm | None:
+    """A result, or None if it has no id, title or date inside the window asked for. A film
+    with no date is not scheduled, and this shelf claims nothing else about it."""
+    tmdb_id = int_or_none(item.get("id"))
+    title = item.get("title")
+    released = _air_date(item.get("release_date"))
+    if tmdb_id is None or not isinstance(title, str) or not title or released is None:
+        return None
+    if not start <= released <= end:
+        return None
+    return UpcomingFilm(tmdb_id, title, released, image_url(item.get("poster_path")))
 
 
 def _certification(content_ratings: object) -> str | None:
@@ -406,6 +423,46 @@ class TmdbClient:
             },
         )
         return _rows(rows)
+
+    async def upcoming_films(
+        self, *, territory: str, start: date, end: date
+    ) -> tuple[UpcomingFilm, ...]:
+        """Up to two pages of films scheduled in a territory, most popular first. A read.
+
+        Two so the shelf still fills once what has charted or been ignored is removed. The
+        second is asked for only if TMDB says there is one.
+
+        `/discover/movie` and not `/movie/upcoming`, whose window cannot be chosen: TMDB
+        documents that one as this same call with fixed dates. The date bounds and the date
+        returned are the territory's own once `region` is set, and listing theatrical (3)
+        before limited (2) makes the date returned the theatrical one where it has both.
+        """
+        films: dict[int, UpcomingFilm] = {}
+        for page in range(1, UPCOMING_MAX_PAGES + 1):
+            payload = await self._request(
+                "/discover/movie",
+                {
+                    "region": territory,
+                    "release_date.gte": start.isoformat(),
+                    "release_date.lte": end.isoformat(),
+                    "with_release_type": UPCOMING_RELEASE_TYPES,
+                    "sort_by": SORT_POPULARITY,
+                    "page": page,
+                    # Never a setting, for the reason discover_tv gives.
+                    "include_adult": "false",
+                    "include_video": "false",
+                },
+            )
+            results = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(results, list):
+                raise TmdbError("unexpected TMDB response shape")
+            for item in results:
+                film = _upcoming_from(item, start, end) if isinstance(item, dict) else None
+                if film:
+                    films.setdefault(film.tmdb_id, film)
+            if page >= (int_or_none(payload.get("total_pages")) or 0):
+                break
+        return tuple(films.values())
 
     async def search_tv(self, query: str, *, page: int = 1) -> list[TmdbShow]:
         """Find a series by name — the fallback when a discovery row cannot be matched."""

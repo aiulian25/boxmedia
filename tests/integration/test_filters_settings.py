@@ -277,6 +277,7 @@ WEEKLY_CHECK_FIELDS = {
 }
 BACKUP_SCHEDULE_FIELDS = {"backup_interval_days", "backup_keep"}
 REGION_FIELDS = {"boxoffice_region"}
+UPCOMING_FIELDS = {"upcoming_enabled", "upcoming_territory", "upcoming_window_days"}
 # Owned by neither form: the legacy global pair, read-only and carried by both.
 CARRIED_ONLY_FIELDS = {"quality_profile_id", "default_root_folder"}
 # Distinctive non-default values, so "carried through" cannot pass by coincidence.
@@ -289,6 +290,9 @@ DISTINCTIVE = {
     "backup_keep": 4,
     "report_keep": 33,
     "boxoffice_region": "GB",
+    "upcoming_enabled": True,
+    "upcoming_territory": "JP",
+    "upcoming_window_days": 180,
     "schedule_mode": SCHEDULE_MODE_INTERVAL,  # not the default, so a reset shows
 }
 
@@ -300,10 +304,11 @@ def test_every_filters_field_is_owned_by_exactly_one_form() -> None:
     instead of silently escaping the carry-through checks.
     """
     classified = (
-        WEEKLY_CHECK_FIELDS | BACKUP_SCHEDULE_FIELDS | REGION_FIELDS | CARRIED_ONLY_FIELDS
+        WEEKLY_CHECK_FIELDS | BACKUP_SCHEDULE_FIELDS | REGION_FIELDS | UPCOMING_FIELDS
+        | CARRIED_ONLY_FIELDS
     )
     assert set(FiltersConfig.model_fields) == classified
-    owners = (WEEKLY_CHECK_FIELDS, BACKUP_SCHEDULE_FIELDS, REGION_FIELDS)
+    owners = (WEEKLY_CHECK_FIELDS, BACKUP_SCHEDULE_FIELDS, REGION_FIELDS, UPCOMING_FIELDS)
     for index, group in enumerate(owners):
         for other in owners[index + 1:]:
             assert not (group & other), "a field is claimed by two forms"
@@ -328,7 +333,7 @@ def test_saving_the_weekly_check_carries_every_field_it_does_not_own(
 
     config = harness.client.app.state.filters.load()
     assert (config.schedule_interval_hours, config.chart_size) == (48, 11)  # applied
-    for field in BACKUP_SCHEDULE_FIELDS | REGION_FIELDS | CARRIED_ONLY_FIELDS:
+    for field in BACKUP_SCHEDULE_FIELDS | REGION_FIELDS | UPCOMING_FIELDS | CARRIED_ONLY_FIELDS:
         assert getattr(config, field) == DISTINCTIVE[field], f"{field} was reset"
 
 
@@ -346,7 +351,7 @@ def test_saving_the_backup_schedule_carries_every_field_it_does_not_own(
 
     config = harness.client.app.state.filters.load()
     assert (config.backup_interval_days, config.backup_keep) == (2, 6)  # applied
-    for field in WEEKLY_CHECK_FIELDS | REGION_FIELDS | CARRIED_ONLY_FIELDS:
+    for field in WEEKLY_CHECK_FIELDS | REGION_FIELDS | UPCOMING_FIELDS | CARRIED_ONLY_FIELDS:
         assert getattr(config, field) == DISTINCTIVE[field], f"{field} was reset"
 
 
@@ -364,7 +369,28 @@ def test_saving_the_region_carries_every_field_it_does_not_own(
 
     config = harness.client.app.state.filters.load()
     assert config.boxoffice_region == "DE"  # applied
-    for field in WEEKLY_CHECK_FIELDS | BACKUP_SCHEDULE_FIELDS | CARRIED_ONLY_FIELDS:
+    others = WEEKLY_CHECK_FIELDS | BACKUP_SCHEDULE_FIELDS | UPCOMING_FIELDS
+    for field in others | CARRIED_ONLY_FIELDS:
+        assert getattr(config, field) == DISTINCTIVE[field], f"{field} was reset"
+
+
+def test_saving_upcoming_films_carries_every_field_it_does_not_own(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    _seed_every_field(harness)
+
+    harness.client.post(
+        "/settings/upcoming",
+        data={
+            "upcoming_enabled": "on", "upcoming_territory": "DE", "upcoming_window_days": "30",
+        },
+        follow_redirects=False,
+    )
+
+    config = harness.client.app.state.filters.load()
+    assert (config.upcoming_territory, config.upcoming_window_days) == ("DE", 30)  # applied
+    for field in WEEKLY_CHECK_FIELDS | BACKUP_SCHEDULE_FIELDS | REGION_FIELDS | CARRIED_ONLY_FIELDS:
         assert getattr(config, field) == DISTINCTIVE[field], f"{field} was reset"
 
 

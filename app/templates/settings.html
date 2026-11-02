@@ -18,7 +18,7 @@
 <section class="settings-section">
   <h3 class="section-title">User Management</h3>
   <div class="account-card">
-    <form method="post" action="{{ url_base }}/account/profile" data-settings-form class="account-form">
+    <form method="post" action="{{ url_base }}/account/profile" data-settings-form="Profile" class="account-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div class="field">
         <label for="username">Login username</label>
@@ -70,7 +70,7 @@
     {# Radios rather than a toggle: two named choices, and the one in effect is readable
        without interpreting a switch position. Saves like every other action on this page
        — POST, then back here with a banner. #}
-    <form method="post" action="{{ url_base }}/account/theme" data-settings-form class="stack">
+    <form method="post" action="{{ url_base }}/account/theme" data-settings-form="Theme" class="stack">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <fieldset class="theme-choice">
         <legend>Theme</legend>
@@ -118,7 +118,7 @@
       <span class="tag">{{ app.kind_name }}</span>
       {% if app.primary %}<span class="tag">Primary</span>{% endif %}
     </div>
-    <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}" data-settings-form class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/apps/{{ app.id }}" data-settings-form="{{ app.name }}" class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="name-{{ app.id }}">App Name</label>
@@ -300,7 +300,7 @@
        cannot reach it. `formaction` sends the same body to the probe route instead, and
        each button carries its own `provider` — a submit button's name/value is part of
        the submission, so no hidden field is needed and no script builds the request. #}
-    <form method="post" action="{{ url_base }}{{ discovery_path }}" data-settings-form class="app-grid">
+    <form method="post" action="{{ url_base }}{{ discovery_path }}" data-settings-form="Discovery keys" class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="tmdb-key">TMDB API key</label>
@@ -365,7 +365,7 @@
     {# One connection, not a list: multiple Radarrs exist because quality profiles
        differ per instance, and a media server has no analogue of that. Which server
        it is, is a choice on that one connection. #}
-    <form method="post" action="{{ url_base }}/settings/media-server" data-settings-form class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/media-server" data-settings-form="Media server" class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       {# The choice comes FIRST and spans the card, because everything below it —
          what the address looks like, what the secret is called, where to find it —
@@ -447,7 +447,7 @@
 <section class="settings-section">
   <h3 class="section-title">Weekly Check</h3>
   <div class="app-card">
-    <form method="post" action="{{ url_base }}/settings/filters" data-settings-form class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/filters" data-settings-form="Radarr defaults" class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       {# The same radio pattern as Appearance: two named choices, and the one in effect is
          readable without interpreting a switch. Spans the grid so the interval field sits
@@ -491,7 +491,7 @@
 <section class="settings-section">
   <h3 class="section-title">Box Office Region</h3>
   <div class="app-card">
-    <form method="post" action="{{ url_base }}/settings/region" data-settings-form class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/region" data-settings-form="Box office region" class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="boxoffice_region">Chart</label>
@@ -519,11 +519,51 @@
   </div>
 </section>
 
+{% include "_tmdb_attribution.html" %}
+
+<section class="settings-section">
+  <h3 class="section-title">Upcoming Films</h3>
+  <div class="app-card">
+    {# Off by default, and saving fetches nothing: this only decides whether Discover offers
+       the shelf and its Refresh. Turning it off drops what was fetched. #}
+    <form method="post" action="{{ url_base }}/settings/upcoming" data-settings-form="Upcoming films" class="app-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div>
+        <label for="upcoming_territory">Territory</label>
+        <select id="upcoming_territory" name="upcoming_territory">
+          {% for code, label in upcoming_territories.items() %}
+          <option value="{{ code }}" {% if code == filters.upcoming_territory %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <p class="field-note">Whose release dates to ask TMDB for. Domestic on the chart is the US and Canada; TMDB dates are per country.</p>
+      </div>
+      <div>
+        <label for="upcoming_window_days">Look ahead</label>
+        <select id="upcoming_window_days" name="upcoming_window_days">
+          {% for days in upcoming_windows %}
+          <option value="{{ days }}" {% if days == filters.upcoming_window_days %}selected{% endif %}>{{ days }} days</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="app-grid-full">
+        <label class="theme-option" for="upcoming_enabled">
+          <input id="upcoming_enabled" name="upcoming_enabled" type="checkbox" value="on" {% if filters.upcoming_enabled %}checked{% endif %}>
+          Show an Upcoming Films shelf on Discover
+        </label>
+        <p class="field-note">Uses your TMDB key, and only when you press Refresh on that shelf. Nothing is fetched on a schedule or by opening a page, and nothing is added to Radarr without you.</p>
+      </div>
+      <div class="app-actions">
+        <button type="submit" data-form-save class="btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+</section>
+
 <section class="settings-section">
   <h3 class="section-title">Backups</h3>
   <div class="app-card">
     <h4 class="section-subtitle">Automatic backups</h4>
-    <form method="post" action="{{ url_base }}/settings/backups/schedule" data-settings-form class="app-grid">
+    <form method="post" action="{{ url_base }}/settings/backups/schedule" data-settings-form="Automatic backups" class="app-grid">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
         <label for="backup_interval_days">Create one every (days)</label>
@@ -596,7 +636,7 @@
     <h4 class="section-subtitle">Import a backup file</h4>
     <form method="post" action="{{ url_base }}/settings/backups/import" enctype="multipart/form-data" class="stack">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <input type="file" name="backup_file" accept=".backup" required>
+      <input type="file" name="backup_file" accept=".backup" aria-label="Backup file to import" required>
       <details>
         <summary class="btn-secondary">Import &amp; Restore</summary>
         <p class="subtle">This replaces your current data with the uploaded backup.</p>
@@ -680,6 +720,7 @@
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="tmdb_id" value="{{ movie.tmdb_id if movie.tmdb_id is not none }}">
                   <input type="hidden" name="normalized_title" value="{{ movie.normalized_title }}">
+                  <input type="hidden" name="kind" value="{{ movie.kind }}">
                   <input type="hidden" name="next" value="settings">
                   <button type="submit" class="btn-ghost">Un-ignore</button>
                 </form>
@@ -704,8 +745,8 @@
    Deliberately not covering the password form or any action button: a password change
    asks for the current one and is not a field left pending, and "restore this backup" is
    not something a Save button should ever have been holding. #}
-<div class="save-bar" data-save-bar data-settings-url="{{ url_base }}/settings" role="region" aria-label="Unsaved changes" hidden>
-  <span class="save-bar-text">You have unsaved changes.</span>
+<div class="save-bar" data-save-bar data-settings-url="{{ url_base }}/settings" data-save-statuses='{{ save_statuses | tojson }}' role="region" aria-label="Unsaved changes" hidden>
+  <span class="save-bar-text" data-save-text role="status">You have unsaved changes.</span>
   <button type="button" class="btn-ghost" data-discard-all>Discard</button>
   <button type="button" class="btn-primary" data-save-all>Save Changes</button>
 </div>

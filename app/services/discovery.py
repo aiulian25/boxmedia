@@ -80,6 +80,8 @@ DISCOVER_CACHE_TTL_SECONDS = 6 * 60 * 60
 # One page of each row. Six across at two rows deep is what the mockup shows; twenty
 # leaves room for the "hide what I already have" filter to remove some and still fill it.
 DISCOVER_ROW_SIZE = 20
+# What Refresh asks for: enough to still fill a shelf after what you have ignored is removed.
+DISCOVER_FETCH_SIZE = 30
 
 # The same mask the connection cards show. Mirrored rather than imported so a credential
 # store does not depend on the connection store for a UI string; a test pins the two

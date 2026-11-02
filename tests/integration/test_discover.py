@@ -9,6 +9,7 @@ becoming a page that goes down when Trakt does.
 from __future__ import annotations
 
 import httpx
+import pytest
 import respx
 
 from app.services.discovery import (
@@ -16,7 +17,12 @@ from app.services.discovery import (
     TRENDING_KEY,
     DiscoverShow,
 )
+from app.services.ignore import KIND_SERIES
+from app.services.matcher import normalize_title
+from app.services.radarr import RadarrMovie
 from app.services.reports import (
+    MATCHED_AMBIGUOUS,
+    MATCHED_BY_GUESS,
     MovieAction,
     MovieResult,
     MovieStatus,
@@ -718,3 +724,570 @@ def test_the_refresh_form_carries_the_open_chip(harness: AppHarness) -> None:
     page = harness.client.get("/discover?type=tv").text
 
     assert '<input type="hidden" name="type" value="tv">' in page
+
+
+# --- a name is not ownership ---
+
+
+def _hold(
+    harness: AppHarness, *, tvdb_id: int, name: str = "Attic Sonarr", title="The Hollow Coast",
+) -> str:
+    apps = harness.client.app.state.apps
+    apps.add(name=name, url="http://sonarr.local:8989", api_key="f" * 32, kind="sonarr")
+    app_id = next(app.id for app in apps.list_apps("sonarr") if app.name == name)
+    harness.client.app.state.series_cache.save(app_id, (
+        SonarrSeries(
+            sonarr_id=14, tvdb_id=tvdb_id, title=title, year=2023,
+            monitored=True, ended=False, episode_count=10, episode_file_count=10,
+            title_slug="the-hollow-coast",
+        ),
+    ))
+    return app_id
+
+
+def test_a_namesake_with_a_different_id_is_not_owned(harness: AppHarness) -> None:
+    """The reproduction: "In Sonarr", "Complete — 10 episodes", about another show."""
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness, anticipated=())
+    _hold(harness, tvdb_id=999)
+
+    page = harness.client.get("/discover").text
+
+    assert "In Sonarr" not in page
+    assert "Complete — 10 episodes" not in page
+    assert "Best guess" not in page
+    assert "Missing" in page
+
+
+def test_a_name_match_with_no_id_says_it_is_a_guess_and_claims_no_counts(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness, trending=(_show(tvdb_id=None),), anticipated=())
+    _hold(harness, tvdb_id=121361)
+
+    page = harness.client.get("/discover").text
+
+    assert "Maybe in Sonarr" in page
+    assert "Best guess — verify" in page
+    assert "Attic Sonarr has a series of the same name" in page
+    assert "Complete — 10 episodes" not in page
+    assert '<span>In Sonarr</span>' not in page
+
+
+def test_an_exact_id_stays_a_stated_fact_and_names_its_connection(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness, anticipated=())
+    _hold(harness, tvdb_id=121361)
+
+    page = harness.client.get("/discover").text
+
+    assert '<span>In Sonarr</span>' in page
+    assert "Complete — 10 episodes" in page
+    assert "on Attic Sonarr" in page
+    assert "Best guess" not in page
+
+
+def test_what_your_media_server_is_sure_of_beats_a_name_match_in_sonarr() -> None:
+    from types import SimpleNamespace
+
+    from app.services.mediaserver import HOLDS_PROBABLY, HOLDS_YES
+    from app.web.discover import STATE_MAYBE_IN_SONARR, STATE_ON_SERVER, _show_state
+
+    guess = SimpleNamespace(state=HOLDS_PROBABLY)
+
+    assert _show_state(_show(), guess, HOLDS_YES)["state"] == STATE_ON_SERVER
+    assert _show_state(_show(), guess, None)["state"] == STATE_MAYBE_IN_SONARR
+
+
+def test_a_cached_connection_settings_no_longer_has_is_not_named(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness, anticipated=())
+    harness.client.app.state.series_cache.save("app-gone", (
+        SonarrSeries(
+            sonarr_id=14, tvdb_id=121361, title="The Hollow Coast", year=2023,
+            monitored=True, ended=False, episode_count=10, episode_file_count=10,
+        ),
+    ))
+
+    response = harness.client.get("/discover")
+
+    assert response.status_code == 200
+    assert '<span>In Sonarr</span>' in response.text
+
+
+# --- the film shelf: the newest chart, and what is true of each film now ---
+
+RADARR_URL = "http://radarr.local:7878"
+RADARR_KEY = "0123456789abcdef0123456789abcdef"
+FILM_ID = 52001
+
+
+def _film(
+    *,
+    status: str = MovieStatus.MISSING,
+    action: str = MovieAction.NONE,
+    detail: str | None = None,
+    tmdb_id: int | None = FILM_ID,
+) -> MovieResult:
+    return MovieResult(
+        rank=1, title="Neon Rain", normalized_title="neon rain",
+        gross_amount=81_500_000, gross_display="$81.5M", weeks_in_release=4,
+        status=status, action=action, detail=detail, tmdb_id=tmdb_id,
+    )
+
+
+def _chart(
+    harness: AppHarness,
+    week: str = "2026W32",
+    run_at: str = "2026-08-19T23:44:00+00:00",
+    movies: list[MovieResult] | None = None,
+    **fields: str,
+) -> str:
+    report_id = f"report-{week}-chart"
+    harness.client.app.state.reports.save(Report(
+        id=report_id, week=week, run_at=run_at,
+        trigger=RunTrigger.SCHEDULED, status=RunStatus.OK,
+        totals=ReportTotals(movies=1, matched=0),
+        movies=movies if movies is not None else [_film()],
+        **fields,
+    ))
+    return report_id
+
+
+def _connect(harness: AppHarness, name: str = "Main", library: dict | None = None) -> None:
+    """A connection, and if `library` is given, a read of it some other page just made."""
+    state = harness.client.app.state
+    app = state.apps.add(name=name, url=RADARR_URL, api_key=RADARR_KEY)
+    if library is not None:
+        state.radarr_library_snapshots.put(app.id, library)
+
+
+def _copy(*, has_file: bool) -> RadarrMovie:
+    return RadarrMovie(tmdb_id=FILM_ID, title="Neon Rain", year=2026, has_file=has_file)
+
+
+def _shelf(harness: AppHarness) -> str:
+    return harness.client.get("/discover?type=movies").text
+
+
+def test_rerunning_an_old_week_does_not_take_over_the_shelf(harness: AppHarness) -> None:
+    harness.activate()
+    _chart(harness, "2026W32", "2026-08-19T10:00:00+00:00",
+           [_film().model_copy(update={"title": "Current Film"})])
+    _chart(harness, "2026W30", "2026-08-20T10:00:00+00:00",
+           [_film().model_copy(update={"title": "Old Film"})])
+
+    page = _shelf(harness)
+
+    assert "Current Film" in page
+    assert "Old Film" not in page
+    assert "Mojo · week 2026W32" in page
+
+
+def test_the_caption_names_the_chart_it_came_from(harness: AppHarness) -> None:
+    harness.activate()
+    _chart(harness, region="DE", currency="€")
+
+    page = _shelf(harness)
+
+    assert "Germany weekend" in page
+    assert "domestic" not in page.lower().split("box office", 1)[1].split("</span>")[0]
+
+
+def test_a_domestic_chart_still_says_so(harness: AppHarness) -> None:
+    harness.activate()
+    _chart(harness)
+
+    assert "Domestic (US &amp; Canada) weekly" in _shelf(harness)
+
+
+@pytest.mark.parametrize(
+    ("film", "label"),
+    [
+        (_film(status=MovieStatus.IN_LIBRARY), "In Library"),
+        (_film(status=MovieStatus.WANTED), "Wanted"),
+        (_film(status=MovieStatus.MISSING), "Missing"),
+        (_film(action=MovieAction.NO_MATCH, tmdb_id=None), "No match"),
+        (_film(action=MovieAction.ERROR, detail="lookup failed"), "Unknown"),
+        (_film(status="something else"), "Unknown"),
+    ],
+    ids=["in-library", "wanted", "missing", "no-match", "lookup-failed", "unrecognised"],
+)
+def test_with_no_recent_read_a_film_reads_as_recorded(
+    harness: AppHarness, film: MovieResult, label: str,
+) -> None:
+    """A film that is not in the library used to read "Wanted", which says it is."""
+    harness.activate()
+    _chart(harness, movies=[film])
+
+    assert f">{label}<" in _shelf(harness)
+
+
+def test_a_status_from_the_stored_week_says_when_it_was_true(harness: AppHarness) -> None:
+    harness.activate()
+    _chart(harness)
+
+    page = _shelf(harness)
+
+    assert "as of 19/8/2026 23:44" in page  # day first, always
+
+
+def test_a_film_added_since_the_chart_reads_as_it_is_now(harness: AppHarness) -> None:
+    harness.activate()
+    _connect(harness, library={FILM_ID: _copy(has_file=True)})
+    _chart(harness)
+
+    page = _shelf(harness)
+
+    assert ">In Library<" in page
+    assert ">Missing<" not in page
+    assert "as of " not in page
+
+
+def test_a_film_waiting_in_radarr_is_wanted(harness: AppHarness) -> None:
+    harness.activate()
+    _connect(harness, library={FILM_ID: _copy(has_file=False)})
+    _chart(harness)
+
+    assert ">Wanted<" in _shelf(harness)
+
+
+def test_a_film_removed_since_the_chart_reads_as_it_is_now(harness: AppHarness) -> None:
+    harness.activate()
+    _connect(harness, library={})
+    _chart(harness, movies=[_film(status=MovieStatus.IN_LIBRARY)])
+
+    page = _shelf(harness)
+
+    assert ">Missing<" in page
+    assert ">In Library<" not in page
+
+
+def test_one_silent_connection_means_missing_cannot_be_claimed_live(harness: AppHarness) -> None:
+    harness.activate()
+    _connect(harness, "Main", library={})
+    _connect(harness, "Other")
+    _chart(harness, movies=[_film(status=MovieStatus.WANTED)])
+
+    page = _shelf(harness)
+
+    assert ">Wanted<" in page  # still only the record
+    assert "as of " in page
+
+
+@respx.mock
+def test_a_stale_read_is_not_refreshed_by_opening_the_page(harness: AppHarness) -> None:
+    """The negative that matters. With routes mocked by none, any request here would raise."""
+    harness.activate()
+    _connect(harness)
+    _chart(harness)
+
+    assert ">Missing<" in _shelf(harness)
+    assert len(respx.calls) == 0
+
+
+def test_an_ignored_film_says_so_even_with_nothing_read(harness: AppHarness) -> None:
+    harness.activate()
+    harness.client.app.state.ignore.add(
+        tmdb_id=FILM_ID, title="Neon Rain", normalized_title="neon rain"
+    )
+    _chart(harness)
+
+    assert ">Ignored<" in _shelf(harness)
+
+
+def test_holding_a_film_outranks_ignoring_it(harness: AppHarness) -> None:
+    harness.activate()
+    harness.client.app.state.ignore.add(
+        tmdb_id=FILM_ID, title="Neon Rain", normalized_title="neon rain"
+    )
+    _connect(harness, library={FILM_ID: _copy(has_file=True)})
+    _chart(harness)
+
+    assert ">In Library<" in _shelf(harness)
+
+
+def test_a_guess_links_to_the_row_that_can_settle_it(harness: AppHarness) -> None:
+    harness.activate()
+    report_id = _chart(harness, movies=[_film(detail=MATCHED_BY_GUESS)])
+
+    page = _shelf(harness)
+
+    assert "Best guess — verify" in page
+    assert f"/reports/{report_id}#movie-1" in page
+
+
+def test_a_guess_already_held_needs_no_hint_but_an_ambiguous_title_does(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    _connect(harness, library={FILM_ID: _copy(has_file=True)})
+    _chart(harness, movies=[_film(detail=MATCHED_BY_GUESS)])
+    assert "Best guess" not in _shelf(harness)
+
+    _chart(harness, movies=[_film(detail=MATCHED_AMBIGUOUS)])
+    assert "Best guess" in _shelf(harness)
+
+
+def test_a_confirmed_film_carries_no_hint(harness: AppHarness) -> None:
+    harness.activate()
+    _chart(harness)
+
+    assert "Best guess" not in _shelf(harness)
+
+
+# --- "Missing" is only as good as what has been read ---
+
+
+def test_a_sonarr_never_read_qualifies_missing_on_the_tv_shelves(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness)
+    state = harness.client.app.state
+    app = state.apps.add(name="Upstairs", url=RADARR_URL, api_key=RADARR_KEY, kind="sonarr")
+
+    assert "Upstairs not read yet" in harness.client.get("/discover").text
+    assert "not read yet" not in harness.client.get("/discover?type=movies").text
+
+    state.series_cache.save(app.id, ())
+    assert "not read yet" not in harness.client.get("/discover").text
+
+
+# --- a dismissed show stays dismissed ---
+
+SHOW_ID = 1396
+ANTICIPATED_ID = 4242
+
+
+def _ignore_series(harness: AppHarness, tmdb_id: int, title: str, **extra: str) -> None:
+    harness.client.post(
+        "/ignore-series",
+        data={"tmdb_id": str(tmdb_id), "title": title, **extra},
+        follow_redirects=False,
+    )
+
+
+def test_an_ignored_show_leaves_the_trending_shelf(harness: AppHarness) -> None:
+    """The audit's reproduction: Ignore promised it would not be suggested again."""
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness)
+
+    _ignore_series(harness, SHOW_ID, "The Hollow Coast")
+    page = harness.client.get("/discover").text
+
+    assert "The Hollow Coast" not in page
+    assert "Ash Cartography" in page  # and nothing else went with it
+    assert "1 ignored" in page
+
+
+def test_an_ignored_show_leaves_the_anticipated_shelf(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness)
+
+    _ignore_series(harness, ANTICIPATED_ID, "Ash Cartography")
+    page = harness.client.get("/discover").text
+
+    assert "Ash Cartography" not in page
+    assert "The Hollow Coast" in page
+
+
+def test_a_show_on_both_shelves_leaves_both(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness, trending=(_show(),), anticipated=(_show(),))
+
+    _ignore_series(harness, SHOW_ID, "The Hollow Coast")
+
+    assert "The Hollow Coast" not in harness.client.get("/discover").text
+
+
+def test_a_fresh_fetch_of_the_shelves_does_not_bring_it_back(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness)
+    _ignore_series(harness, SHOW_ID, "The Hollow Coast")
+
+    _seed_shelves(harness)  # what a Refresh writes: the same show, from Trakt, again
+
+    assert "The Hollow Coast" not in harness.client.get("/discover").text
+
+
+@respx.mock
+def test_un_ignoring_brings_it_back_from_the_cache(harness: AppHarness) -> None:
+    """With no routes mocked, any request to Trakt, TMDB or Sonarr here would raise."""
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness)
+    _ignore_series(harness, SHOW_ID, "The Hollow Coast")
+
+    _ignore_series(harness, SHOW_ID, "The Hollow Coast", undo="1")
+    page = harness.client.get("/discover").text
+
+    assert "The Hollow Coast" in page
+    assert "ignored" not in page.split("Trending now", 1)[1].split("</span>", 1)[0]
+    assert len(respx.calls) == 0
+
+
+def test_a_shelf_with_everything_ignored_does_not_say_nothing_was_fetched(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness, trending=(_show(),), anticipated=())
+
+    _ignore_series(harness, SHOW_ID, "The Hollow Coast")
+    page = harness.client.get("/discover").text
+
+    assert "Everything on this shelf is ignored" in page
+    assert page.count("Nothing fetched yet") == 1  # the shelf that really is empty
+
+
+def test_a_film_with_the_same_number_stays_on_the_chart(harness: AppHarness) -> None:
+    """TMDB numbers films and series separately, so tv/1396 says nothing about movie/1396."""
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness)
+    _chart(harness, movies=[_film(tmdb_id=SHOW_ID, status=MovieStatus.IN_LIBRARY)])
+
+    _ignore_series(harness, SHOW_ID, "The Hollow Coast")
+    page = harness.client.get("/discover").text
+
+    assert "Neon Rain" in page
+    assert ">Ignored<" not in page
+    assert ">In Library<" in page
+
+
+def test_an_ignored_film_with_the_same_number_leaves_the_show(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness)
+
+    harness.client.app.state.ignore.add(
+        tmdb_id=SHOW_ID, title="A Film", normalized_title="a film"
+    )
+
+    assert "The Hollow Coast" in harness.client.get("/discover").text
+
+
+def test_a_show_with_no_id_is_matched_by_its_title(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness, trending=(_show(tmdb_id=None),), anticipated=())
+
+    harness.client.app.state.ignore.add(
+        tmdb_id=None, title="The Hollow Coast",
+        normalized_title=normalize_title("The Hollow Coast"), kind=KIND_SERIES,
+    )
+
+    assert "The Hollow Coast" not in harness.client.get("/discover").text
+
+
+# --- what deleting a key takes with it ---
+
+
+@pytest.mark.parametrize("provider", ["tmdb", "trakt"])
+def test_deleting_either_key_drops_the_tv_shelves_it_filled(
+    harness: AppHarness, provider: str
+) -> None:
+    harness.activate()
+    _keys(harness)
+    _seed_shelves(harness)
+
+    harness.client.post(f"/settings/discovery/{provider}/delete", follow_redirects=False)
+
+    assert "The Hollow Coast" not in harness.client.get("/discover").text
+
+
+# --- a shelf stays full after ignoring ---
+
+
+def test_ignoring_a_show_lets_the_next_one_onto_the_shelf(harness: AppHarness) -> None:
+    harness.activate()
+    _keys(harness)
+    shows = tuple(
+        _show(f"Show Number {index}", tmdb_id=index, tvdb_id=index) for index in range(1, 31)
+    )
+    _seed_shelves(harness, trending=shows, anticipated=())
+    assert "Show Number 21<" not in harness.client.get("/discover").text
+
+    _ignore_series(harness, 1, "Show Number 1")
+    page = harness.client.get("/discover").text
+
+    assert "Show Number 1<" not in page
+    assert "Show Number 21<" in page
+    assert "Show Number 22<" not in page
+
+
+# --- a read older than a minute still answers, and says how old it is ---
+
+
+def _read_long_ago(harness: AppHarness, library: dict, *, age_seconds: float) -> None:
+    state = harness.client.app.state
+    app = state.apps.add(name="Main", url=RADARR_URL, api_key=RADARR_KEY)
+    snapshots = state.radarr_library_snapshots
+    snapshots.put(app.id, library)
+    monotonic, stored = snapshots._entries[app.id]
+    snapshots._entries[app.id] = (monotonic - age_seconds, stored)
+    snapshots._read_at[app.id] -= age_seconds
+
+
+def test_an_hour_old_read_decides_the_card_and_the_page_says_how_old(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    _read_long_ago(harness, {FILM_ID: _copy(has_file=True)}, age_seconds=3600)
+    _chart(harness)
+
+    page = _shelf(harness)
+
+    assert ">In Library<" in page
+    assert "Library status is from when Radarr was last read" in page
+    assert "when this week was fetched" not in page
+
+
+def test_a_read_from_days_ago_falls_back_to_the_weeks_record(harness: AppHarness) -> None:
+    harness.activate()
+    _read_long_ago(harness, {FILM_ID: _copy(has_file=True)}, age_seconds=3 * 24 * 3600)
+    _chart(harness)
+
+    page = _shelf(harness)
+
+    assert ">Missing<" in page
+    assert "when this week was fetched" in page
+
+
+def test_a_fresh_read_needs_no_note_about_its_age(harness: AppHarness) -> None:
+    harness.activate()
+    _connect(harness, library={FILM_ID: _copy(has_file=True)})
+    _chart(harness)
+
+    assert "last read" not in _shelf(harness)
+
+
+# --- the attribution TMDB's licence asks for ---
+
+
+@pytest.mark.parametrize("path", ["/discover", "/settings"])
+def test_the_logo_and_notice_are_shown_where_tmdb_data_is(harness: AppHarness, path: str) -> None:
+    harness.activate()
+
+    page = harness.client.get(path).text
+
+    assert '/static/img/tmdb.svg?v=' in page
+    assert "uses TMDB and the TMDB APIs but is not endorsed" in page
+
+
+def test_the_logo_is_served_from_here_and_carries_nothing_active(harness: AppHarness) -> None:
+    response = harness.client.get("/static/img/tmdb.svg")
+
+    assert response.status_code == 200
+    assert "<script" not in response.text
+    assert "href=" not in response.text
+

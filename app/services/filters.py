@@ -24,6 +24,12 @@ from app.services.boxoffice import (
     validated_region,
 )
 from app.services.reports import MAX_REPORT_RETENTION, MAX_REPORTS, MIN_REPORT_RETENTION
+from app.services.upcoming import (
+    DEFAULT_TERRITORY,
+    DEFAULT_WINDOW_DAYS,
+    TERRITORIES,
+    WINDOW_CHOICES_DAYS,
+)
 
 FILTERS_SCHEMA_VERSION = 1
 FILTERS_FILENAME = "filters.yml"
@@ -68,6 +74,21 @@ class FiltersConfig(BaseModel):
     # switching back to it restores exactly what was configured.
     schedule_mode: str = SCHEDULE_MODE_CADENCE
     boxoffice_region: str = DOMESTIC_REGION
+    # Off unless someone turns it on: it is the one film shelf that asks a public API.
+    upcoming_enabled: bool = False
+    upcoming_territory: str = DEFAULT_TERRITORY
+    upcoming_window_days: int = DEFAULT_WINDOW_DAYS
+
+    @field_validator("upcoming_territory", mode="before")
+    @classmethod
+    def _known_territory(cls, value: object) -> str:
+        """Read-tolerant, like the region: the Settings route is the strict half."""
+        return value if value in TERRITORIES else DEFAULT_TERRITORY
+
+    @field_validator("upcoming_window_days", mode="before")
+    @classmethod
+    def _known_window(cls, value: object) -> int:
+        return value if value in WINDOW_CHOICES_DAYS else DEFAULT_WINDOW_DAYS
 
     @field_validator("schedule_mode", mode="before")
     @classmethod
