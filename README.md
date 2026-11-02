@@ -32,9 +32,11 @@ home server. It never downloads anything itself — it tells Radarr what to fetc
   films and series alike.
 - **Several Radarrs, honestly.** Add to whichever instance you choose, see which
   one holds each film, upgrade a copy in place, and watch real download progress
-  on every page it appears.
+  on every page it appears. If a server stops answering, the last figure stays until it
+  answers again; a download only disappears once its server has said so.
 - **Thirteen regions.** Domestic plus twelve regional charts, with grosses shown
-  in whatever currency the source actually prints — never converted, never mixed.
+  in whatever currency the source actually prints — never converted, never mixed. A total or a trend covers one region's chart at a
+  time, and regional charts are weekend figures where Domestic is weekly.
 - **Encrypted backups** you can verify, restore, or hand to your own 3‑2‑1.
 
 ## What it looks like
@@ -71,7 +73,10 @@ second one bolted on: the same cards, the same two colour registers, the same
 - **Discover** shows what is doing well this week. Films are ranked by what they
   took at the box office; series by how many people are watching them on Trakt
   right now. The page says so, because there is no television box office and
-  pretending otherwise would be a made-up ranking.
+  pretending otherwise would be a made-up ranking. An optional **Upcoming Films**
+  shelf, off until you turn it on in Settings, lists what TMDB has scheduled in a
+  territory you choose. It asks TMDB only when you press its Refresh, its dates are
+  provisional, and it makes no claim about box office.
 - **Calendar** is one week, both media. Episodes from Sonarr and release dates
   from Radarr in the same day column, today's column marked, and a fortnight's
   look-ahead underneath where a long episode title has room to be read.
@@ -86,12 +91,18 @@ second one bolted on: the same cards, the same two colour registers, the same
 - **Nothing is sent anywhere until you press Add.** Every one of the three pages
   renders from a local cache. Opening one costs no third-party request — Discover
   fetches only when you press **Refresh**, and the Calendar only when its cache is
-  more than fifteen minutes old.
+  more than fifteen minutes old. If one of your servers does not answer, what it last
+  sent stays on the page with a warning naming it and when it was last read, until it
+  answers again. The Calendar's "Last fetch" is when it last asked; that warning is how
+  old the answer is.
 - **No unattended traffic to Trakt or TMDB.** The morning job at **06:00 UTC**
   re-reads *your own* Sonarr and Radarr and nothing else. Discover has no job at
   all, deliberately: its six-hour cache and its Refresh button are enough.
 
 ### Your own keys
+
+This product uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved
+by TMDB.
 
 Television needs two credentials, and **BoxMedia ships neither** — not in the
 code, not in `.env.example`, not in the image. Both are free, take a minute, and
@@ -219,7 +230,7 @@ into an empty folder, then:
 # 1. Create your .env from the template and set BM_SESSION_SECRET.
 cp .env.example .env
 #    Generate a session secret:
-docker run --rm --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.5.1 \
+docker run --rm --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.6.0 \
   -c "import secrets; print(secrets.token_urlsafe(48))"
 #    Paste it into BM_SESSION_SECRET in .env.
 
@@ -290,8 +301,18 @@ previous password and find every report and setting exactly as before.
 
 Media files are **never** in a backup. BoxMedia doesn't store them; your movie
 library belongs to Radarr and its own storage. A typical archive is a few MB —
-the poster cache is the part that grows. Uploaded archives are capped at **64 MB**;
-a larger one has to be restored from `/data/backups/` rather than imported.
+the poster cache is the part that grows. Backups stream to disk, so their size is
+limited by your disk and not by the container's memory.
+
+**Verify** runs every check a restore runs, without changing anything. It decrypts the
+archive, checks its manifest, file list and checksums, then loads the account, settings,
+connections, corrections and every weekly report the way the app would, so a backup of an
+account nobody could log in to fails here rather than after a restore. It does not contact
+your servers or test saved credentials, and a saved credential the key cannot read is not
+treated as a failure. Caches and logs are not validated, because the app rebuilds or
+tolerates them. An archive is refused above 20,000 files, 64 MiB for one file, 1 MiB for
+one settings file or report, or 2 GiB unpacked. A restore needs free disk space for about
+twice the archive's size, and an older BoxMedia cannot read an archive this version writes.
 
 Create, download, restore, or import backups under **Settings → Backups**, or let
 one happen automatically before every restore (a safety net). Archives live in
@@ -352,19 +373,26 @@ docker compose down
 
 # 2. Generate a new key next to the old one, then rotate the stored connections.
 docker run --rm -v "$PWD/secrets:/secrets" --entrypoint /usr/bin/python3.11 \
-  ghcr.io/aiulian25/boxmedia:1.5.1 -m app.core.crypto genkey /secrets/boxmedia-new.key
+  ghcr.io/aiulian25/boxmedia:1.6.0 -m app.core.crypto genkey /secrets/boxmedia-new.key
 docker run --rm -v "$PWD/secrets:/secrets" -v "$PWD/data:/data" \
-  --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.5.1 \
+  --entrypoint /usr/bin/python3.11 ghcr.io/aiulian25/boxmedia:1.6.0 \
   -m app.core.crypto rotate /secrets/boxmedia.key /secrets/boxmedia-new.key /data
 
 # 3. Point BM_ENCRYPTION_KEY_FILE (or the compose mount) at the new key, then start.
 docker compose up -d
 ```
 
-Nothing is written unless every credential in every store re-encrypts cleanly, so a
-failed rotation leaves all of them untouched — a half-rotated install would be worse
-than one that never started, because the half that moved could no longer be rotated back
-with the old key. **Keep the old key until every backup made with it is deleted** —
+The `init` service hands `secrets/` to the app's uid (65532), which is what lets step 2
+create the new key there; that needs one earlier start with this version's compose file.
+
+If a credential opens with neither key, nothing is written. If the rotation is interrupted
+after that (a full disk, a crash, a power cut), some credentials may be under each key.
+Keep both key files and **run the same `rotate` command again**: it finishes from where it
+stopped, and needs nothing re-entered. To go back to the old key instead, run it with the
+two keys swapped. Do not start BoxMedia in between: the credentials still under the other
+key would read as unavailable until you finish.
+
+**Keep the old key until every backup made with it is deleted** —
 existing `.backup` archives can only be decrypted with the key they were created under.
 Afterwards, verify with Settings → **Test Connection**.
 
@@ -381,6 +409,19 @@ come back on the next load.
   key** in place first. Corrupt, tampered, or wrong-key files are rejected safely;
   a validation failure never touches your live data.
 
+A restore replaces everything or nothing. BoxMedia validates the archive, briefly answers
+other requests with "restoring", stops any backfill, and waits up to 45 seconds for work
+already running; if that does not finish, nothing changes and you can try again. It then
+takes a safety backup and swaps the data in. **Afterwards everybody is signed out**, and you
+sign in with the password from the backup.
+
+If the swap fails, the previous data is put back. If the container dies part-way, the next
+start does the same before anything else. If putting it back fails too (a full or read-only
+disk), BoxMedia refuses to serve and says so, rather than running on half-restored data: fix
+the disk and restart, which retries. To recover by hand with BoxMedia stopped, rename each
+`/data/.<name>.retired-*` back to `<name>`, replacing what is there, then delete
+`/data/.restore-journal.json`.
+
 ## Security posture
 
 - Argon2id password hashing; forced first-run password change; login
@@ -395,11 +436,12 @@ come back on the next load.
 - TLS certificate validation on all outbound calls; point `BM_TLS_CA_FILE` at a
   CA bundle for a self-signed home Radarr, Sonarr or media server rather than
   disabling verification. That escape hatch is for **your own servers** — the
-  public endpoints below are always verified, against the system trust store, and
-  neither `BM_TLS_CA_FILE` nor `BM_OUTBOUND_TLS_VERIFY` can change that. (If your
-  network intercepts TLS wholesale, set the container's `SSL_CERT_FILE` to a bundle
-  holding both your CA **and** the public roots; that keeps verification on rather
-  than turning it off for a public API carrying your TMDB key.)
+  public endpoints below are always verified, against the CA bundle pinned in the
+  image, and neither `BM_TLS_CA_FILE` nor `BM_OUTBOUND_TLS_VERIFY` can change that.
+  (If your network intercepts TLS wholesale, set the container's `SSL_CERT_FILE` to
+  a bundle holding both your CA **and** the public roots; that keeps verification
+  on rather than turning it off for a public API carrying your TMDB key. That bundle
+  is then yours to keep current: BoxMedia updates no longer reach it.)
 - **Every host BoxMedia can contact**, and nothing else: `boxofficemojo.com`
   (the weekly chart), `api.themoviedb.org` and `image.tmdb.org` (artwork and
   metadata, only once you add a TMDB key), `api.trakt.tv` (trending series, only
@@ -414,12 +456,71 @@ come back on the next load.
   its credential travels as a header, never in a URL where proxy logs would keep
   it. The same is true of the Trakt client ID.
 
+## If the container was down, or a fetch failed
+
+Weeks that were missed while BoxMedia was off are fetched on their own after the next healthy
+check, up to twelve at a time and at least fifteen seconds apart. A week that **failed** is
+retried the same way, with growing gaps that survive a restart. If Radarr or the network was
+down, it gets eight attempts, spread further apart each time. If Box Office Mojo has no chart for that
+week, or a malformed one, it gets three and then stops, and the Weekly page says which weeks
+those are; **Re-run** on the week's card always tries again. A week Mojo has not published yet
+is not a failure and costs no attempt. BoxMedia never invents an empty chart for a week.
+
+## What "Last check" means
+
+**Last check** on the Weekly page is when the schedule last went to Box Office Mojo, with what
+it came to beside it: *chart updated*, *no changes* or *failed*. Most checks of a settled week
+find no changes and write nothing, and that still counts as a check. A manual fetch is not a
+scheduled check and does not move this. After a restart the schedule resumes from this time.
+
+## How series are identified
+
+Sonarr identifies a series by its TVDB id, so only that id says a show is **In Sonarr**. Two
+known ids that differ are two shows, however alike their names, and the show you were looking
+at can still be added. Where one side has no id, a series of the same name and year reads
+**Best guess — verify**, names the Sonarr it is on, and leaves Add available. With several
+Sonarr connections, a show already on one by id is not added to another.
+
+## How films are identified
+
+A chart gives a title, and a title is not a film: two films called *Nosferatu* can chart
+years apart. When Radarr returns exactly one film with that title, that is the match. When it
+returns several, or none, or a different film from the one Box Office Mojo's own release
+page names, BoxMedia asks that page for the film's IMDb id and uses the film carrying it.
+If that does not settle it, the card says **Best guess — verify**, even when the film it
+picked is one you own, because that ownership may be its namesake's.
+
+**Wrong match?** applies to that release's other weeks and to its future weeks, and the page
+lists them first. A different release with the same title is left alone. Weeks stored before
+this was recorded have no source, so they are listed separately and you can leave them out.
+Corrections made by earlier versions stay in force for their title, unless the source shows
+a row is a different film.
+
+## When a chart looks wrong
+
+A weekly chart is only stored if it is whole: every title within your chosen depth has a
+gross, ranks run from 1 with no gaps, and a week already stored has not come back shorter.
+Where Box Office Mojo itself prints a dash for a film's weeks, the card simply omits them. A page that fails this is recorded as a **failed** fetch, its HTML is
+kept for Settings → Maintenance, and **the week you already had stays as it was**. A gross
+of zero is a figure; a missing one is a failure, never a zero.
+
+## Running more than one
+
+BoxMedia runs as **exactly one process per data directory**. Its files, sessions and
+scheduler assume a single owner, so do not add uvicorn workers or replicas. A second process
+pointed at the same directory stops at startup and says so rather than overwriting the
+first. (With extra uvicorn workers, one serves and the rest fail and restart repeatedly, so
+the log fills with that message.) On a filesystem without file locking (some network mounts) that check cannot run, so
+the rule is yours to keep.
+
 ## Development
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest                 # unit + integration tests
 .venv/bin/ruff check app tests   # lint
+# tests/e2e runs the real app.js and stylesheet in headless Chrome, and skips without Chrome
+# or the Tailwind binary. On its own: pytest --noconftest tests/e2e/test_settings_ui.py
 # Recompile CSS after editing templates (Tailwind tree-shakes unused classes):
 ./tools/tailwindcss -c tailwind.config.js -i styles/tailwind.css -o app/static/css/app.css --minify
 .venv/bin/uvicorn --factory app.main:create_app   # run locally
@@ -427,6 +528,20 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 Pre-deploy gate: [`scripts/check.sh`](scripts/check.sh) runs ruff, pytest,
 `pip-audit`, and a Trivy image scan.
+
+To run a local image beside a production install, use the dev stack. It has its own
+configuration, data, encryption key and port (`58547`), and reads nothing from `.env`:
+
+```bash
+cp .env.dev.example .env.dev     # then set BM_SESSION_SECRET
+docker compose -f docker-compose.dev.yml --env-file .env.dev up -d --build
+```
+
+**Upgrading a dev install that used `.env`, `./data` and `./secrets`:** nothing is moved
+for you, and `up` stops until `.env.dev` exists. To keep that install, stop it, copy its
+`.env` to `.env.dev`, and add `BM_DEV_DATA_PATH=./data` and `BM_DEV_SECRETS_PATH=./secrets`.
+Only do this if those directories are not also in use by a production stack: two
+running copies on one data directory overwrite each other's files.
 
 ## License
 
