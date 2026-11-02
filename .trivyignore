@@ -2,10 +2,12 @@
 #
 # Every entry below is a HIGH-severity CVE in a Debian 12 OS package that ships
 # inside the pinned distroless base image (gcr.io/distroless/python3-debian12:
-# nonroot). They are NOT in BoxMedia's own code or Python dependencies (those are
-# audited clean by pip-audit). Re-pulling the base returns the same digest, so this
-# is the newest distroless build available — the Debian point-release fixes simply
-# have not landed in a distroless rebuild yet (base-image lag).
+# nonroot). They are NOT in BoxMedia's own code or Python dependencies. Nothing here
+# waives those: pip-audit and this scan judge them afresh on every run, and a clean
+# result holds only for that run (certifi 2026.7.22 passed until PYSEC-2026-4320 was
+# published on 2026-10-20). Re-pulling the base on 2026-11-02 returned the same
+# digest, so this was the newest distroless build available that day — the Debian
+# point-release fixes had not landed in a distroless rebuild (base-image lag).
 #
 # Not reachable from BoxMedia's runtime, and mitigated by the container hardening
 # (read-only rootfs, cap_drop ALL, no-new-privileges, non-root UID 65532, no shell):

@@ -46,9 +46,14 @@ FROM gcr.io/distroless/python3-debian12:nonroot@sha256:7d1042ce588ab97019fe95c24
 LABEL org.opencontainers.image.source="https://github.com/aiulian25/boxmedia" \
       org.opencontainers.image.description="Weekly box-office hits, matched against your Radarr library for one-click adding" \
       org.opencontainers.image.licenses="MIT"
+# The distroless base points SSL_CERT_FILE at its own Debian bundle, and httpx prefers that
+# over certifi. Without the last line the image ignores the hash-pinned bundle and trusts
+# whatever the base last shipped — when this was written, PYSEC-2026-4320's compromised root.
 ENV PYTHONPATH=/app/deps:/app \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    SSL_CERT_FILE=/app/deps/certifi/cacert.pem \
+    TMPDIR=/data/.tmp
 WORKDIR /app
 COPY --from=builder /install /app/deps
 COPY app /app/app
