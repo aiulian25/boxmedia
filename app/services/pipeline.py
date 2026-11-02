@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from secrets import token_hex
 
@@ -25,16 +26,18 @@ from app.services import boxoffice
 from app.services.apps import AppsStore
 from app.services.boxoffice import (
     BoxOfficeEntry,
+    ChartScope,
     ScrapeError,
     WeekNotPublishedError,
     format_gross,
 )
-from app.services.corrections import Correction, CorrectionStore
+from app.services.corrections import Correction, CorrectionBook, CorrectionStore
 from app.services.ignore import IgnoreSnapshot, IgnoreStore
 from app.services.matcher import Candidate, find_match, normalize_title
 from app.services.radarr import RadarrError, RadarrLookupResult, RadarrMovie
 from app.services.release_ids import ReleaseIdCache
 from app.services.reports import (
+    MATCHED_AMBIGUOUS,
     MATCHED_BY_GUESS,
     MAX_REPORTS,
     MovieAction,
@@ -55,7 +58,7 @@ CARD_GENRES = 3
 
 # What a week's chart says, with nothing about the Radarr library in it. Two runs that
 # produce the same fingerprint found the same chart, so the second has nothing to record.
-ChartFingerprint = list[tuple[int, str, int, int, int | None, int | None]]
+ChartFingerprint = list[tuple[int, str, int, int | None, int | None, int | None]]
 
 # Returns (resolved_week_id, entries) — the week actually parsed may differ from the
 # requested one when we step back over an in-progress week.
@@ -82,6 +85,37 @@ FetchReleaseId = Callable[[str], Awaitable[str | None]]
 # Six is also how many connections a browser opens to one host, which keeps this as
 # polite to Radarr's upstream and to Mojo as a person clicking through would be.
 RECONCILE_CONCURRENCY = 6
+
+# The chart facts of a row, which a correction never changes, except for the display title.
+_CHART_FIELDS = (
+    "rank",
+    "title",
+    "normalized_title",
+    "gross_amount",
+    "gross_display",
+    "total_gross",
+    "theaters",
+    "gross_change_pct",
+    "weeks_in_release",
+    "release_path",
+    "source_imdb_id",
+)
+# How Radarr's search takes an exact id, for a film its title search cannot find.
+RADARR_IMDB_TERM = "imdb:{imdb_id}"
+
+
+class PipelineBusyError(Exception):
+    """Another run still held its turn when the caller's patience ran out. Nothing ran."""
+
+
+@dataclass(frozen=True)
+class _RunConfig:
+    """The settings one run answers to, read once so an edit applies to the next run: a
+    region changed mid-flight must not relabel a chart fetched from the old one."""
+
+    region: str
+    report_keep: int
+    chart_size: int
 
 
 class _ReleaseLookups:
@@ -136,6 +170,12 @@ class Pipeline:
         self._corrections = corrections or CorrectionStore(settings.config_dir)
         self._release_ids = release_ids or ReleaseIdCache(settings.cache_dir)
         self._fetch_release_id = fetch_release_id or self._default_fetch_release_id
+        # One run at a time, whoever asked. Without it a slow older run could write over a
+        # newer run's figures: atomic files stop a torn write, not a stale one. Held for the
+        # whole run, so the queue is bounded by who can ask: one job per schedule, one
+        # backfill, and manual clicks, which give up. Inside `exclusive` in lock order: a
+        # restore waits for whoever holds this, and nothing here ever waits for a restore.
+        self._admission = asyncio.Lock()
 
     async def _default_fetch_chart(self, week: str | None) -> tuple[str, list[BoxOfficeEntry]]:
         return await boxoffice.fetch_weekly_chart(
@@ -171,7 +211,7 @@ class Pipeline:
         return self._apps.primary_id()
 
     def _unchanged_report(
-        self, week: str, entries: list[BoxOfficeEntry]
+        self, week: str, entries: list[BoxOfficeEntry], config: _RunConfig
     ) -> Report | None:
         """The stored report this chart would duplicate, if there is one.
 
@@ -187,15 +227,51 @@ class Pipeline:
         stored = self._reports.latest_for_week(week)
         if stored is None:
             return None
-        # A stored week fetched from a DIFFERENT chart is not this chart, whatever its
-        # numbers happen to be. Compared here rather than folded into the fingerprint,
-        # which is a per-title shape and has no room for a fact about the whole run.
-        if stored.region != self._region():
+        # A stored week fetched from a DIFFERENT chart, or printed in different money, is not
+        # this chart, whatever its numbers happen to be. Compared here rather than folded into
+        # the fingerprint, which is a per-title shape and has no room for a fact about the
+        # whole run.
+        if stored.chart_scope != ChartScope(config.region, _chart_currency(entries)):
             return None
         return stored if _fingerprint_of(stored) == _fingerprint(entries) else None
 
-    async def run(self, *, trigger: str, week: str | None = None) -> Report:
+    def _shrank(self, week: str, entries: list[BoxOfficeEntry], config: _RunConfig) -> bool:
+        """Whether this chart is a truncated view of one already stored.
+
+        A page cut short at a row boundary parses perfectly, with ranks 1 to N and every
+        figure present, so the parser cannot tell. Only the stored week can. A lowered depth
+        is not this: the chart then still holds as many titles as were asked for.
+        """
+        stored = self._reports.latest_for_week(week)
+        if stored is None or stored.region != config.region:
+            return False
+        return len(entries) < len(stored.movies) and len(entries) < config.chart_size
+
+    async def run(
+        self,
+        *,
+        trigger: str,
+        week: str | None = None,
+        admission_timeout: float | None = None,
+    ) -> Report:
+        """Run once this pipeline is free. `admission_timeout` is how long to wait for that
+        before raising PipelineBusyError; None waits, which is right for unattended work,
+        whose week would otherwise simply be lost. Cancelling, at any point, gives the turn
+        back."""
+        try:
+            await asyncio.wait_for(self._admission.acquire(), admission_timeout)
+        except TimeoutError as exc:
+            raise PipelineBusyError("another run is still in progress") from exc
+        try:
+            return await self._run_admitted(trigger, week)
+        finally:
+            self._admission.release()
+
+    async def _run_admitted(self, trigger: str, week: str | None) -> Report:
         run_at = datetime.now(UTC)
+        config = _RunConfig(
+            region=self._region(), report_keep=self._report_keep(), chart_size=self._chart_size()
+        )
         report_id = f"report-{run_at:%Y%m%d-%H%M%S}-{token_hex(2)}"
         week_label = week or "current"
 
@@ -203,7 +279,7 @@ class Pipeline:
         if app_id is None:
             return self._save_failed(
                 report_id, run_at, trigger, week_label, RunStatus.NO_APP,
-                "No Radarr connection is configured.",
+                "No Radarr connection is configured.", config,
             )
 
         try:
@@ -215,7 +291,7 @@ class Pipeline:
             raise
         except ScrapeError as exc:
             return self._save_failed(
-                report_id, run_at, trigger, week_label, RunStatus.SCRAPE_FAILED, str(exc)
+                report_id, run_at, trigger, week_label, RunStatus.SCRAPE_FAILED, str(exc), config
             )
         # Label the report with the week actually fetched (a picked/current week may have
         # stepped back over an in-progress one), so the report and its re-run are honest.
@@ -226,13 +302,20 @@ class Pipeline:
         # admin — keeps the report, and the second attempt is a no-op rather than a
         # duplicate. Checked here so an unchanged week costs one page fetch and no
         # library read, lookup or poster work at all.
-        unchanged = self._unchanged_report(week_label, entries)
+        unchanged = self._unchanged_report(week_label, entries, config)
         if unchanged is not None:
             self._audit.record(
                 AuditAction.PIPELINE_RUN, trigger=trigger, week=week_label,
                 movies=len(entries), unchanged=True,
             )
             return unchanged
+        if self._shrank(week_label, entries, config):
+            return self._save_failed(
+                report_id, run_at, trigger, week_label, RunStatus.SCRAPE_FAILED,
+                f"Box Office Mojo listed only {len(entries)} title(s) for a week already stored "
+                "with more. Kept the stored chart.",
+                config,
+            )
 
         try:
             radarr = self._make_radarr(app_id)
@@ -242,12 +325,12 @@ class Pipeline:
             # (AppNotFoundError subclasses KeyError) — report it rather than crash.
             return self._save_failed(
                 report_id, run_at, trigger, week_label, RunStatus.NO_APP,
-                "The Radarr connection was removed while the run was in progress.",
+                "The Radarr connection was removed while the run was in progress.", config,
             )
         except RadarrError as exc:
             return self._save_failed(
                 report_id, run_at, trigger, week_label, RunStatus.RADARR_FAILED,
-                f"Could not read the Radarr library: {exc}",
+                f"Could not read the Radarr library: {exc}", config,
             )
 
         library_by_tmdb = {movie.tmdb_id: movie for movie in library}
@@ -258,7 +341,7 @@ class Pipeline:
         # Read once for the whole run, for the same reason the ignore list is: every row
         # is then judged against the same answers, rather than against whatever the file
         # held at the moment that row happened to be built.
-        corrections = self._corrections.all()
+        corrections = self._corrections.book()
         # One budget for the whole run, so five guessed titles cost five release pages and
         # a sixth costs none. Reached only on a chart that changed — the unchanged check
         # above returns before any of this.
@@ -277,6 +360,12 @@ class Pipeline:
                 )
 
         results = await asyncio.gather(*[reconcile(entry) for entry in entries])
+        # No await from here to the write below, on purpose. fix_match also runs on this
+        # event loop with none between its two writes, so one of these two blocks finishes
+        # before the other starts, and an admin's choice cannot fall between them.
+        results = self._with_corrections_made_meanwhile(
+            results, corrections, library_by_tmdb, ignored
+        )
         matched = sum(
             1 for result in results if result.status in (MovieStatus.IN_LIBRARY, MovieStatus.WANTED)
         )
@@ -290,18 +379,47 @@ class Pipeline:
             trigger=trigger,
             status=RunStatus.OK,
             week=week_label,
-            region=self._region(),
+            region=config.region,
             currency=_chart_currency(entries),
             totals=ReportTotals(movies=len(results), matched=matched),
             movies=results,
         )
         self._reports.replace_week(report)
-        self._reports.prune(self._report_keep())
+        self._reports.prune(config.report_keep)
         self._audit.record(
             AuditAction.PIPELINE_RUN, trigger=trigger, week=week_label,
             movies=len(results), matched=matched,
         )
         return report
+
+    def _with_corrections_made_meanwhile(
+        self,
+        results: list[MovieResult],
+        seen: CorrectionBook,
+        library_by_tmdb: dict[int, RadarrMovie],
+        ignored: IgnoreSnapshot,
+    ) -> list[MovieResult]:
+        """Apply any correction that arrived after this run read the list.
+
+        It has already been written to the stored weeks, so committing this run's rows as
+        they stand would quietly overwrite an admin's decision with a guess.
+        """
+        current = self._corrections.book()
+        updated: list[MovieResult] = []
+        for result in results:
+            identity = (result.normalized_title, result.release_path, result.source_imdb_id)
+            correction = current.for_row(*identity)
+            if correction is None or correction == seen.for_row(*identity):
+                updated.append(result)
+                continue
+            common = {field: getattr(result, field) for field in _CHART_FIELDS}
+            common["title"] = correction.title
+            updated.append(
+                self._result(
+                    common, _links_from_correction(correction, []), library_by_tmdb, ignored
+                )
+            )
+        return updated
 
     async def _reconcile(
         self,
@@ -309,7 +427,7 @@ class Pipeline:
         radarr: object,
         library_by_tmdb: dict[int, RadarrMovie],
         ignored: IgnoreSnapshot,
-        corrections: dict[str, Correction],
+        corrections: CorrectionBook,
         lookups: _ReleaseLookups,
     ) -> MovieResult:
         """Report each chart title's status against the library. NEVER adds.
@@ -333,6 +451,12 @@ class Pipeline:
             "theaters": entry.theaters,
             "gross_change_pct": entry.gross_change_pct,
             "weeks_in_release": entry.weeks_in_release,
+            "release_path": entry.release_path,
+            # Whatever a run has already learned. Spending a page to learn it is decided
+            # below, only where the answer would change something.
+            "source_imdb_id": (
+                self._release_ids.get(entry.release_path) if entry.release_path else None
+            ),
         }
 
         try:
@@ -348,7 +472,12 @@ class Pipeline:
         # IMDb confirmation and certainly a guess — and it is checked before the empty
         # result below, because a title Radarr's search cannot find at all is exactly the
         # kind that got corrected by hand in the first place.
-        correction = corrections.get(common["normalized_title"])
+        correction = self._correction_for(entry, common, corrections)
+        if correction is not None and correction.release_path is None and entry.release_path:
+            # A title-only correction, about to be applied to a row that can say which film
+            # it is. Worth one page: this is how a remake escapes its namesake's correction.
+            common["source_imdb_id"] = await self._source_imdb(entry, lookups)
+            correction = self._correction_for(entry, common, corrections)
         if correction is not None:
             common["title"] = correction.title
             return self._result(
@@ -356,21 +485,33 @@ class Pipeline:
                 library_by_tmdb, ignored,
             )
 
-        if not candidates_raw:
-            return MovieResult(**common, status=MovieStatus.MISSING, action=MovieAction.NO_MATCH)
-
         candidates = [Candidate(item.title, item.year, item) for item in candidates_raw]
-        matched = find_match(entry.title, candidates)
-        # Nothing Radarr returned matched the title. Before falling back to its first
-        # suggestion — which is how a remake, a sequel or a re-release ends up on the wrong
-        # card — ask Mojo which film this row actually is. An IMDb id is exact where a
-        # title is not, and both sides already have one.
-        confirmed = (
-            None if matched else await self._confirm_by_imdb(entry, candidates_raw, lookups)
-        )
+        title_match = find_match(entry.title, candidates)
+        matched: RadarrLookupResult | None = title_match.payload if title_match else None
+        known = common["source_imdb_id"]
+        contradicted = bool(matched and known and matched.imdb_id and matched.imdb_id != known)
+        ambiguous = bool(title_match and title_match.ambiguous)
+        # A title that settled it costs nothing further. Otherwise, before falling back to
+        # a suggestion — which is how a remake, a sequel or a re-release ends up on the wrong
+        # card — ask Mojo which film this row actually is. An IMDb id is exact where a title
+        # is not, and both sides already have one.
+        confirmed = None
+        if matched is None or ambiguous or contradicted:
+            common["source_imdb_id"] = await self._source_imdb(entry, lookups)
+            confirmed = await self._confirm_by_imdb(
+                radarr, common["source_imdb_id"], candidates_raw
+            )
+        # Still nothing to show: Radarr's search found no such title, and no id found it.
+        if confirmed is None and not candidates_raw:
+            return MovieResult(**common, status=MovieStatus.MISSING, action=MovieAction.NO_MATCH)
         # Still a guess only when neither route identified it. That case keeps the amber
         # hint it has always had; the fix-match flow is what it is for.
         best: RadarrLookupResult = confirmed or matched or candidates_raw[0]
+        detail = None
+        if confirmed is None and (matched is None or contradicted):
+            detail = MATCHED_BY_GUESS
+        elif confirmed is None and ambiguous:
+            detail = MATCHED_AMBIGUOUS
         links = {
             "tmdb_id": best.tmdb_id,
             "year": best.year,
@@ -384,7 +525,7 @@ class Pipeline:
             # Carried on every matched path, including the in-library one: how the film
             # was identified is a fact about the match, not about the library. Recording
             # it only while missing would silently drop it the moment someone adds it.
-            "detail": None if (matched or confirmed) else MATCHED_BY_GUESS,
+            "detail": detail,
         }
         return self._result(common, links, library_by_tmdb, ignored)
 
@@ -415,18 +556,20 @@ class Pipeline:
             **common, **links, status=MovieStatus.MISSING, action=MovieAction.NONE
         )
 
-    async def _confirm_by_imdb(
-        self,
-        entry: BoxOfficeEntry,
-        candidates: list[RadarrLookupResult],
-        lookups: _ReleaseLookups,
-    ) -> RadarrLookupResult | None:
-        """The candidate whose IMDb id is the one Mojo's release page names, or None.
+    @staticmethod
+    def _correction_for(
+        entry: BoxOfficeEntry, common: dict, corrections: CorrectionBook
+    ) -> Correction | None:
+        return corrections.for_row(
+            common["normalized_title"], entry.release_path, common["source_imdb_id"]
+        )
+
+    async def _source_imdb(self, entry: BoxOfficeEntry, lookups: _ReleaseLookups) -> str | None:
+        """The IMDb id Mojo's release page names for this row, or None.
 
         None for every ordinary disappointment — the row linked no page, the run has spent
-        its budget, the page could not be read, or no candidate carries that id. This
-        exists to improve a guess, never to endanger a run, so every one of those simply
-        leaves the guess exactly as it was.
+        its budget, the page could not be read. This exists to improve an answer, never to
+        endanger a run.
         """
         if entry.release_path is None:
             return None
@@ -440,12 +583,37 @@ class Pipeline:
             # Written only on success: a page that failed to answer is worth asking again,
             # while an id, once known, is true forever.
             self._release_ids.put(entry.release_path, imdb_id)
-        return next(
-            (candidate for candidate in candidates if candidate.imdb_id == imdb_id), None
-        )
+        return imdb_id
+
+    async def _confirm_by_imdb(
+        self, radarr: object, imdb_id: str | None, candidates: list[RadarrLookupResult]
+    ) -> RadarrLookupResult | None:
+        """The film carrying that id: among what the search found, else by asking for it.
+
+        Radarr's title search can miss a film entirely when Mojo spells it differently, which
+        is exactly when an id is the only thing left to go on. A failure here leaves whatever
+        the run already had, like every other step that exists only to improve a guess.
+        """
+        if imdb_id is None:
+            return None
+        found = next((item for item in candidates if item.imdb_id == imdb_id), None)
+        if found is not None:
+            return found
+        try:
+            exact = await radarr.lookup(RADARR_IMDB_TERM.format(imdb_id=imdb_id))
+        except RadarrError:
+            return None
+        return next((item for item in exact if item.imdb_id == imdb_id), None)
 
     def _save_failed(
-        self, report_id: str, run_at: datetime, trigger: str, week: str, status: str, error: str
+        self,
+        report_id: str,
+        run_at: datetime,
+        trigger: str,
+        week: str,
+        status: str,
+        error: str,
+        config: _RunConfig,
     ) -> Report:
         report = Report(
             id=report_id,
@@ -453,12 +621,14 @@ class Pipeline:
             trigger=trigger,
             status=status,
             week=week,
-            region=self._region(),
+            region=config.region,
             totals=ReportTotals(movies=0, matched=0),
             error=error,
         )
+        if week != boxoffice.CURRENT_WEEK:
+            self._reports.drop_failures_for_week(week)
         self._reports.save(report)
-        self._reports.prune(self._report_keep())
+        self._reports.prune(config.report_keep)
         self._audit.record(AuditAction.PIPELINE_RUN, trigger=trigger, week=week, status=status)
         return report
 

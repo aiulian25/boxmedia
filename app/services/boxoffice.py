@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import quote, urljoin
 
 import httpx
@@ -52,10 +54,38 @@ REGIONS: dict[str, str] = {
     "BR": "Brazil",
 }
 DEFAULT_CURRENCY_SYMBOL = "$"
+CHART_PERIOD_WEEKLY = "weekly"
+CHART_PERIOD_WEEKEND = "weekend"
 # The symbol in front of an amount: one to three non-digit characters, and only when
 # digits actually follow. "A$", "R$", "NZ$" and "€" all fit; a "-" in an empty cell does
 # not, because nothing follows it.
 _CURRENCY_RE = re.compile(r"^\s*([^\d\s,.]{1,3})\s*[\d]")
+
+
+class ChartScope(NamedTuple):
+    """Which market's money a chart's figures are, and over what period. Figures with different
+    scopes can never be added or ranked together, even when they print the same symbol.
+
+    The currency is the literal symbol from the page, never an inferred ISO code: "$" alone
+    does not say which dollar, which is why the region is part of this.
+    """
+
+    region: str = DOMESTIC_REGION
+    currency: str = DEFAULT_CURRENCY_SYMBOL
+
+    @property
+    def period(self) -> str:
+        """Follows from the region, as `week_chart_url` does, so it needs no storing and a
+        report written before this existed already has the right answer."""
+        return CHART_PERIOD_WEEKLY if self.region == DOMESTIC_REGION else CHART_PERIOD_WEEKEND
+
+    @property
+    def chart_name(self) -> str:
+        return f"{REGIONS.get(self.region, self.region)} {self.period}"
+
+    @property
+    def label(self) -> str:
+        return f"{self.chart_name} · {self.currency}"
 
 
 def validated_region(value: object) -> str:
@@ -275,10 +305,28 @@ _PERCENT_RE = re.compile(
     rf"(?P<sign>[{re.escape('+' + _MINUS_SIGNS)}])?\s*(?P<whole>[\d,]+)(?:\.\d+)?\s*%"
 )
 _BILLION = 1_000_000_000
+# A required figure as printed: up to three symbol characters, then digits, optionally in
+# groups of three. Deliberately not "any digits in the cell": that reads "$1.5M" as 15 and
+# would store it as a confident figure. A dash, an empty cell or a suffix all fail to match.
+_REQUIRED_AMOUNT_RE = re.compile(r"[^\d\s,.]{0,3}\s*(?:\d{1,3}(?:[,.\s]\d{3})+|\d+)")
+_REQUIRED_WEEKS_RE = re.compile(r"\d{1,3}(?:,\d{3})*")
+_STATED_UNKNOWN = frozenset(("-", "\u2212", "\u2013", "\u2014"))  # hyphen, minus, en and em dash
+
+
+# How an unreachable page's failure reads in a stored report. A constant because telling a
+# passing outage from a week with no data is decided from this text: failures are stored as
+# sentences, and reports written before this distinction existed have only that to go on.
+FETCH_FAILED_PREFIX = "could not fetch box-office chart"
+NO_DATA_PREFIX = "No box-office data available"
 
 
 class ScrapeError(Exception):
     """The box-office chart could not be fetched or parsed."""
+
+
+class MalformedChartError(ScrapeError):
+    """The page has a chart, and it is not whole. Kept apart from "no data": the source has
+    the week and something is wrong with what it sent, which an admin may want to look at."""
 
 
 class WeekNotPublishedError(ScrapeError):
@@ -296,7 +344,10 @@ class BoxOfficeEntry(BaseModel):
     rank: int = Field(ge=1)
     title: str = Field(min_length=1)
     gross_amount: int = Field(ge=0)
-    weeks_in_release: int = Field(ge=1)
+    # None when Mojo itself prints a dash, which real charts do mid-table (New Zealand's
+    # 2026W41, rank 18). Unknown is the truth there: "1" would be invented, and refusing would
+    # cost the whole week. A blank or garbled cell is still refused; see `_week_count`.
+    weeks_in_release: int | None = Field(ge=1)
     # Mojo's "Total Gross" — the film's running box-office total, not this week's take.
     # Optional: it is shown beside the weekly figure, never used to decide anything, so a
     # layout without the column must still yield a usable chart rather than no chart.
@@ -399,73 +450,100 @@ def _locate_chart(soup: BeautifulSoup) -> tuple[list, dict[str, int]]:
     raise ScrapeError("box-office results table not found (page layout may have changed)")
 
 
+def _required_gross(text: str, rank: int) -> int:
+    """The week's take as printed, or a refusal. Zero is a figure; absent is not."""
+    if not _REQUIRED_AMOUNT_RE.fullmatch(text):
+        raise MalformedChartError(f"rank {rank} has no usable gross ({text[:20]!r})")
+    return int("".join(character for character in text if character.isdigit()))
+
+
+def _week_count(text: str, rank: int) -> int | None:
+    """The weeks in release, None if Mojo states it does not know, or a refusal."""
+    if text in _STATED_UNKNOWN:
+        return None
+    if not _REQUIRED_WEEKS_RE.fullmatch(text):
+        raise MalformedChartError(f"rank {rank} has no usable week count ({text[:20]!r})")
+    return int(text.replace(",", ""))
+
+
+def _ranked_row(cells: list, indices: dict[str, int], rank: int) -> BoxOfficeEntry:
+    """One row that will be stored, or a refusal naming what is wrong with it."""
+    highest_required = max(indices[column] for column in _REQUIRED_COLUMNS)
+    if len(cells) <= highest_required:
+        raise MalformedChartError(f"rank {rank} is missing cells")
+    gross_text = cells[indices["gross"]].get_text(strip=True)
+    release_cell = cells[indices["release"]]
+
+    def optional(column: str, read: Callable[[str], int | None]) -> int | None:
+        # A layout without one of these still yields a chart, and "-" in one is None.
+        index = indices.get(column)
+        if index is None or len(cells) <= index:
+            return None
+        return read(cells[index].get_text(strip=True))
+
+    try:
+        return BoxOfficeEntry(
+            rank=rank,
+            title=release_cell.get_text(strip=True),
+            gross_amount=_required_gross(gross_text, rank),
+            weeks_in_release=_week_count(cells[indices["weeks"]].get_text(strip=True), rank),
+            total_gross=optional(TOTAL_GROSS_COLUMN, _clean_int),
+            currency_symbol=_currency_prefix(gross_text),
+            theaters=optional(THEATERS_COLUMN, _clean_int),
+            gross_change_pct=optional(GROSS_CHANGE_COLUMN, _clean_percent),
+            release_path=_release_path(release_cell),
+        )
+    except ValidationError as exc:
+        fields = ", ".join(str(error["loc"][0]) for error in exc.errors())
+        raise MalformedChartError(f"rank {rank} has invalid values ({fields})") from exc
+
+
 def parse_chart(html: str, *, top_n: int = TOP_N) -> list[BoxOfficeEntry]:
     """Pure parse: HTML -> validated top-`top_n` entries. Raises ScrapeError on anomaly.
 
     A chart shorter than `top_n` yields everything it has; the completeness check below
     is against MIN_EXPECTED_ROWS, so asking for more never turns a valid week into an error.
+
+    A row whose rank cell is a plain number is a film. Anything else is an ad or separator
+    and is skipped. Every film inside the requested depth has to be whole, because one
+    quietly dropped or filled in would replace a good stored week with a wrong one. Below
+    that depth nothing is stored, so a tail row must not cost a week its chart.
     """
     soup = BeautifulSoup(html, "html.parser")
     data_rows, indices = _locate_chart(soup)
 
-    entries: list[BoxOfficeEntry] = []
-    # Bounded by the REQUIRED columns only: total gross is optional, and counting its
-    # index here would reject rows this parser accepts today.
-    highest_index = max(indices[column] for column in _REQUIRED_COLUMNS)
-    total_index = indices.get(TOTAL_GROSS_COLUMN)
-    theaters_index = indices.get(THEATERS_COLUMN)
-    change_index = indices.get(GROSS_CHANGE_COLUMN)
+    ranked: list[int] = []
+    wanted: list[tuple[int, list]] = []
     for row in data_rows:
         cells = row.find_all(["td", "th"])
-        if len(cells) <= highest_index:
+        if len(cells) <= indices["rank"]:
             continue
-        rank = _clean_int(cells[indices["rank"]].get_text(strip=True))
-        if rank is None:
+        rank_text = cells[indices["rank"]].get_text(strip=True)
+        if not rank_text.isdecimal():
             continue  # not a movie row (ad/section separator)
-        gross_text = cells[indices["gross"]].get_text(strip=True)
-        gross = _clean_int(gross_text)
-        weeks = _clean_int(cells[indices["weeks"]].get_text(strip=True))
-        release_cell = cells[indices["release"]]
-        title = release_cell.get_text(strip=True)
-        release_path = _release_path(release_cell)
-        total_gross = None
-        if total_index is not None and len(cells) > total_index:
-            total_gross = _clean_int(cells[total_index].get_text(strip=True))
-        theaters = None
-        if theaters_index is not None and len(cells) > theaters_index:
-            theaters = _clean_int(cells[theaters_index].get_text(strip=True))
-        gross_change_pct = None
-        if change_index is not None and len(cells) > change_index:
-            gross_change_pct = _clean_percent(cells[change_index].get_text(strip=True))
-        try:
-            entries.append(
-                BoxOfficeEntry(
-                    rank=rank,
-                    title=title,
-                    gross_amount=gross if gross is not None else 0,
-                    weeks_in_release=weeks if weeks is not None else 1,
-                    total_gross=total_gross,
-                    currency_symbol=_currency_prefix(gross_text),
-                    theaters=theaters,
-                    gross_change_pct=gross_change_pct,
-                    release_path=release_path,
-                )
-            )
-        except ValidationError:
-            continue
+        rank = int(rank_text)
+        ranked.append(rank)
+        if rank <= top_n:
+            wanted.append((rank, cells))
 
-    if len(entries) < MIN_EXPECTED_ROWS:
+    if len(ranked) < MIN_EXPECTED_ROWS:
         # The table parsed cleanly with the right columns but has too few rows. That's
         # almost always an in-progress week BOM hasn't fully reported yet — NOT a layout
         # change (that surfaces as "results table not found" in _locate_chart). Say so
         # honestly so a re-run of the current week isn't blamed on the scraper.
         raise ScrapeError(
-            f"only {len(entries)} title(s) listed for this week — it may not be fully "
+            f"only {len(ranked)} title(s) listed for this week — it may not be fully "
             f"reported yet (a complete week lists {MIN_EXPECTED_ROWS}+). Use Run current "
             "week, or pick a completed past week."
         )
+    # Every real chart read runs 1, 2, 3 without a break, so a gap or repeat at the top is a
+    # row lost or mangled upstream, and five survivors must not pass for a chart.
+    top_ranks = sorted(ranked)[:top_n]
+    if top_ranks != list(range(1, len(top_ranks) + 1)):
+        raise MalformedChartError(f"chart ranks are not continuous from 1: {top_ranks[:top_n]}")
+    entries = [_ranked_row(cells, indices, rank) for rank, cells in wanted]
     entries.sort(key=lambda entry: entry.rank)
-    return entries[:top_n]
+    return entries
 
 
 async def fetch_weekly_chart(
@@ -499,9 +577,11 @@ async def fetch_weekly_chart(
             html = await _get_text(client, week_chart_url(url, candidate, area=area))
             try:
                 return (candidate or CURRENT_WEEK, parse_chart(html, top_n=top_n))
-            except ScrapeError:
+            except ScrapeError as exc:
                 if position < len(candidates) - 1:
                     continue  # current-week lookback: step back to the previous week
+                if isinstance(exc, MalformedChartError):
+                    raise  # the week exists, so "no data" would misreport what went wrong
                 if week and week != CURRENT_WEEK:
                     # A picked/re-run week is fetched exactly. Asked only on THIS path, so
                     # a chart that parses — every scheduled run and backfill — costs no
@@ -514,14 +594,14 @@ async def fetch_weekly_chart(
                             f"newest is {latest}."
                         ) from None
                     raise ScrapeError(
-                        f"No box-office data available for week {week} — it may be in the "
+                        f"{NO_DATA_PREFIX} for week {week} — it may be in the "
                         "future or not yet reported. Pick a completed past week, or use Run "
                         "current week."
                     ) from None
                 raise  # current week exhausted its lookback -> surface the underlying error
         raise ScrapeError("no box-office week could be resolved")  # unreachable: guards len>=1
     except httpx.HTTPError as exc:
-        raise ScrapeError(f"could not fetch box-office chart: {exc}") from exc
+        raise ScrapeError(f"{FETCH_FAILED_PREFIX}: {exc}") from exc
     except WeekNotPublishedError:
         raise  # not a layout problem, so nothing for the Maintenance card to show
     except ScrapeError:

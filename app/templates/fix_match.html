@@ -6,6 +6,15 @@
   <p class="subtle">Radarr's results for “{{ term }}”. Pick the correct title and the chart entry is re-pointed at it — then you can add it as usual.</p>
 </section>
 
+{% if candidates and (scope.same or scope.unverified or scope.other) %}
+{# Said before anything is pressed, because this change does not stop at this row. #}
+<div class="app-card mb-6">
+  {% if scope.same %}<p>This correction will update: <strong>{{ scope.same|join(", ") }}</strong>, the same release.</p>{% endif %}
+  {% if scope.unverified %}<p>Also, unless you choose otherwise: <strong>{{ scope.unverified|join(", ") }}</strong>. These recorded no source, so they are probably this film but could be another with the same title.</p>{% endif %}
+  {% if scope.other %}<p class="subtle">Not changed: {{ scope.other|join(", ") }}, a different release with this title.</p>{% endif %}
+</div>
+{% endif %}
+
 {% if candidates %}
 <div class="app-card">
   <table class="detail-table">
@@ -43,6 +52,9 @@
             <input type="hidden" name="term" value="{{ term }}">
             <input type="hidden" name="tmdb_id" value="{{ candidate.tmdb_id }}">
             <button type="submit" class="btn-add">Use this</button>
+            {% if scope.unverified %}
+            <button type="submit" name="leave_unverified" value="on" class="btn-ignore">Use this, leave those weeks</button>
+            {% endif %}
           </form>
         </td>
       </tr>

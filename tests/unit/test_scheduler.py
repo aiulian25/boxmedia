@@ -36,7 +36,7 @@ class StubPipeline:
     def __init__(self) -> None:
         self.triggers: list[str] = []
 
-    async def run(self, *, trigger: str) -> Report:
+    async def run(self, *, trigger: str, admission_timeout: float | None = None) -> Report:
         self.triggers.append(trigger)
         return Report(
             id="report-stub", run_at="2026-08-12T00:00:00+00:00", trigger=trigger,
@@ -528,8 +528,8 @@ async def test_a_healthy_scheduled_run_fetches_the_weeks_the_history_skipped(
 
 async def test_a_failed_scheduled_run_fetches_nothing_else(tmp_path: Path) -> None:
     """A failed run usually means Radarr or Mojo is unreachable. Filling then would record
-    every missing week as failed, and a failed week is never offered again — the outage
-    would cost every week it overlapped, permanently."""
+    every missing week as failed, and spend a retry on each for an outage they had no part
+    in."""
     backfill = _RecordingBackfill()
     scheduler = BoxMediaScheduler(
         _FailingPipeline(), interval_hours=WEEKLY_HOURS,

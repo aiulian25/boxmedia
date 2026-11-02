@@ -74,14 +74,24 @@ class Candidate:
     payload: Any
 
 
+@dataclass(frozen=True)
+class TitleMatch:
+    """A candidate with the right title, and whether that settled which film it is."""
+
+    payload: Any
+    # Another candidate has the same title: a remake, usually. Picking one is a guess,
+    # however exact the title looks, and only a stronger signal can make it more.
+    ambiguous: bool
+
+
 def find_match(
     title: str, candidates: list[Candidate], *, year: int | None = None
-) -> Any | None:
-    """Return the payload of the candidate whose title matches, else None.
+) -> TitleMatch | None:
+    """The candidate whose title matches, else None.
 
-    When several candidates share a normalized title (a remake — e.g. two
-    "Nosferatu"), a supplied `year` selects the matching release; otherwise the
-    first match wins.
+    When several candidates share a normalized title (a remake — e.g. two "Nosferatu"), a
+    supplied `year` selects the matching release. Otherwise the first is returned, marked
+    ambiguous, so that no caller can mistake it for an identification.
     """
     target = normalize_title(title)
     matches = [c for c in candidates if normalize_title(c.title) == target]
@@ -90,5 +100,5 @@ def find_match(
     if year is not None:
         for candidate in matches:
             if candidate.year == year:
-                return candidate.payload
-    return matches[0].payload
+                return TitleMatch(candidate.payload, ambiguous=False)
+    return TitleMatch(matches[0].payload, ambiguous=len(matches) > 1)

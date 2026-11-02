@@ -202,6 +202,10 @@ class PosterPrefetcher:
         if self._pending:
             self._background.start(PREFETCH_KEY, self._drain)
 
+    def clear(self) -> None:
+        """Forget what was queued — a restore may have replaced what any page will ask for."""
+        self._pending.clear()
+
     async def _drain(self) -> None:
         limit = asyncio.Semaphore(PREFETCH_CONCURRENCY)
 

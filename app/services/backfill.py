@@ -14,9 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import random
+from datetime import UTC, datetime
 
+from app.services.boxoffice import WeekNotPublishedError
+from app.services.ingestion_state import IngestionStateStore
+from app.services.maintenance import MaintenanceGate
 from app.services.pipeline import Pipeline
-from app.services.reports import RunTrigger
+from app.services.reports import RunStatus, RunTrigger
 
 # The pause between weeks, plus up to JITTER seconds. Twelve weeks therefore takes three
 # minutes at least — which is the intended shape: a backfill is something left to get on
@@ -34,11 +38,22 @@ class BackfillRunner:
     exactly the traffic the delay exists to avoid.
     """
 
-    def __init__(self, pipeline: Pipeline) -> None:
+    def __init__(
+        self,
+        pipeline: Pipeline,
+        maintenance: MaintenanceGate | None = None,
+        ingestion: IngestionStateStore | None = None,
+    ) -> None:
         self._pipeline = pipeline
+        self._maintenance = maintenance or MaintenanceGate()
+        # Where a failed week's retry count lives, so backoff survives a restart. Optional
+        # so tests can build a runner without one; the app always passes it.
+        self._ingestion = ingestion
         self._task: asyncio.Task | None = None
         self._weeks: list[str] = []
         self._done = 0
+        self._failed = 0
+        self._deferred = 0
         self._current: str | None = None
 
     def running(self) -> bool:
@@ -49,23 +64,31 @@ class BackfillRunner:
         return {
             "running": self.running(),
             "done": self._done,
+            "failed": self._failed,
+            "deferred": self._deferred,
             "total": len(self._weeks),
             "current_week": self._current,
         }
 
     def start(self, weeks: list[str]) -> bool:
-        """Begin a backfill. False when one is already running, or there is nothing to do.
+        """Begin a backfill. False when one is running, there is nothing to do, or a
+        maintenance has the door closed.
 
         The caller passes the weeks; nothing here reads them from a request. They are
         derived server-side from stored history, so no submitted value can steer what gets
         fetched — the same rule the add route follows for connection ids.
         """
-        if self.running() or not weeks:
+        if self.running() or not weeks or not self._maintenance.try_enter():
             return False
         self._weeks = list(weeks)
         self._done = 0
+        self._failed = 0
+        self._deferred = 0
         self._current = None
         self._task = asyncio.create_task(self._run())
+        # A callback rather than a `finally`: a task cancelled before its first step never
+        # enters `_run`, and the gate would wait for it for ever.
+        self._task.add_done_callback(lambda _: self._maintenance.leave())
         return True
 
     async def _run(self) -> None:
@@ -73,7 +96,6 @@ class BackfillRunner:
             for index, week in enumerate(self._weeks):
                 self._current = week
                 await self._fetch(week)
-                self._done += 1
                 if index < len(self._weeks) - 1:
                     await asyncio.sleep(
                         BACKFILL_DELAY_SECONDS + random.uniform(0, BACKFILL_JITTER_SECONDS)  # noqa: S311
@@ -87,22 +109,45 @@ class BackfillRunner:
         """One week through the ordinary pipeline, so everything it does still applies.
 
         Dedupe, report-id reuse, retention and the audit line are the pipeline's, not
-        this loop's. A run that fails has already written its own failed report — that
-        card IS the record — so the loop notes nothing and moves on. Any other exception
-        is swallowed for the same reason: one bad week must not abandon the other eleven.
+        this loop's. A run that fails has already written its own failed report — that card
+        IS the record — so the loop counts it, spends one of its retries and moves on. A week
+        Mojo has not published stores nothing and spends nothing: it is early, not failed.
+        Any other exception is swallowed for the same reason: one bad week must not abandon
+        the other eleven.
         """
         try:
-            await self._pipeline.run(trigger=RunTrigger.MANUAL, week=week)
+            report = await self._pipeline.run(trigger=RunTrigger.MANUAL, week=week)
         except asyncio.CancelledError:
             raise  # shutdown is not a week failing
+        except WeekNotPublishedError:
+            self._deferred += 1
+            return
         except Exception as exc:  # noqa: BLE001 — the stored report carries the detail
             print(f"backfill: week {week} failed: {exc}", flush=True)
+            self._note_failure(week)
+            return
+        if report.status != RunStatus.OK:
+            self._note_failure(week)
+            return
+        self._done += 1
+        if self._ingestion is not None:
+            self._ingestion.clear_week(week)
+
+    def _note_failure(self, week: str) -> None:
+        self._failed += 1
+        if self._ingestion is not None:
+            self._ingestion.record_week_failure(week, datetime.now(UTC))
 
     def cancel(self) -> None:
-        """Stop at the next await. Called from the lifespan's `finally`.
+        """Stop at the next await. Called from the lifespan's `finally`, and from a worker
+        thread by a restore, which is what the maintenance gate's count then waits on.
 
         A half-finished backfill leaves whole reports behind, never a partial one: the
         pipeline writes each week atomically, and the loop only ever sits between weeks.
         """
-        if self.running():
-            self._task.cancel()
+        if not self.running():
+            return
+        try:
+            self._task.get_loop().call_soon_threadsafe(self._task.cancel)
+        except RuntimeError:
+            pass  # its loop has closed, and nothing on a closed loop is still running

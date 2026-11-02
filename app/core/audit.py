@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
+
+from app.core import filestore
 
 AUDIT_FILENAME = "audit.jsonl"
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024  # rotate at 5 MB
@@ -49,6 +50,7 @@ class AuditAction:
     APP_REMOVED = "app_removed"
     APP_TESTED = "app_tested"
     DISCOVER_REFRESHED = "discover_refreshed"
+    UPCOMING_REFRESHED = "upcoming_refreshed"
     CALENDAR_REFRESHED = "calendar_refreshed"
     REFRESH_FAILED = "refresh_failed"
     DISCOVERY_KEY_SAVED = "discovery_key_saved"  # noqa: S105 — action name, not a secret
@@ -84,7 +86,13 @@ def _clip_actor(actor: str | None) -> str | None:
 
 
 class AuditLog:
-    """Thread-safe append-only JSONL writer with size-based rotation."""
+    """Thread-safe append-only JSONL writer with size-based rotation.
+
+    Serialized by the filestore write lock rather than a lock of its own. A backup reads
+    logs/ under that lock and a restore swaps it under that lock, and an append that ignored
+    it could rotate a file out from under the read, or recreate logs/ between a restore's
+    two renames.
+    """
 
     def __init__(
         self,
@@ -96,7 +104,6 @@ class AuditLog:
         self._path = path
         self._max_bytes = max_bytes
         self._keep = keep
-        self._lock = threading.Lock()
 
     def record(
         self,
@@ -115,7 +122,7 @@ class AuditLog:
         entry.update(details)
         line = json.dumps(entry, ensure_ascii=False) + "\n"
         encoded = line.encode("utf-8")
-        with self._lock:
+        with filestore.write_lock():
             self._rotate_if_needed(len(encoded))
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("ab") as handle:

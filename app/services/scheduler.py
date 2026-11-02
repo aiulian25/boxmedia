@@ -10,7 +10,9 @@ same-day reports in the weekly-view mockup.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -20,10 +22,19 @@ from app.core.audit import AuditAction, AuditLog
 from app.services.backfill import BackfillRunner
 from app.services.backup import DEFAULT_KEEP, BackupError, BackupService
 from app.services.filters import SCHEDULE_MODE_CADENCE
+from app.services.ingestion_state import (
+    OUTCOME_CHANGED,
+    OUTCOME_FAILED,
+    OUTCOME_UNCHANGED,
+    IngestionStateStore,
+    failure_class_of,
+    retry_is_due,
+)
+from app.services.maintenance import MaintenanceGate
 from app.services.pipeline import Pipeline
 from app.services.radarr import RadarrError
 from app.services.refresh import ServerRefresher
-from app.services.reports import Report, ReportsStore, RunStatus, RunTrigger
+from app.services.reports import MAX_BACKFILL_WEEKS, Report, ReportsStore, RunStatus, RunTrigger
 from app.services.sonarr import SonarrError
 
 JOB_ID = "weekly-box-office"
@@ -74,6 +85,37 @@ def _jitter_for(interval_hours: int) -> int:
     return min(MAX_JITTER_SECONDS, interval_hours * SECONDS_PER_HOUR // 4)
 
 
+def _skipped_during_maintenance(
+    body: Callable[[BoxMediaScheduler], Awaitable[None]],
+) -> Callable[[BoxMediaScheduler], Awaitable[None]]:
+    """Run a job only if the gate admits it, and count it until it has really finished.
+
+    Skipped rather than queued: a restore lasts seconds, and every job here fires again on
+    its schedule. A job already running is waited for by the restore, never cancelled.
+    """
+
+    @wraps(body)
+    async def run(self: BoxMediaScheduler) -> None:
+        with self._maintenance.admitted() as admitted:
+            if admitted:
+                await body(self)
+
+    return run
+
+
+def _outcome_of(report: Report, started: datetime) -> str:
+    """What a finished run came to. A run that recorded anything stamps itself after it
+    started; one that found the chart unchanged hands back the stored report, older stamp
+    and all, and leaves its bytes alone."""
+    if report.status != RunStatus.OK:
+        return OUTCOME_FAILED
+    try:
+        recorded_now = datetime.fromisoformat(report.run_at) >= started
+    except (ValueError, TypeError):
+        return OUTCOME_UNCHANGED  # a hand-edited stamp on a stored report, so not this run's
+    return OUTCOME_CHANGED if recorded_now else OUTCOME_UNCHANGED
+
+
 class BoxMediaScheduler:
     def __init__(
         self,
@@ -88,8 +130,14 @@ class BoxMediaScheduler:
         audit: AuditLog | None = None,
         reports: ReportsStore | None = None,
         backfill: BackfillRunner | None = None,
+        maintenance: MaintenanceGate | None = None,
+        ingestion: IngestionStateStore | None = None,
     ) -> None:
         self._pipeline = pipeline
+        self._maintenance = maintenance or MaintenanceGate()
+        # What actually happened at each check. Optional so tests can build a scheduler
+        # without one; the app always passes it.
+        self._ingestion = ingestion
         self._interval_hours = interval_hours
         self._schedule_mode = schedule_mode
         # Optional: without a backup service (or with interval 0) the scheduler simply
@@ -122,13 +170,23 @@ class BoxMediaScheduler:
         """
         return self._last_scheduled_run(reports)
 
-    def _last_scheduled_run(self, reports: list[Report] | None = None) -> datetime | None:
-        """The stored answer, or None.
+    def last_outcome(self) -> str | None:
+        """What the last check came to, or None when there is no record of it finishing."""
+        return self._ingestion.load().outcome if self._ingestion else None
 
-        Read from the reports rather than a separate state file: every run writes one,
-        including a failed scrape, so this is already the record of "we went to Mojo".
-        Counting a failure keeps a broken scraper from being retried on every restart.
+    def _last_scheduled_run(self, reports: list[Report] | None = None) -> datetime | None:
+        """When a check last went to Mojo, or None.
+
+        From the attempt record, which every check writes whatever it finds. Counting a
+        failure keeps a broken scraper from being retried on every restart.
+
+        The reports are what an install has before its first check with this record, and
+        what is left if the record is damaged. They can only under-report: an unchanged
+        check writes none, and a manual run takes over a week's.
         """
+        recorded = self._ingestion.load().attempted_at if self._ingestion else None
+        if recorded is not None:
+            return recorded
         if reports is None:
             if self._reports is None:
                 return None
@@ -220,6 +278,12 @@ class BoxMediaScheduler:
         Box Office Mojo on the same second, and the cadence needs it MORE than an interval
         does, because every install on it shares the same four hours.
         """
+        if self._schedule_mode != SCHEDULE_MODE_CADENCE and self._scheduler.get_job(
+            CATCHUP_JOB_ID
+        ):
+            # Cadence mode's one-shot. Interval mode has its own anchor, and left pending
+            # this would fire an extra check nobody scheduled.
+            self._scheduler.remove_job(CATCHUP_JOB_ID)
         if self._schedule_mode == SCHEDULE_MODE_CADENCE:
             self._scheduler.add_job(
                 self._run_scheduled,
@@ -283,9 +347,22 @@ class BoxMediaScheduler:
             replace_existing=True,
         )
 
+    @_skipped_during_maintenance
     async def _run_scheduled(self) -> None:
-        report = await self._pipeline.run(trigger=RunTrigger.SCHEDULED)
+        started = datetime.now(UTC)
+        if self._ingestion is not None:
+            self._ingestion.record_attempt(started)
+        try:
+            report = await self._pipeline.run(trigger=RunTrigger.SCHEDULED)
+        except Exception:
+            self._record_outcome(OUTCOME_FAILED)
+            raise
+        self._record_outcome(_outcome_of(report, started))
         self._fill_missing_weeks(report)
+
+    def _record_outcome(self, outcome: str) -> None:
+        if self._ingestion is not None:
+            self._ingestion.record_outcome(outcome, datetime.now(UTC))
 
     def _fill_missing_weeks(self, report: Report) -> None:
         """Fetch every week the history skipped — the half of the schedule nobody sees.
@@ -307,11 +384,28 @@ class BoxMediaScheduler:
             return
         if report.status != RunStatus.OK:
             return
-        missing = self._reports.missing_weeks()
-        if missing:
+        weeks = sorted({*self._reports.missing_weeks(), *self._weeks_due_a_retry()})
+        if weeks:
             # Single-flight, polite and capped per start; a run already going says no.
-            self._backfill.start(missing)
+            self._backfill.start(weeks[:MAX_BACKFILL_WEEKS])
 
+    def _weeks_due_a_retry(self) -> list[str]:
+        """Failed weeks whose backoff has passed and whose attempts are not spent.
+
+        This is why a passing outage does not leave a permanent hole: it runs after a healthy
+        check, when whatever failed those weeks is most likely over.
+        """
+        if self._ingestion is None:
+            return []
+        retries = self._ingestion.week_retries()
+        now = datetime.now(UTC)
+        return [
+            week
+            for week, report in self._reports.failed_weeks().items()
+            if retry_is_due(retries.get(week), failure_class_of(report), now)
+        ]
+
+    @_skipped_during_maintenance
     async def _run_backup(self) -> None:
         """Take an unattended encrypted snapshot, pruned to the configured retention.
 
@@ -320,9 +414,9 @@ class BoxMediaScheduler:
         stalling the event loop. A failure is recorded and swallowed — a missed backup
         must not kill the scheduler.
 
-        OSError is caught alongside BackupError because that is what the create path
-        actually raises: every BackupError in the backup service comes from the restore
-        helpers, while a full disk surfaces as OSError out of `atomic_write_bytes`. A
+        OSError is caught alongside BackupError because the create path raises both: an
+        install past the archive budgets is a BackupError, while a full disk surfaces as
+        OSError out of `atomic_write_bytes`. A
         programming error is deliberately NOT caught — that should still surface loudly.
         """
         if self._backups is None:
@@ -344,6 +438,7 @@ class BoxMediaScheduler:
                 )
             print(f"scheduled backup failed: {exc}", flush=True)
 
+    @_skipped_during_maintenance
     async def _run_calendar_refresh(self) -> None:
         """Re-read the week from every connection, unattended.
 
@@ -368,6 +463,7 @@ class BoxMediaScheduler:
         if self._audit is not None:
             self._audit.record(AuditAction.CALENDAR_REFRESHED, complete=complete)
 
+    @_skipped_during_maintenance
     async def _run_series_refresh(self) -> None:
         """Re-read what every Sonarr holds, unattended.
 
@@ -388,8 +484,10 @@ class BoxMediaScheduler:
             self._audit.record(AuditAction.REFRESH_FAILED, job=job_id, error=str(exc))
         print(f"scheduled {job_id} failed: {exc}", flush=True)
 
-    async def run_now(self) -> Report:
-        return await self._pipeline.run(trigger=RunTrigger.MANUAL)
+    async def run_now(self, *, admission_timeout: float | None = None) -> Report:
+        return await self._pipeline.run(
+            trigger=RunTrigger.MANUAL, admission_timeout=admission_timeout
+        )
 
     def reschedule(
         self,

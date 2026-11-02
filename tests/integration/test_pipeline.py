@@ -12,7 +12,9 @@ import respx
 from app.core import crypto
 from app.core.audit import AuditLog
 from app.core.config import Settings
+from app.services import backfill as backfill_module
 from app.services.apps import AppNotFoundError, AppsStore
+from app.services.backfill import BackfillRunner
 from app.services.boxoffice import (
     MAX_RELEASE_LOOKUPS_PER_RUN,
     BoxOfficeEntry,
@@ -22,6 +24,7 @@ from app.services.boxoffice import (
 from app.services.corrections import Correction, CorrectionStore
 from app.services.filters import FiltersConfig, FiltersStore
 from app.services.ignore import IgnoreStore
+from app.services.ingestion_state import IngestionStateStore
 from app.services.pipeline import CARD_GENRES, RECONCILE_CONCURRENCY, Pipeline
 from app.services.radarr import RadarrLookupResult, RadarrMovie
 from app.services.release_ids import RELEASE_IDS_FILENAME, ReleaseIdCache
@@ -36,6 +39,7 @@ from app.services.reports import (
     RunStatus,
     RunTrigger,
 )
+from app.services.scheduler import BoxMediaScheduler
 from tests.conftest import AppHarness
 
 APP_ID = "app-primary"
@@ -524,6 +528,118 @@ async def test_a_week_whose_last_attempt_failed_is_still_recorded(env) -> None:
 
     assert report.status == RunStatus.OK
     assert len(reports_store.list_reports()) == 2
+
+
+async def test_a_week_failing_again_replaces_its_failure(env) -> None:
+    """A week retried for weeks must not fill the retention and push real weeks out."""
+    pipeline, reports_store = _build_pipeline(env, _radarr(), _config(), _chart())
+
+    async def _fetch_fails(week=None):  # noqa: ANN001, ANN202, ARG001
+        raise ScrapeError("could not fetch box-office chart: timed out")
+
+    pipeline._fetch_chart = _fetch_fails
+    for _ in range(3):
+        await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
+
+    assert len(reports_store.list_reports()) == 1
+
+
+async def test_a_week_failing_after_its_chart_keeps_the_chart(env) -> None:
+    pipeline, reports_store = _build_pipeline(env, _radarr(), _config(), _chart())
+    await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
+
+    async def _fetch_fails(week=None):  # noqa: ANN001, ANN202, ARG001
+        raise ScrapeError("could not fetch box-office chart: timed out")
+
+    pipeline._fetch_chart = _fetch_fails
+    await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
+
+    assert reports_store.latest_for_week("2026W02").status == RunStatus.OK
+    assert reports_store.failed_weeks() == {}
+
+
+async def test_an_outage_heals_itself_with_nobody_at_the_page(env, monkeypatch) -> None:  # noqa: ANN001
+    """The whole path with the real pipeline, runner and scheduler: a week fails while the
+    source is down, a check during the outage leaves it alone, and the first healthy check
+    fills it. After that nothing is fetched again."""
+    settings, _audit = env
+    entries = _chart()
+    pipeline, reports_store = _build_pipeline(env, _radarr(), _config(), entries)
+    ingestion = IngestionStateStore(settings.config_dir)
+
+    async def _no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(backfill_module.asyncio, "sleep", _no_wait)
+    state = {"down": False}
+
+    async def _fetch(week=None):  # noqa: ANN001, ANN202
+        if state["down"]:
+            raise ScrapeError("could not fetch box-office chart: timed out")
+        return (week or "2026W33", entries)
+
+    pipeline._fetch_chart = _fetch
+    runner = BackfillRunner(pipeline, ingestion=ingestion)
+    scheduler = BoxMediaScheduler(
+        pipeline, interval_hours=168, reports=reports_store, ingestion=ingestion, backfill=runner,
+    )
+    for week in ("2026W30", "2026W32"):
+        await pipeline.run(trigger=RunTrigger.MANUAL, week=week)
+
+    state["down"] = True
+    await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W31")
+    await scheduler._run_scheduled()
+    assert not runner.running()
+    assert list(reports_store.failed_weeks()) == ["2026W31"]
+
+    state["down"] = False
+    await scheduler._run_scheduled()
+    await runner._task
+
+    assert reports_store.latest_for_week("2026W31").status == RunStatus.OK
+    assert reports_store.failed_weeks() == {}
+    assert runner.status()["done"] == 1
+    finished = runner._task
+    await scheduler._run_scheduled()
+    assert runner._task is finished
+
+
+def _priced_chart(symbol: str) -> list[BoxOfficeEntry]:
+    return [
+        BoxOfficeEntry(rank=1, title="Neon Rain", gross_amount=5_000_000, weeks_in_release=1,
+                       currency_symbol=symbol),
+    ]
+
+
+async def test_the_same_figures_in_different_money_are_a_new_chart(env) -> None:
+    """The fingerprint compares figures, so a corrected symbol alone used to change nothing,
+    and the week kept printing the old currency."""
+    radarr = CountingRadarr([], {"Neon Rain": []})
+    pipeline, reports_store = _build_pipeline(env, radarr, _config(), _priced_chart("$"))
+    first = await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
+
+    async def _in_euros(week=None):  # noqa: ANN001, ANN202
+        return (week, _priced_chart("€"))
+
+    pipeline._fetch_chart = _in_euros
+    await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
+
+    stored = reports_store.latest_for_week("2026W02")
+    assert stored.currency == "€"
+    assert stored.movies[0].gross_display.startswith("€")
+    assert stored.id == first.id  # still the same week's report
+    assert len(reports_store.list_reports()) == 1
+
+
+async def test_the_same_figures_in_the_same_money_are_still_no_change(env) -> None:
+    radarr = CountingRadarr([], {"Neon Rain": []})
+    pipeline, reports_store = _build_pipeline(env, radarr, _config(), _priced_chart("€"))
+    first = await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
+
+    second = await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
+
+    assert second.run_at == first.run_at
+    assert len(reports_store.list_reports()) == 1
 
 
 async def test_the_skipped_run_is_still_audited(env) -> None:
@@ -1104,7 +1220,7 @@ async def test_an_exact_title_match_never_fetches_a_release_page(env) -> None:
 
     await pipeline.run(trigger=RunTrigger.MANUAL, week="2026W02")
 
-    assert fetch.paths == []
+    assert "/release/rl1/" not in fetch.paths
     assert reports_store.latest_for_week("2026W02").movies[0].detail is None
 
 
@@ -1424,3 +1540,147 @@ async def test_a_chart_is_looked_up_several_titles_at_a_time(env) -> None:
     # More than one at once, or nothing overlapped; exactly the bound, or it is not one.
     assert 1 < radarr.peak == RECONCILE_CONCURRENCY
     assert [movie.rank for movie in report.movies] == list(range(1, 21))
+
+
+# --- a bad page cannot change a good week ---
+
+_STORED_WEEK = "2026W30"
+
+
+def _stored_week_bytes(reports: ReportsStore) -> tuple[Report, bytes]:
+    stored = reports.latest_for_week(_STORED_WEEK)
+    return stored, (reports._dir / f"{stored.id}.json").read_bytes()
+
+
+async def test_a_failed_fetch_leaves_the_stored_week_byte_identical(env) -> None:
+    """Every malformed chart reaches the pipeline as ScrapeError. It is recorded as an
+    attempt, beside the week rather than over it."""
+    radarr = FakeRadarr([], {"Neon Rain": [], "Skin Crawl": []})
+    pipeline, reports = _build_pipeline(env, radarr, _config(), _chart())
+    await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+    stored, before = _stored_week_bytes(reports)
+
+    async def malformed(week: str | None) -> tuple[str, list[BoxOfficeEntry]]:
+        raise ScrapeError("rank 1 has no usable gross ('-')")
+
+    pipeline._fetch_chart = malformed
+    failed = await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+
+    assert failed.status == RunStatus.SCRAPE_FAILED
+    assert failed.id != stored.id
+    assert _stored_week_bytes(reports) == (stored, before)
+
+
+def _long_chart(count: int) -> list[BoxOfficeEntry]:
+    return [
+        BoxOfficeEntry(rank=rank, title=f"Film {rank}", gross_amount=1_000, weeks_in_release=1)
+        for rank in range(1, count + 1)
+    ]
+
+
+async def test_a_page_cut_short_cannot_replace_a_longer_stored_week(env) -> None:
+    """Ranks 1 to 6, every figure present: nothing the parser could object to."""
+    radarr = FakeRadarr([], {})
+    full, short = _long_chart(10), _long_chart(6)
+    pipeline, reports = _build_pipeline(env, radarr, _config(), full, chart_size=lambda: 10)
+    await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+    stored, before = _stored_week_bytes(reports)
+
+    async def truncated(week: str | None) -> tuple[str, list[BoxOfficeEntry]]:
+        return week, short
+
+    pipeline._fetch_chart = truncated
+    failed = await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+
+    assert failed.status == RunStatus.SCRAPE_FAILED
+    assert "Kept the stored chart" in failed.error
+    assert _stored_week_bytes(reports) == (stored, before)
+
+
+async def test_lowering_the_depth_is_not_a_truncated_page(env) -> None:
+    radarr = FakeRadarr([], {})
+    depth = [10]
+    full, shallow = _long_chart(10), _long_chart(6)
+    pipeline, reports = _build_pipeline(env, radarr, _config(), full, chart_size=lambda: depth[0])
+    await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+    depth[0] = 6
+
+    async def as_asked(week: str | None) -> tuple[str, list[BoxOfficeEntry]]:
+        return week, shallow
+
+    pipeline._fetch_chart = as_asked
+    report = await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+
+    assert report.status == RunStatus.OK
+    assert len(reports.latest_for_week(_STORED_WEEK).movies) == 6
+
+
+async def test_a_chart_that_grew_or_was_revised_still_replaces_the_week(env) -> None:
+    """Meaningful revisions are the reason a week is fetched again, and they must not make a
+    second card."""
+    radarr = FakeRadarr([], {})
+    pipeline, reports = _build_pipeline(
+        env, radarr, _config(), _long_chart(6), chart_size=lambda: 10
+    )
+    first = await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+    revised = [
+        entry.model_copy(update={"gross_amount": 2_000}) for entry in _long_chart(8)
+    ]
+
+    async def later(week: str | None) -> tuple[str, list[BoxOfficeEntry]]:
+        return week, revised
+
+    pipeline._fetch_chart = later
+    second = await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+
+    assert second.status == RunStatus.OK
+    assert second.id == first.id
+    assert len(reports.list_reports()) == 1
+    assert reports.latest_for_week(_STORED_WEEK).movies[0].gross_amount == 2_000
+
+
+async def test_a_shorter_chart_from_another_region_is_not_a_truncation(env) -> None:
+    """A different chart entirely, and the stored one was never comparable."""
+    radarr = FakeRadarr([], {})
+    region = ["GB"]
+    pipeline, reports = _build_pipeline(
+        env, radarr, _config(), _long_chart(10), chart_size=lambda: 10, region=lambda: region[0]
+    )
+    await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+    region[0] = "NL"
+    short = _long_chart(6)
+
+    async def other(week: str | None) -> tuple[str, list[BoxOfficeEntry]]:
+        return week, short
+
+    pipeline._fetch_chart = other
+    report = await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+
+    assert report.status == RunStatus.OK
+    assert reports.latest_for_week(_STORED_WEEK).region == "NL"
+
+
+async def test_a_film_with_unknown_weeks_is_stored_as_unknown_and_renders(
+    env, harness: AppHarness
+) -> None:
+    from app.web.discover import _movie_meta
+
+    radarr = FakeRadarr([], {})
+    chart = _long_chart(6)
+    chart[0] = chart[0].model_copy(update={"weeks_in_release": None})
+    pipeline, reports = _build_pipeline(env, radarr, _config(), chart)
+
+    report = await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+
+    assert reports.get(report.id).movies[0].weeks_in_release is None
+    again = await pipeline.run(trigger=RunTrigger.MANUAL, week=_STORED_WEEK)
+    assert again.run_at == report.run_at, "unknown compares equal, so nothing is rewritten"
+    assert _movie_meta("$1.0M", None) == "$1.0M"
+    assert _movie_meta("$1.0M", 3) == "$1.0M · Wk 3"
+
+    harness.activate()
+    harness.client.app.state.reports.save(report)
+    page = harness.client.get(f"/reports/{report.id}").text
+    assert "Film 1" in page
+    assert "Wk None" not in page
+

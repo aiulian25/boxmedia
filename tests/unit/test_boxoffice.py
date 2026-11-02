@@ -17,10 +17,13 @@ from app.services.boxoffice import (
     MAX_SNAPSHOTS,
     MIN_CHART_SIZE,
     MIN_EXPECTED_ROWS,
+    REGIONS,
     RELEASE_IMDB_RE,
     SNAPSHOT_PREFIX,
     SNAPSHOT_SUFFIX,
     TOP_N,
+    ChartScope,
+    MalformedChartError,
     ScrapeError,
     WeekNotPublishedError,
     _clean_percent,
@@ -501,8 +504,11 @@ def test_a_row_missing_only_the_total_cell_is_still_kept() -> None:
     html = _chart(
         '<tr><th>Rank</th><th>Release</th><th>Gross</th><th>Weeks</th>'
         '<th>Total Gross</th></tr>',
-        short_row + _rows(5, cells='<tr><td>{rank}</td><td>Film {rank}</td>'
-                                   '<td>$4,000,000</td><td>2</td><td>$40,000,000</td></tr>'))
+        short_row + "".join(
+            f'<tr><td>{rank}</td><td>Film {rank}</td><td>$4,000,000</td>'
+            '<td>2</td><td>$40,000,000</td></tr>'
+            for rank in range(2, 7)
+        ))
 
     entries = parse_chart(html)
 
@@ -935,3 +941,186 @@ def test_the_release_lookup_budget_is_small() -> None:
     """Every lookup is another request at Box Office Mojo, and they only ever happen for
     titles Radarr could not recognise on a chart that changed."""
     assert MAX_RELEASE_LOOKUPS_PER_RUN == 5
+
+
+# --- a chart that is not whole is refused, not patched up ---
+
+_REQUIRED_HEADER = (
+    "<tr><th>Rank</th><th>Release</th><th>Gross</th><th>Theaters</th><th>Weeks</th></tr>"
+)
+
+
+def _row(rank: object, *, title="Film", gross="$1,000", weeks="2", theaters="10") -> str:
+    return (
+        f"<tr><td>{rank}</td><td>{title}{rank}</td><td>{gross}</td>"
+        f"<td>{theaters}</td><td>{weeks}</td></tr>"
+    )
+
+
+def _whole_chart(count: int = 6, **first_row: object) -> list[str]:
+    rows = [_row(rank) for rank in range(1, count + 1)]
+    if first_row:
+        rows[0] = _row(1, **first_row)
+    return rows
+
+
+def _table(rows: list[str]) -> str:
+    return _chart(_REQUIRED_HEADER, "".join(rows))
+
+
+@pytest.mark.parametrize(
+    "bad_cell",
+    [
+        {"gross": ""},
+        {"gross": "-"},
+        {"gross": "n/a"},
+        {"gross": "$1.5M"},
+        {"gross": "$1.5"},
+        {"weeks": ""},
+        {"weeks": "n/a"},
+        {"weeks": "0"},
+        {"weeks": "2.5"},
+    ],
+    ids=lambda cell: f"{next(iter(cell))}={next(iter(cell.values()))!r}",
+)
+def test_a_film_missing_a_required_figure_is_refused_not_invented(bad_cell: dict) -> None:
+    """The audit's reproduction: six rows, the first with no gross or weeks, parsed as 0 and
+    1. "$1.5M" used to read as 15, which is the same lie with more confidence."""
+    # A dash in weeks is the one exception: see the test after this.
+    with pytest.raises(ScrapeError, match="rank 1"):
+        parse_chart(_table(_whole_chart(**bad_cell)))
+
+
+@pytest.mark.parametrize("dash", ["-", "\u2212", "\u2013", "\u2014"])
+def test_a_dash_in_weeks_is_mojo_saying_it_does_not_know(dash: str) -> None:
+    """Real: New Zealand's 2026W41 prints it at rank 18, inside the deepest setting. Unknown
+    is the truth: 1 would be invented, and refusing would cost the whole week."""
+    entries = parse_chart(_table(_whole_chart(weeks=dash)))
+
+    assert entries[0].weeks_in_release is None
+    assert entries[1].weeks_in_release == 2
+
+
+def test_a_film_with_no_title_is_refused() -> None:
+    html = _table(_whole_chart()).replace("<td>Film1</td>", "<td></td>")
+    with pytest.raises(ScrapeError, match="rank 1"):
+        parse_chart(html)
+
+
+def test_a_film_cut_short_is_refused_rather_than_skipped() -> None:
+    """Skipping it leaves five survivors, which used to qualify as a chart."""
+    rows = _whole_chart()
+    rows[2] = "<tr><td>3</td><td>Film3</td></tr>"
+    with pytest.raises(ScrapeError, match="rank 3"):
+        parse_chart(_table(rows))
+
+
+@pytest.mark.parametrize(
+    "ranks",
+    [[1, 2, 4, 5, 6, 7], [2, 3, 4, 5, 6, 7], [1, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]],
+    ids=["gap", "no-first", "duplicate", "zero"],
+)
+def test_ranks_that_do_not_run_from_one_are_refused(ranks: list[int]) -> None:
+    with pytest.raises(ScrapeError, match="not continuous"):
+        parse_chart(_table([_row(rank) for rank in ranks]))
+
+
+def test_a_charts_period_follows_the_path_its_region_is_fetched_from() -> None:
+    for region in REGIONS:
+        scope = ChartScope(region, "$")
+        assert scope.period in week_chart_url(BOM_WEEKLY_URL, "2026W28", area=region)
+
+
+def test_a_region_this_build_does_not_ship_is_still_named() -> None:
+    assert ChartScope("XX", "¤").label == "XX weekend · ¤"
+
+
+async def test_a_broken_chart_for_a_picked_week_is_not_reported_as_no_data(
+    tmp_path: Path,
+) -> None:
+    """Mojo has the week, so "no data" would misreport it, and the retry policy reads this."""
+    page = _table([_row(rank) for rank in [1, 2, 4, 5, 6, 7]])
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, text=page))
+    )
+
+    with pytest.raises(MalformedChartError, match="not continuous"):
+        await fetch_weekly_chart(snapshot_dir=tmp_path, week="2026W28", client=client)
+    await client.aclose()
+
+
+def test_a_rank_lost_just_past_the_shallow_depth_is_still_a_gap() -> None:
+    """Depth 3 with ranks 1, 2, 4: the third film stored would be the wrong film."""
+    with pytest.raises(ScrapeError, match="not continuous"):
+        parse_chart(_table([_row(rank) for rank in (1, 2, 4, 5, 6, 7)]), top_n=3)
+
+
+def test_an_explicit_zero_gross_is_a_figure() -> None:
+    entries = parse_chart(_table(_whole_chart(gross="$0")))
+    assert entries[0].gross_amount == 0
+
+
+def test_separators_and_ads_are_not_films() -> None:
+    rows = _whole_chart()
+    rows.insert(2, '<tr><td colspan="5">Sponsored 300x250</td></tr>')
+    rows.insert(4, "<tr><td>Ad</td><td>x</td><td>x</td><td>x</td><td>x</td></tr>")
+
+    assert [entry.rank for entry in parse_chart(_table(rows))] == [1, 2, 3, 4, 5, 6]
+
+
+@pytest.mark.parametrize("cell", ["-", "", "n/a"])
+def test_a_missing_optional_figure_stays_unknown(cell: str) -> None:
+    entries = parse_chart(_table(_whole_chart(theaters=cell)))
+    assert entries[0].theaters is None
+
+
+def test_a_tail_row_below_the_depth_cannot_cost_a_week_its_chart() -> None:
+    """Nothing below the depth is stored, so nothing below it is judged."""
+    rows = [_row(rank) for rank in range(1, 11)]
+    rows[9] = _row(10, gross="-")
+    rows.append("<tr><td>11</td></tr>")
+    rows.append(_row(11))
+
+    entries = parse_chart(_table(rows), top_n=5)
+
+    assert [entry.rank for entry in entries] == [1, 2, 3, 4, 5]
+
+
+def test_the_same_tail_row_is_refused_once_the_depth_reaches_it() -> None:
+    rows = [_row(rank) for rank in range(1, 11)]
+    rows[9] = _row(10, gross="-")
+    with pytest.raises(ScrapeError, match="rank 10"):
+        parse_chart(_table(rows), top_n=10)
+
+
+def test_a_week_count_past_a_thousand_is_a_number() -> None:
+    """Real: Australia's chart lists re-releases at 1,327 weeks."""
+    assert parse_chart(_table(_whole_chart(weeks="1,327")))[0].weeks_in_release == 1327
+
+
+@pytest.mark.parametrize(
+    "printed, amount",
+    [
+        ("$1,234,567", 1234567),
+        ("1,234,567", 1234567),
+        ("1.234.567", 1234567),
+        ("1 234 567", 1234567),
+        ("£81,514,000", 81514000),
+        ("NZ$92,039", 92039),
+        ("R$ 5,019", 5019),
+        ("81514000", 81514000),
+    ],
+)
+def test_real_ways_of_printing_a_figure_still_read(printed: str, amount: int) -> None:
+    assert parse_chart(_table(_whole_chart(gross=printed)))[0].gross_amount == amount
+
+
+def test_a_mangled_fixture_row_fails_and_is_snapshot_worthy() -> None:
+    """The real page's markup, with one gross cell emptied."""
+    html = _fixture_html()
+    head, marker, tail = html.partition('<td class="mojo-field-type-money">')
+    assert marker, "the fixture no longer marks its money cells"
+    closing = tail.index("</td>")
+    with pytest.raises(ScrapeError, match="rank 1"):
+        parse_chart(head + marker + tail[closing:])
+

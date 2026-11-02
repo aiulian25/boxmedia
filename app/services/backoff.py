@@ -44,6 +44,11 @@ class RadarrBackoff:
         self._failed_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
+    def clear(self) -> None:
+        """Forget every failure — a restore may have replaced every connection."""
+        with self._lock:
+            self._failed_at.clear()
+
     def should_skip(self, app_id: str) -> bool:
         """True while a recent failure should still be honoured, expiring the entry once
         it is old enough to be worth another attempt."""

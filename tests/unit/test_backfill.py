@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +13,9 @@ from app.services.backfill import (
     BACKFILL_JITTER_SECONDS,
     BackfillRunner,
 )
-from app.services.reports import RunTrigger
+from app.services.boxoffice import WeekNotPublishedError
+from app.services.ingestion_state import IngestionStateStore
+from app.services.reports import RunStatus, RunTrigger
 
 
 class _RecordingPipeline:
@@ -31,7 +34,7 @@ class _RecordingPipeline:
         self.started.set()
         if self._fail_on is not None and week == self._fail_on:
             raise RuntimeError("Radarr fell over")
-        return None
+        return SimpleNamespace(status=RunStatus.OK)
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +73,7 @@ async def test_a_second_start_while_running_is_refused() -> None:
         pipeline.weeks.append(week)
         pipeline.started.set()
         await pipeline.release.wait()
+        return SimpleNamespace(status=RunStatus.OK)
 
     pipeline.run = _blocking
     runner = BackfillRunner(pipeline)
@@ -89,7 +93,8 @@ async def test_starting_with_nothing_to_do_is_refused() -> None:
 
     assert runner.start([]) is False
     assert runner.status() == {
-        "running": False, "done": 0, "total": 0, "current_week": None,
+        "running": False, "done": 0, "failed": 0, "deferred": 0, "total": 0,
+        "current_week": None,
     }
 
 
@@ -103,7 +108,8 @@ async def test_a_week_that_raises_does_not_abandon_the_rest() -> None:
     await runner._task
 
     assert pipeline.weeks == ["2026W30", "2026W31", "2026W32"]
-    assert runner.status()["done"] == 3
+    assert runner.status()["done"] == 2
+    assert runner.status()["failed"] == 1
     assert runner.status()["running"] is False
 
 
@@ -115,6 +121,7 @@ async def test_progress_is_readable_while_it_runs() -> None:
         pipeline.weeks.append(week)
         pipeline.started.set()
         await gate.wait()
+        return SimpleNamespace(status=RunStatus.OK)
 
     pipeline.run = _one_at_a_time
     runner = BackfillRunner(pipeline)
@@ -130,7 +137,8 @@ async def test_progress_is_readable_while_it_runs() -> None:
     gate.set()
     await runner._task
     assert runner.status() == {
-        "running": False, "done": 2, "total": 2, "current_week": None,
+        "running": False, "done": 2, "failed": 0, "deferred": 0, "total": 2,
+        "current_week": None,
     }
 
 
@@ -184,3 +192,50 @@ async def test_it_waits_between_weeks_but_not_after_the_last(
     for pause in slept:
         assert BACKFILL_DELAY_SECONDS <= pause <= BACKFILL_DELAY_SECONDS + BACKFILL_JITTER_SECONDS
     assert len(set(slept)) == len(slept), "the jitter is not varying the pause"
+
+
+class _AnsweringPipeline:
+    """Each week gets the answer it was given: a status, or an exception to raise."""
+
+    def __init__(self, answers: dict[str, object]) -> None:
+        self._answers = answers
+
+    async def run(self, *, trigger: str, week: str | None = None):  # noqa: ANN201, ARG002
+        answer = self._answers[week]
+        if isinstance(answer, Exception):
+            raise answer
+        return SimpleNamespace(status=answer)
+
+
+async def test_it_counts_what_each_week_actually_came_to(tmp_path) -> None:  # noqa: ANN001
+    """It used to count every week as fetched, so an outage reported a full house."""
+    ingestion = IngestionStateStore(tmp_path)
+    runner = BackfillRunner(_AnsweringPipeline({
+        "2026W30": RunStatus.OK,
+        "2026W31": RunStatus.RADARR_FAILED,
+        "2026W32": WeekNotPublishedError("not yet"),
+        "2026W33": RuntimeError("a bug"),
+    }), ingestion=ingestion)
+
+    runner.start(["2026W30", "2026W31", "2026W32", "2026W33"])
+    await runner._task
+
+    status = runner.status()
+    assert (status["done"], status["failed"], status["deferred"]) == (1, 2, 1)
+    assert set(ingestion.week_retries()) == {"2026W31", "2026W33"}  # early is not failed
+
+
+async def test_a_week_that_comes_good_forgets_its_attempts(tmp_path) -> None:  # noqa: ANN001
+    ingestion = IngestionStateStore(tmp_path)
+    runner = BackfillRunner(
+        _AnsweringPipeline({"2026W31": RunStatus.RADARR_FAILED}), ingestion=ingestion
+    )
+    runner.start(["2026W31"])
+    await runner._task
+    assert ingestion.week_retries()["2026W31"].attempts == 1
+
+    recovered = BackfillRunner(_AnsweringPipeline({"2026W31": RunStatus.OK}), ingestion=ingestion)
+    recovered.start(["2026W31"])
+    await recovered._task
+
+    assert ingestion.week_retries() == {}

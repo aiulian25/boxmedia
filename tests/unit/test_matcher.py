@@ -47,7 +47,9 @@ def test_find_match_returns_payload() -> None:
         Candidate("Dune: Part Two", 2024, 693134),
         Candidate("Oppenheimer", 2023, 872585),
     ]
-    assert find_match("Dune Part 2", candidates) == 693134
+    found = find_match("Dune Part 2", candidates)
+    assert found.payload == 693134
+    assert found.ambiguous is False
     assert find_match("Poor Things", candidates) is None
 
 
@@ -56,7 +58,23 @@ def test_find_match_year_disambiguates_remake() -> None:
         Candidate("Nosferatu", 1922, 1001),
         Candidate("Nosferatu", 2024, 2024),
     ]
-    assert find_match("Nosferatu", candidates, year=2024) == 2024
-    assert find_match("Nosferatu", candidates, year=1922) == 1001
-    # Without a year, a match is still returned (first one).
-    assert find_match("Nosferatu", candidates) in (1001, 2024)
+    assert find_match("Nosferatu", candidates, year=2024).payload == 2024
+    assert find_match("Nosferatu", candidates, year=1922).payload == 1001
+    assert find_match("Nosferatu", candidates, year=2024).ambiguous is False
+
+
+def test_two_films_with_one_title_are_ambiguous_not_identified() -> None:
+    """The audit's reproduction: first match won, and nothing downstream could tell."""
+    found = find_match(
+        "Nosferatu", [Candidate("Nosferatu", 1922, 1001), Candidate("Nosferatu", 2024, 2024)]
+    )
+    assert found.ambiguous is True
+
+
+def test_a_year_that_matches_neither_leaves_it_ambiguous() -> None:
+    found = find_match(
+        "Nosferatu",
+        [Candidate("Nosferatu", 1922, 1001), Candidate("Nosferatu", 2024, 2024)],
+        year=1979,
+    )
+    assert found.ambiguous is True
