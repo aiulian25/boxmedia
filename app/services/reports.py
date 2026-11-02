@@ -14,7 +14,7 @@ from urllib.parse import quote
 from pydantic import BaseModel, Field
 
 from app.core import filestore
-from app.services.boxoffice import CURRENT_WEEK, previous_week_id, week_start
+from app.services.boxoffice import CURRENT_WEEK, ChartScope, previous_week_id, week_start
 
 REPORT_SCHEMA_VERSION = 1
 REPORT_FILENAME_PREFIX = "report-"
@@ -59,6 +59,10 @@ class MovieAction:
 # the run took its first suggestion. A `detail` value rather than a MovieAction: an action
 # drives what the card offers to DO, and this only changes what the card admits.
 MATCHED_BY_GUESS = "matched_by_guess"
+# Radarr returned several films with exactly this title and nothing settled which. Kept apart
+# from the above because it can be wrong while looking right: the namesake it picked may be
+# one the library holds, so unlike a first suggestion it still needs saying on an owned card.
+MATCHED_AMBIGUOUS = "matched_ambiguous"
 
 
 class RunStatus:
@@ -100,7 +104,17 @@ class MovieResult(BaseModel):
     # existed simply has neither.
     theaters: int | None = Field(default=None, ge=0)
     gross_change_pct: int | None = None
-    weeks_in_release: int
+    # Which film the SOURCE says this row is, as far as it has said: Mojo's page for this
+    # release, and the IMDb id that page names when it has been read. A title cannot tell
+    # two Nosferatus apart; these can, which is what lets a correction reach this film's
+    # other weeks and leave a namesake's alone. Additive, so REPORT_SCHEMA_VERSION does not
+    # move; a report written before them has neither, and that is treated as "not known".
+    release_path: str | None = None
+    source_imdb_id: str | None = None
+    # None when the chart itself did not say. Every report written before that was possible
+    # holds a number, so old files still read, and an older build reading a None is the only
+    # thing this widens.
+    weeks_in_release: int | None
     status: str
     action: str
     tmdb_id: int | None = None
@@ -155,6 +169,24 @@ class Report(BaseModel):
     currency: str = "$"
     movies: list[MovieResult] = Field(default_factory=list)
     error: str | None = None
+
+    @property
+    def chart_scope(self) -> ChartScope:
+        return ChartScope(self.region, self.currency)
+
+
+# Where a stored row stands relative to a correction with the same chart title.
+SCOPE_SAME = "same"  # the source says it is this film
+SCOPE_UNVERIFIED = "unverified"  # nothing recorded says either way
+SCOPE_OTHER = "other"  # the source says it is a different release or film
+
+
+def _scope_of(movie: MovieResult, release_path: str | None, imdb_id: str | None) -> str:
+    if imdb_id and movie.source_imdb_id:
+        return SCOPE_SAME if movie.source_imdb_id == imdb_id else SCOPE_OTHER
+    if release_path and movie.release_path:
+        return SCOPE_SAME if movie.release_path == release_path else SCOPE_OTHER
+    return SCOPE_UNVERIFIED
 
 
 class ReportsStore:
@@ -258,13 +290,11 @@ class ReportsStore:
     def missing_weeks(self, reports: list[Report] | None = None) -> list[str]:
         """Weeks inside the stored range that have no report at all, oldest first.
 
-        "Missing" means never attempted, not "has no usable chart". A week that WAS
-        fetched and failed — Mojo had nothing for it, or the scrape broke — keeps its
-        failed report and its card, and is not offered again. Counting only completed
-        weeks here would make a week Box Office Mojo genuinely has no data for come back
-        as a hole on every visit, and be re-fetched on every backfill, forever: an endless
-        polite retry is still an endless retry. Re-running such a week stays a deliberate,
-        per-week action on its own card.
+        "Missing" means never attempted, not "has no usable chart". A week that WAS fetched
+        and failed keeps its failed report and its card, and is not a hole: counting it here
+        would make a week Box Office Mojo genuinely has no data for come back on every visit
+        and be re-fetched on every backfill, forever. Those are `failed_weeks`, which the
+        schedule retries on a bounded, recorded backoff instead.
 
         Bounded by the range actually held, so this never proposes fetching backwards into
         weeks that predate the install. Capped for the same reason the chart depth is.
@@ -289,6 +319,26 @@ class ReportsStore:
         # takes the next twelve.
         return holes[:MAX_BACKFILL_WEEKS]
 
+
+    def failed_weeks(self, reports: list[Report] | None = None) -> dict[str, Report]:
+        """Each real week whose only record is a failure, with its latest failed report."""
+        held = reports if reports is not None else self.list_reports()
+        completed = {report.week for report in held if report.status == RunStatus.OK}
+        failed: dict[str, Report] = {}
+        for report in held:  # newest run first, so the first seen for a week is its latest
+            if report.status == RunStatus.OK or report.week in completed:
+                continue
+            if week_start(report.week) is not None:
+                failed.setdefault(report.week, report)
+        return failed
+
+    def drop_failures_for_week(self, week: str) -> None:
+        """Remove a week's failed reports, as a newer failure replaces them. A week retried
+        for weeks must not fill the retention with copies of one failure and push real weeks
+        out. The latest keeps the error, and the audit log has a line for each attempt."""
+        for report in self.list_reports():
+            if report.week == week and report.status != RunStatus.OK:
+                self.delete(report.id)
 
     def completed_weeks(self, reports: list[Report] | None = None) -> list[Report]:
         """One report per real week that finished, newest week first.
@@ -315,12 +365,12 @@ class ReportsStore:
 
     def histories(
         self, reports: list[Report] | None = None
-    ) -> dict[str, list[tuple[str, int, int, str]]]:
-        """Every title's week-by-week `(week, rank, gross, currency)`, oldest first.
+    ) -> dict[str, list[tuple[str, int, int, ChartScope]]]:
+        """Every title's week-by-week `(week, rank, gross, scope)`, oldest first.
 
-        The currency travels WITH the figure because a history can legitimately mix them:
-        the region is a setting, and a week keeps whatever it was fetched with. A gross
-        without its currency is a number that cannot be added to anything safely.
+        The scope travels WITH the figure because a history can legitimately mix them: the
+        region is a setting, and a week keeps whatever it was fetched with. A gross or a
+        rank without its chart cannot be added to or compared with anything safely.
 
         Built for ALL titles in a single pass — a page showing ten movies must not scan
         the history ten times. Callers that already hold the report list pass it in so the
@@ -330,7 +380,7 @@ class ReportsStore:
         """
         reports = self.list_reports() if reports is None else reports
         seen_weeks: set[str] = set()
-        per_title: dict[str, list[tuple[str, int, int, str]]] = {}
+        per_title: dict[str, list[tuple[str, int, int, ChartScope]]] = {}
         for report in reports:
             if report.status != RunStatus.OK or report.week == CURRENT_WEEK:
                 continue
@@ -339,10 +389,12 @@ class ReportsStore:
             seen_weeks.add(report.week)
             for movie in report.movies:
                 per_title.setdefault(movie.normalized_title, []).append(
-                    (report.week, movie.rank, movie.gross_amount, report.currency)
+                    (report.week, movie.rank, movie.gross_amount, report.chart_scope)
                 )
         for entries in per_title.values():
-            entries.reverse()  # chronological reads better than newest-first
+            # By chart week: reports arrive by when they ran, and re-running an old week puts
+            # it at the front of that order without moving it in time.
+            entries.sort(key=lambda entry: entry[0])
         return per_title
 
     def get(self, report_id: str) -> Report:
@@ -352,24 +404,51 @@ class ReportsStore:
         document.pop(filestore.SCHEMA_VERSION_KEY, None)
         return Report.model_validate(document)
 
-    def normalized_title_at(self, report_id: str, rank: int) -> str:
-        """The chart title of one row, by the stable per-report key.
+    def row_at(self, report_id: str, rank: int) -> MovieResult:
+        """One row, by the stable per-report key.
 
         Chart ranks are unique within a run. Read rather than accepted from the browser,
-        because this is the key a correction is filed under and everything else keys off
-        that in turn.
+        because its title and source are what a correction is filed under and everything
+        else keys off that in turn.
         """
         for movie in self.get(report_id).movies:
             if movie.rank == rank:
-                return movie.normalized_title
+                return movie
         raise KeyError(f"no movie ranked {rank} in {report_id}")
 
-    def apply_correction(self, normalized_title: str, correction: object) -> int:
-        """Re-point every row of that chart title at the confirmed film. Returns how many.
+    def correction_scope(
+        self, normalized_title: str, release_path: str | None, imdb_id: str | None
+    ) -> dict[str, list[str]]:
+        """Which stored weeks a correction would reach, for showing before it is made."""
+        weeks: dict[str, list[str]] = {SCOPE_SAME: [], SCOPE_UNVERIFIED: [], SCOPE_OTHER: []}
+        for report in self.list_reports():
+            for movie in report.movies:
+                if movie.normalized_title == normalized_title:
+                    weeks[_scope_of(movie, release_path, imdb_id)].append(report.week)
+        return weeks
+
+    def apply_correction(
+        self,
+        normalized_title: str,
+        correction: object,
+        *,
+        include_unverified: bool = True,
+        always: tuple[str, int] | None = None,
+        rating: float | None = None,
+        genres: list[str] | None = None,
+    ) -> int:
+        """Re-point every row that is this film at the confirmed one. Returns how many weeks.
 
         Every stored week, not one row: the same film charts for weeks at a time, and a
         correction that reached only the week the admin happened to be looking at left the
-        others showing the wrong poster — and the dashboard showing the film twice.
+        others showing the wrong poster — and the dashboard showing the film twice. A row
+        whose source says it is a different release is another film with this title, and
+        stays as it is. A row with no source record is included unless the admin said not
+        to; `always` is the (report id, rank) they were actually looking at.
+
+        The film's rating and genres go with its identity, so they are what the caller just
+        looked up or nothing. The stored status goes too: it only answers while Radarr is
+        unreachable, and it described the film this row used to be.
 
         `normalized_title` is deliberately NOT rewritten to follow the new title. It is the
         identity of the CHART ROW, not of the film: the week's dedupe fingerprint, the
@@ -388,6 +467,11 @@ class ReportsStore:
             for index, movie in enumerate(report.movies):
                 if movie.normalized_title != normalized_title:
                     continue
+                scope = _scope_of(movie, correction.release_path, correction.imdb_id)
+                wanted = scope == SCOPE_SAME or (scope == SCOPE_UNVERIFIED and include_unverified)
+                if not wanted and always != (report.id, movie.rank):
+                    continue
+                same_film = movie.tmdb_id == correction.tmdb_id
                 report.movies[index] = movie.model_copy(
                     update={
                         "tmdb_id": correction.tmdb_id,
@@ -398,6 +482,9 @@ class ReportsStore:
                         "wiki_url": wiki_url(correction.title),
                         "action": MovieAction.NONE,
                         "detail": None,
+                        "rating": movie.rating if same_film and rating is None else rating,
+                        "genres": movie.genres if same_film and genres is None else (genres or []),
+                        "status": movie.status if same_film else MovieStatus.MISSING,
                     }
                 )
                 touched = True

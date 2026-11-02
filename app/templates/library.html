@@ -12,6 +12,9 @@
 {% if unreachable %}
 <p class="banner-warn" role="alert">Couldn’t reach {{ unreachable | join(', ') }} — showing the last known library status.</p>
 {% endif %}
+{% for source in stale_sonarr %}
+<p class="banner-warn" role="status">No answer from {{ source.name }} — {% if source.since %}its series here are as of {{ source.since }}{% else %}nothing from it has been read yet, so series it holds are not shown{% endif %}.</p>
+{% endfor %}
 
 {# Real links, not a script filter: the chip row is navigation, so it survives with
    JavaScript off, is bookmarkable, and the back button does what it should. The same

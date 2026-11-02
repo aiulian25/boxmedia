@@ -26,7 +26,7 @@ from app.services.posters import SERIES_POSTER_WIDTH
 from app.services.series import SERIES_CACHE_FILENAME
 from app.services.series import _cached_from as _cached
 from app.services.sonarr import SonarrSeries
-from app.web.library import _sonarr_url_for
+from app.web.deps import sonarr_url_for
 from tests.conftest import AppHarness
 from tests.integration.golden import (
     GOLDEN_PATH,
@@ -131,7 +131,7 @@ def test_the_spine_offers_five_destinations(harness: AppHarness) -> None:
     harness.activate()
 
     nav = re.search(
-        r'<nav class="navlinks">(.*?)</nav>', harness.client.get("/library").text, re.S
+        r'<nav class="navlinks"[^>]*>(.*?)</nav>', harness.client.get("/library").text, re.S
     ).group(1)
 
     assert re.findall(r">([^<]+)</a>", nav) == [
@@ -155,7 +155,7 @@ def test_every_page_marks_its_own_nav_entry(harness: AppHarness) -> None:
     ):
         page = harness.client.get(path)
         assert page.status_code == 200, path
-        active = re.findall(r'class="active">([^<]+)</a>', page.text)
+        active = re.findall(r'class="active" aria-current="page">([^<]+)</a>', page.text)
         assert active == [expected], f"{path} marked {active}"
 
 
@@ -547,7 +547,7 @@ def test_a_hand_edited_connection_address_never_becomes_an_href() -> None:
         api_key_encrypted="x", kind="sonarr",
     )
 
-    assert _sonarr_url_for(hostile, _cached(_series())) is None
+    assert sonarr_url_for(hostile, _cached(_series())) is None
 
 
 def test_the_save_path_neutralises_the_same_address_before_it_is_stored(

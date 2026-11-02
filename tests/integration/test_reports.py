@@ -10,8 +10,14 @@ import httpx
 import pytest
 import respx
 
-from app.services.boxoffice import BoxOfficeEntry, WeekNotPublishedError, bom_week_id
+from app.services.boxoffice import (
+    NO_DATA_PREFIX,
+    BoxOfficeEntry,
+    WeekNotPublishedError,
+    bom_week_id,
+)
 from app.services.filters import SCHEDULE_MODE_CADENCE, SCHEDULE_MODE_INTERVAL
+from app.services.ingestion_state import FAILURE_UNAVAILABLE, MAX_ATTEMPTS
 from app.services.radarr import RadarrLookupResult, RadarrMovie
 from app.services.reports import (
     MATCHED_BY_GUESS,
@@ -563,6 +569,35 @@ def test_detail_shows_the_week_by_week_trend(harness: AppHarness) -> None:
 
     page = harness.client.get("/reports/report-20260814-110000-w27").text
     assert "W26 #1 → W27 #4" in page  # the title's chart run, oldest first
+
+
+def test_a_rerun_old_week_stays_at_the_start_of_the_trend(harness: AppHarness) -> None:
+    harness.activate()
+    _save(harness, _ranked_report("report-20260814-100000-w27", "2026W27", 4, 12_000_000))
+    _save(harness, _ranked_report("report-20260814-110000-w26", "2026W26", 1, 45_000_000))
+
+    page = harness.client.get("/reports/report-20260814-100000-w27").text
+
+    assert "W26 #1 → W27 #4" in page
+
+
+def test_a_trend_stays_inside_the_chart_the_report_came_from(harness: AppHarness) -> None:
+    """Rank 1 in Germany then rank 4 in France is not a film falling three places."""
+    harness.activate()
+    for report_id, week, rank, region in (
+        ("report-20260814-090000-w25", "2026W25", 2, "FR"),
+        ("report-20260814-100000-w26", "2026W26", 1, "DE"),
+        ("report-20260814-110000-w27", "2026W27", 4, "FR"),
+    ):
+        _save(harness, _ranked_report(report_id, week, rank, 1_000_000).model_copy(
+            update={"region": region, "currency": "€"}
+        ))
+
+    page = harness.client.get("/reports/report-20260814-110000-w27").text
+
+    assert "W25 #2 → W27 #4" in page
+    assert "W26 #1" not in page
+    assert "France weekend · €" in page  # and the heading names that chart
 
 
 def test_a_first_week_title_has_no_trend(harness: AppHarness) -> None:
@@ -1741,6 +1776,36 @@ def test_a_week_that_failed_is_not_offered_again(harness: AppHarness) -> None:
     assert "Fetch missing weeks" not in page
 
 
+def test_the_page_says_which_failed_weeks_are_still_being_retried(harness: AppHarness) -> None:
+    harness.activate()
+    state = harness.client.app.state
+    for week, error in (("2026W31", "Radarr refused"), ("2026W33", NO_DATA_PREFIX)):
+        state.reports.save(Report(
+            id=f"report-failed-{week}", run_at="2026-08-14T11:00:00+00:00",
+            trigger=RunTrigger.MANUAL, status=RunStatus.RADARR_FAILED
+            if week == "2026W31" else RunStatus.SCRAPE_FAILED, week=week,
+            totals=ReportTotals(movies=0, matched=0), error=error,
+        ))
+    moment = datetime(2026, 8, 14, tzinfo=UTC)
+    for _ in range(MAX_ATTEMPTS[FAILURE_UNAVAILABLE]):
+        state.ingestion.record_week_failure("2026W33", moment)
+
+    page = harness.client.get("/reports").text
+
+    assert "Could not fetch W31 — BoxMedia will try again" in page
+    assert "No longer retrying W33 — use Re-run" in page
+
+
+def test_the_page_says_nothing_of_retries_with_no_failed_week(harness: AppHarness) -> None:
+    harness.activate()
+    _seed_weeks(harness, ["2026W30"])
+
+    page = harness.client.get("/reports").text
+
+    assert "will try again" not in page
+    assert "No longer retrying" not in page
+
+
 # --- the card says how many screens, and which way it moved (M3) ---
 
 
@@ -2046,3 +2111,55 @@ def test_a_single_missing_week_is_named_not_bounded_by_itself(harness: AppHarnes
 
     assert "1 week missing: W37" in page
     assert "between W37 and W37" not in page
+
+
+@pytest.mark.parametrize(
+    ("outcome", "label"),
+    [("changed", "chart updated"), ("unchanged", "no changes"), ("failed", "failed")],
+)
+async def test_the_page_says_what_the_last_check_came_to(
+    harness: AppHarness, outcome: str, label: str
+) -> None:
+    from datetime import UTC, datetime
+
+    from app.services.scheduler import BoxMediaScheduler
+
+    harness.activate()
+    state = harness.client.app.state
+    state.ingestion.record_attempt(datetime(2026, 8, 12, 14, 3, tzinfo=UTC))
+    state.ingestion.record_outcome(outcome, datetime(2026, 8, 12, 14, 4, tzinfo=UTC))
+    scheduler = BoxMediaScheduler(
+        state.pipeline, interval_hours=168, reports=state.reports, ingestion=state.ingestion
+    )
+    scheduler.start()
+    state.scheduler = scheduler
+    try:
+        page = harness.client.get("/reports").text
+    finally:
+        scheduler.shutdown()
+
+    assert f"Last check: 12/8/2026 14:03 ({label})" in page
+
+
+# --- the review page's badge dots ---
+
+
+@pytest.mark.parametrize(
+    ("status", "action", "dot"),
+    [
+        (MovieStatus.MISSING, MovieAction.NONE, "dot-missing"),
+        (MovieStatus.MISSING, MovieAction.NO_MATCH, "dot-missing"),
+    ],
+)
+def test_each_badge_uses_a_dot_the_stylesheet_has(
+    harness: AppHarness, status: str, action: str, dot: str
+) -> None:
+    harness.activate()
+    report = _ok_report("report-20260814-120000-dots")
+    movie = report.movies[0].model_copy(update={"status": status, "action": action})
+    _save(harness, report.model_copy(update={"movies": [movie]}))
+
+    page = harness.client.get("/reports/report-20260814-120000-dots").text
+
+    assert f'class="dot {dot}"' in page
+

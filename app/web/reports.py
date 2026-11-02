@@ -19,6 +19,7 @@ from fastapi.responses import RedirectResponse
 from app.core.audit import AuditAction
 from app.services.boxoffice import (
     CURRENT_WEEK,
+    ChartScope,
     WeekNotPublishedError,
     bom_week_id,
     format_gross,
@@ -32,12 +33,30 @@ from app.services.boxoffice import (
 )
 from app.services.corrections import Correction
 from app.services.filters import SCHEDULE_MODE_CADENCE
-from app.services.ignore import IgnoreSnapshot
+from app.services.ignore import IGNORE_KINDS, KIND_MOVIE, IgnoreSnapshot
+from app.services.ingestion_state import (
+    OUTCOME_CHANGED,
+    OUTCOME_FAILED,
+    OUTCOME_UNCHANGED,
+    failure_class_of,
+    gave_up,
+)
 from app.services.matcher import normalize_title
 from app.services.mediaserver import MediaServerSnapshot
+from app.services.pipeline import CARD_GENRES, PipelineBusyError
 from app.services.radarr import RadarrClient, RadarrError, RadarrLookupResult, RadarrMovie
 from app.services.radarr_options import RadarrOptions
-from app.services.reports import MATCHED_BY_GUESS, Report, RunStatus, RunTrigger, imdb_url
+from app.services.reports import (
+    MATCHED_AMBIGUOUS,
+    MATCHED_BY_GUESS,
+    SCOPE_OTHER,
+    SCOPE_SAME,
+    SCOPE_UNVERIFIED,
+    Report,
+    RunStatus,
+    RunTrigger,
+    imdb_url,
+)
 from app.web.deps import (
     BANNER_ERROR,
     DETAIL_STATUS_MESSAGES,
@@ -88,8 +107,13 @@ WEEK_NOT_PUBLISHED_MESSAGE = (
     "saved. Mojo’s weeks run Friday to Thursday and appear a few days after they "
     "end — the scheduled check fetches it on its own once it is out."
 )
+RUN_BUSY_STATUS = "run_busy"
+RUN_BUSY_MESSAGE = "Another fetch is still running. Nothing was started — try again shortly."
+# Long enough to outlast one week of a backfill, or a double-click on the same button.
+MANUAL_RUN_WAIT_SECONDS = 20.0
 # Closed set: the code in the URL is ours, never user text, so nothing is injected.
 _LIST_BANNERS = {
+    RUN_BUSY_STATUS: RUN_BUSY_MESSAGE,
     BAD_WEEK_STATUS: BAD_WEEK_MESSAGE,
     WEEK_NOT_FINISHED_STATUS: WEEK_NOT_FINISHED_MESSAGE,
     WEEK_NOT_PUBLISHED_STATUS: WEEK_NOT_PUBLISHED_MESSAGE,
@@ -220,6 +244,15 @@ def _display_time(run_at: str) -> str:
     return run_at[:DISPLAY_TIME_LENGTH].replace("T", " ")
 
 
+# What the last check came to, beside when it ran. "Last check" alone reads as if something
+# new arrived, and most checks of a settled week rightly find nothing.
+_LAST_CHECK_OUTCOMES = {
+    OUTCOME_CHANGED: "chart updated",
+    OUTCOME_UNCHANGED: "no changes",
+    OUTCOME_FAILED: "failed",
+}
+
+
 def _schedule_view(
     request: Request, reports: list[Report] | None = None
 ) -> dict[str, object] | None:
@@ -238,6 +271,7 @@ def _schedule_view(
     last_run = scheduler.last_run_at(reports)
     return {
         "last_run": format_timestamp(last_run) if last_run else NEVER_RAN,
+        "last_outcome": _LAST_CHECK_OUTCOMES.get(scheduler.last_outcome()),
         "next_run": format_timestamp(next_run),
         # How often, in whichever terms this schedule actually runs on. "every 168h" is
         # simply untrue of a cadence, and a line describing the schedule is the last place
@@ -302,17 +336,17 @@ def _month_top_grossers(reports: list[Report]) -> dict[str, object] | None:
     # becomes the new month, thin at first and filling out with each further week.
     year, month = max(by_month)
     month_reports = by_month[(year, month)]
-    # One currency for the whole board, taken from the newest week in the month. A month
-    # can hold weeks fetched from different charts — the region is a setting, and a week
-    # keeps what it was fetched with — and adding pounds to dollars would produce a
-    # ranking that is wrong rather than merely mislabelled. The weeks left out are
-    # counted and said, because a leaderboard quietly built from half a month is worse
-    # than one that admits it.
-    wanted_currency = month_reports[0].currency
+    # One chart for the whole board, taken from the newest week in the month. A month can
+    # hold weeks fetched from different charts — the region is a setting, and a week keeps
+    # what it was fetched with — and adding pounds to dollars, or France's euros to Germany's,
+    # or a weekend to a whole week, would produce a ranking that is wrong rather than merely
+    # mislabelled. The weeks left out are counted and said, because a leaderboard quietly
+    # built from half a month is worse than one that admits it.
+    scope = month_reports[0].chart_scope
     excluded_weeks = 0
     totals: dict[str, dict[str, object]] = {}
     for report in month_reports:
-        if report.currency != wanted_currency:
+        if report.chart_scope != scope:
             excluded_weeks += 1
             continue
         for movie in report.movies:
@@ -343,14 +377,15 @@ def _month_top_grossers(reports: list[Report]) -> dict[str, object] | None:
         entry["rank"] = position
         # Ranked on the month's takings; the running total is shown beside it so a film's
         # overall scale is visible without the monthly figure looking wrong.
-        entry["gross_display"] = format_gross(entry["gross_amount"], wanted_currency)
+        entry["gross_display"] = format_gross(entry["gross_amount"], scope.currency)
         entry["total_gross_display"] = (
-            format_gross(entry["total_gross"], wanted_currency)
+            format_gross(entry["total_gross"], scope.currency)
             if entry["total_gross"]
             else None
         )
     return {
         "label": f"{date(year, month, 1):%B %Y}",
+        "scope_label": scope.label,
         "entries": top,
         # The weeks this board is actually built from, not every week the month holds.
         "weeks_tracked": len(month_reports) - excluded_weeks,
@@ -399,6 +434,25 @@ def _missing_view(weeks: list[str]) -> dict[str, object] | None:
         "last": week_chip_label(weeks[-1], with_year=with_year),
         "labels": [week_chip_label(week, with_year=with_year) for week in weeks],
     }
+
+
+def _failed_weeks_view(request: Request, reports: list[Report]) -> dict[str, list[str]] | None:
+    """Failed weeks the schedule will try again, and those it has stopped trying.
+
+    Said apart because the next step differs: one needs nothing, and the other needs a person
+    to press Re-run on the card, or to accept that the source has no such week.
+    """
+    failed = request.app.state.reports.failed_weeks(reports)
+    if not failed:
+        return None
+    retries = request.app.state.ingestion.week_retries()
+    with_year = spans_multiple_years(list(failed))
+    view: dict[str, list[str]] = {"retrying": [], "given_up": []}
+    for week in sorted(failed):
+        stopped = gave_up(retries.get(week), failure_class_of(failed[week]))
+        label = week_chip_label(week, with_year=with_year)
+        view["given_up" if stopped else "retrying"].append(label)
+    return view
 
 
 @router.post(BACKFILL_PATH)
@@ -450,6 +504,7 @@ async def reports_list(request: Request) -> object:
         # runner's status is in memory.
         missing=_missing_view(request.app.state.reports.missing_weeks(reports)),
         backfill=request.app.state.backfill.status(),
+        failed_weeks=_failed_weeks_view(request, reports),
         schedule=schedule,
         last_run_error=latest.error if last_run_failed else None,
         banner_kind=BANNER_ERROR if banner_text else None,
@@ -522,7 +577,7 @@ def _movie_view(
     movie: object,
     library: dict[int, RadarrMovie] | None,
     ignored: IgnoreSnapshot,
-    history: list[tuple[str, int, int]] | None = None,
+    history: list[tuple[str, int, int, ChartScope]] | None = None,
     holders: list[dict[str, object]] | None = None,
     plex: MediaServerSnapshot | None = None,
 ) -> dict:
@@ -588,7 +643,8 @@ def _movie_view(
         "genres": movie.genres,
         "theaters": movie.theaters,
         "gross_change_pct": movie.gross_change_pct,
-        "guessed": movie.detail == MATCHED_BY_GUESS,
+        "guessed": movie.detail in (MATCHED_BY_GUESS, MATCHED_AMBIGUOUS),
+        "ambiguous": movie.detail == MATCHED_AMBIGUOUS,
         "in_radarr": in_radarr,
         "has_file": has_file,
         "file_quality": file_quality,
@@ -610,7 +666,7 @@ def _movie_view(
     }
 
 
-def _trend_view(history: list[tuple[str, int, int, str]]) -> list[dict[str, object]]:
+def _trend_view(history: list[tuple[str, int, int, ChartScope]]) -> list[dict[str, object]]:
     """The trend line's weeks and ranks, each labelled for the run it sits in."""
     with_year = spans_multiple_years([week for week, _, _, _ in history])
     return [
@@ -800,7 +856,9 @@ async def report_detail(request: Request, report_id: str) -> object:
             movie,
             library,
             ignored,
-            histories.get(movie.normalized_title),
+            # Only this report's chart: a rank in Germany says nothing next to one in France.
+            [point for point in histories.get(movie.normalized_title, [])
+             if point[3] == report.chart_scope],
             radarr_locations(movie.tmdb_id, libraries, apps_by_id, queues),
             server_snapshot,
         )
@@ -881,17 +939,21 @@ async def run_now(
         stored.id: stored.run_at for stored in request.app.state.reports.list_reports()
     }
     scheduler = request.app.state.scheduler
-    if resolved is None and scheduler is not None:
-        report = await scheduler.run_now()
-    else:
-        try:
+    try:
+        if resolved is None and scheduler is not None:
+            report = await scheduler.run_now(admission_timeout=MANUAL_RUN_WAIT_SECONDS)
+        else:
             report = await request.app.state.pipeline.run(
-                trigger=RunTrigger.MANUAL, week=resolved
+                trigger=RunTrigger.MANUAL,
+                week=resolved,
+                admission_timeout=MANUAL_RUN_WAIT_SECONDS,
             )
-        except WeekNotPublishedError:
-            # Nothing was stored, so there is no report to land on and no card to
-            # clean up — the week stays free to be fetched once Mojo has it.
-            return _redirect_reports(request, WEEK_NOT_PUBLISHED_STATUS)
+    except PipelineBusyError:
+        return _redirect_reports(request, RUN_BUSY_STATUS)
+    except WeekNotPublishedError:
+        # Nothing was stored, so there is no report to land on and no card to
+        # clean up — the week stays free to be fetched once Mojo has it.
+        return _redirect_reports(request, WEEK_NOT_PUBLISHED_STATUS)
     # An unchanged run hands back the STORED report object, its old timestamp included;
     # a run that recorded anything stamps a fresh `run_at`. A first sighting of a week is
     # not in the map at all, so it is not unchanged either.
@@ -953,7 +1015,27 @@ async def fix_match_form(
         rank=rank,
         term=term,
         candidates=candidate_views,
+        scope=_correction_preview(request, report_id, rank),
     )
+
+
+def _correction_preview(request: Request, report_id: str, rank: int) -> dict[str, list[str]]:
+    """Which weeks a correction of this row would reach, as labels for the page.
+
+    Empty rather than an error for a row that is not there: the page can still search, and
+    the POST is what refuses it.
+    """
+    reports = request.app.state.reports
+    try:
+        row = reports.row_at(report_id, rank)
+    except (FileNotFoundError, ValueError, KeyError):
+        return {SCOPE_SAME: [], SCOPE_UNVERIFIED: [], SCOPE_OTHER: []}
+    weeks = reports.correction_scope(row.normalized_title, row.release_path, row.source_imdb_id)
+    with_year = spans_multiple_years([week for found in weeks.values() for week in found])
+    return {
+        scope: [week_chip_label(week, with_year=with_year) for week in sorted(found)]
+        for scope, found in weeks.items()
+    }
 
 
 @router.post(FIX_MATCH_PATH)
@@ -963,6 +1045,7 @@ async def fix_match(
     rank: str = Form(...),
     term: str = Form(...),
     tmdb_id: str = Form(...),
+    leave_unverified: str = Form(""),
 ) -> RedirectResponse:
     """Re-point a chart entry at the chosen film.
 
@@ -972,7 +1055,9 @@ async def fix_match(
 
     The correction is remembered rather than applied to this row alone. The same film
     charts for weeks at a time, so a fix that reached only the week being looked at left
-    the others wrong — and the next automatic check overwrote even that one.
+    the others wrong — and the next automatic check overwrote even that one. A different
+    release with the same title is a different film, and is not touched. `leave_unverified`
+    also leaves rows that recorded no source; the page lists them first.
     """
     user = current_user(request)
     chosen_rank = optional_int(rank)
@@ -989,20 +1074,34 @@ async def fix_match(
     if match is None:
         return _redirect_detail(request, report_id, "add_failed")
 
-    correction = Correction(
-        tmdb_id=match.tmdb_id,
-        title=match.title,
-        year=match.year,
-        imdb_url=imdb_url(match.imdb_id),
-        poster_url=match.poster_url,
-    )
+    include_unverified = not leave_unverified
     try:
-        # Filed under the CHART title, which is what a future run will have in hand — and
-        # read from the stored row rather than the form, so nothing the browser sends can
-        # file a correction against a different title than the one being fixed.
-        charted = request.app.state.reports.normalized_title_at(report_id, chosen_rank)
-        request.app.state.corrections.save(charted, correction)
-        weeks = request.app.state.reports.apply_correction(charted, correction)
+        # Filed under the row's own source, or failing that its CHART title, which is what a
+        # future run will have in hand — and read from the stored row rather than the form,
+        # so nothing the browser sends can file a correction against a different film.
+        row = request.app.state.reports.row_at(report_id, chosen_rank)
+        charted = row.normalized_title
+        correction = Correction(
+            tmdb_id=match.tmdb_id,
+            title=match.title,
+            year=match.year,
+            imdb_url=imdb_url(match.imdb_id),
+            poster_url=match.poster_url,
+            release_path=row.release_path,
+            imdb_id=match.imdb_id,
+        )
+        # With no source on the row, a saved correction would speak for the whole title,
+        # which is the very thing that was just declined.
+        if row.release_path or include_unverified:
+            request.app.state.corrections.save(charted, correction)
+        weeks = request.app.state.reports.apply_correction(
+            charted,
+            correction,
+            include_unverified=include_unverified,
+            always=(report_id, chosen_rank),
+            rating=match.rating,
+            genres=list(match.genres)[:CARD_GENRES],
+        )
     except (FileNotFoundError, ValueError, KeyError):
         return _redirect_reports(request)
 
@@ -1157,11 +1256,20 @@ def unignore_movie(
     tmdb_id: str = Form(""),
     normalized_title: str = Form(...),
     next_page: str = Form("", alias="next"),
+    kind: str = Form(KIND_MOVIE),
 ) -> RedirectResponse:
-    """Un-ignore a title from a weekly report, or from the list in Settings."""
+    """Un-ignore a title from a weekly report, or from the list in Settings.
+
+    The kind comes from the Settings list, which holds series too. Removal only looks at
+    entries of the kind it is told, so without it a series there could never be removed, and
+    a dismissed show has nowhere else to be brought back from. Anything unknown means a film,
+    as a report's own form does by not sending one.
+    """
     current_user(request)
     request.app.state.ignore.remove(
-        tmdb_id=optional_int(tmdb_id), normalized_title=normalized_title
+        tmdb_id=optional_int(tmdb_id),
+        normalized_title=normalized_title,
+        kind=kind if kind in IGNORE_KINDS else KIND_MOVIE,
     )
     if next_page == SETTINGS_TARGET:
         url_base = request.app.state.settings.url_base

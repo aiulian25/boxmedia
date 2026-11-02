@@ -7,7 +7,9 @@ ruling 4's regression contract, the golden diff in `test_spine.py` being the oth
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import UTC, datetime
 
 import httpx
 import respx
@@ -25,6 +27,7 @@ from app.services.reports import (
     RunStatus,
     RunTrigger,
 )
+from app.services.series import SERIES_CACHE_FILENAME
 from app.services.sonarr import SonarrSeries
 from app.web.deps import radarr_url_for
 from app.web.library import DEFAULT_LIMIT, PAGE_INCREMENT
@@ -940,19 +943,42 @@ def test_progress_reads_the_queue_inside_the_libraries_gather(harness: AppHarnes
 
 
 def _week_in(harness: AppHarness, week: str, gross: int, currency: str, *,
-             total: int | None = None, run_at: str | None = None) -> None:
+             total: int | None = None, run_at: str | None = None,
+             region: str | None = None) -> None:
     """One stored week for the same film, fetched in a given currency."""
     movie = _movie(1, "Dune Part Two", MovieStatus.IN_LIBRARY)
     harness.client.app.state.reports.save(Report(
         id=f"report-{week}-{'usd' if currency == '$' else 'gbp'}",
         run_at=run_at or f"2026-08-1{week[-1]}T10:00:00+00:00",
         trigger=RunTrigger.MANUAL, status=RunStatus.OK, week=week, currency=currency,
-        region="" if currency == "$" else "GB",
+        region=region if region is not None else ("" if currency == "$" else "GB"),
         totals=ReportTotals(movies=1, matched=1),
         movies=[movie.model_copy(update={
             "gross_amount": gross, "gross_display": f"{currency}{gross}", "total_gross": total,
         })],
     ))
+
+
+@respx.mock
+def test_a_tracked_sum_never_adds_two_markets_with_one_symbol(harness: AppHarness) -> None:
+    harness.activate()
+    harness.client.app.state.apps.add(name="Main", url=RADARR_URL, api_key=RADARR_KEY)
+    _week_in(harness, "2026W30", 1_000_000, "€", region="FR", total=50_000_000,
+             run_at="2026-08-01T10:00:00+00:00")
+    _week_in(harness, "2026W31", 2_000_000, "€", region="DE", total=3_000_000,
+             run_at="2026-08-08T10:00:00+00:00")
+    _week_in(harness, "2026W32", 4_000_000, "€", region="DE", total=7_000_000,
+             run_at="2026-08-09T10:00:00+00:00")
+    respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[
+        {"tmdbId": 1001, "id": 7, "title": "Dune Part Two", "year": 2024,
+         "hasFile": True, "images": []},
+    ]))
+
+    page = harness.client.get("/library").text
+
+    assert "2 weeks tracked" in page
+    assert "€6.0M tracked (Germany weekend)" in page
+    assert "€7.0M lifetime" in page  # not France's larger running total
 
 
 @respx.mock
@@ -973,7 +999,7 @@ def test_a_tracked_sum_never_adds_two_currencies(harness: AppHarness) -> None:
 
     page = harness.client.get("/library").text
 
-    assert "3 weeks tracked" in page       # the history is still three weeks long
+    assert "2 weeks tracked" in page       # the count describes the sum beside it
     assert "$3.0M tracked" in page         # ...and the money is only the dollars
     assert "£" not in page.split("tracked")[0][-200:]
 
@@ -1005,6 +1031,8 @@ def test_a_lifetime_figure_is_never_folded_across_currencies(harness: AppHarness
     # The freshest report is the dollar one, so the card speaks dollars.
     _week_in(harness, "2026W30", 1_000_000, "£", total=999_000_000,
              run_at="2026-08-01T10:00:00+00:00")
+    _week_in(harness, "2026W29", 1_000_000, "$", total=70_000_000,
+             run_at="2026-08-02T10:00:00+00:00")
     _week_in(harness, "2026W31", 2_000_000, "$", total=80_000_000,
              run_at="2026-08-20T10:00:00+00:00")
     respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[
@@ -1020,7 +1048,7 @@ def test_a_lifetime_figure_is_never_folded_across_currencies(harness: AppHarness
     # that once matched a timestamp — a short substring against a whole document.
     assert "£999" not in page
     assert "999.0M" not in page
-    assert "$2.0M tracked" in page     # ...and only the dollar week is summed
+    assert "$3.0M tracked" in page     # ...and only the dollar weeks are summed
 
 
 def test_a_corrected_film_stays_one_film_across_its_weeks(harness: AppHarness) -> None:
@@ -1041,7 +1069,9 @@ def test_a_corrected_film_stays_one_film_across_its_weeks(harness: AppHarness) -
             movies=[MovieResult(
                 rank=5, title="Miroirs No. 3", normalized_title="miroirs no 3",
                 gross_amount=1_000_000, gross_display="$1.0M", weeks_in_release=index + 1,
-                status=MovieStatus.WANTED, action=MovieAction.NONE, tmdb_id=999,
+                # Already this film, spelled the chart's way. A row re-pointed from another
+                # film drops its stored status, since that described the other film.
+                status=MovieStatus.WANTED, action=MovieAction.NONE, tmdb_id=111,
             )],
         ))
 
@@ -1154,3 +1184,50 @@ def test_browsing_reuses_radarr_s_library_instead_of_downloading_it_every_page(
         harness.client.get("/library")
 
     assert library.call_count == 1
+
+
+# --- a Sonarr that has gone quiet ---
+
+
+def _sonarr_app(harness: AppHarness) -> str:
+    return harness.client.app.state.apps.add(
+        name="Upstairs", url=SONARR_URL, api_key=RADARR_KEY, kind="sonarr"
+    ).id
+
+
+def _age_series_snapshot(harness: AppHarness, app_id: str, read_at: float) -> None:
+    path = harness.settings.cache_dir / SERIES_CACHE_FILENAME
+    document = json.loads(path.read_text("utf-8"))
+    document["by_app"][app_id]["fetched_at"] = read_at
+    path.write_text(json.dumps(document), "utf-8")
+
+
+@respx.mock
+def test_a_silent_sonarr_keeps_its_cards_and_says_how_old_they_are(harness: AppHarness) -> None:
+    harness.activate()
+    app_id = _sonarr_app(harness)
+    harness.client.app.state.series_cache.save(app_id, ())
+    _age_series_snapshot(harness, app_id, datetime(2026, 8, 3, 9, 30, tzinfo=UTC).timestamp())
+    respx.get(f"{SONARR_URL}/api/v3/series").mock(return_value=httpx.Response(500, json={}))
+
+    page = harness.client.get("/library").text
+
+    assert "No answer from Upstairs — its series here are as of 3/8/2026 09:30" in page
+
+
+@respx.mock
+def test_a_sonarr_that_answers_has_nothing_to_warn_about(harness: AppHarness) -> None:
+    harness.activate()
+    _sonarr_app(harness)
+    respx.get(f"{SONARR_URL}/api/v3/series").mock(return_value=httpx.Response(200, json=[]))
+
+    assert "No answer from" not in harness.client.get("/library").text
+
+
+@respx.mock
+def test_a_sonarr_never_read_is_not_an_empty_one(harness: AppHarness) -> None:
+    harness.activate()
+    _sonarr_app(harness)
+    respx.get(f"{SONARR_URL}/api/v3/series").mock(return_value=httpx.Response(500, json={}))
+
+    assert "nothing from it has been read yet" in harness.client.get("/library").text

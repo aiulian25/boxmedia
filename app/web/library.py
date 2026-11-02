@@ -33,7 +33,7 @@ in Radarr download percentages and would otherwise repaint a completeness band w
 from __future__ import annotations
 
 import asyncio
-from urllib.parse import quote
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
 from fastapi import status as http_status
@@ -41,7 +41,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from app.core.sessions import COOKIE_NAME
 from app.services.apps import KIND_SONARR, ExternalApp
-from app.services.boxoffice import DEFAULT_CURRENCY_SYMBOL, format_gross
+from app.services.boxoffice import ChartScope, format_gross
 from app.services.matcher import normalize_title
 from app.services.posters import SERIES_POSTER_WIDTH
 from app.services.radarr import RadarrMovie
@@ -61,7 +61,7 @@ from app.web.deps import (
     radarr_locations,
     refresh_stale_series_libraries,
     render,
-    safe_external_url,
+    sonarr_url_for,
     validated_media_type,
 )
 
@@ -114,17 +114,17 @@ def _merge_history(reports: list[Report]) -> list[dict]:
                     "imdb_url": movie.imdb_url,
                     "wiki_url": movie.wiki_url,
                     "total_gross": None,
-                    # The freshest sighting decides which money this card speaks. Every
+                    # The freshest sighting decides which chart this card speaks for. Every
                     # figure on it is then computed against that one, so the tracked sum
-                    # and the lifetime figure on the same line can never be in different
-                    # currencies.
-                    "currency": report.currency,
+                    # and the lifetime figure on the same line can never be from different
+                    # markets.
+                    "scope": report.chart_scope,
                 },
             )
-            # Only fold a running total that is in the SAME money. A max across currencies
-            # is not a bigger number, it is a meaningless one — and after the region became
-            # a setting, a history really can hold both.
-            if movie.total_gross is not None and report.currency == entry["currency"]:
+            # Only fold a running total from the SAME chart. A max across markets is not a
+            # bigger number, it is a meaningless one — and after the region became a setting,
+            # a history really can hold both.
+            if movie.total_gross is not None and report.chart_scope == entry["scope"]:
                 entry["total_gross"] = max(entry["total_gross"] or 0, movie.total_gross)
     # Insertion order is first-sighting order, which is what the grid showed before this
     # became a dict: newest week first, chart rank within it.
@@ -162,7 +162,7 @@ def _library_only_views(
                     "gross_display": None,  # never charted in a week we hold
                     "weeks_in_release": None,
                     "total_gross": None,
-                    "currency": DEFAULT_CURRENCY_SYMBOL,
+                    "scope": ChartScope(),
                     "tmdb_id": tmdb,
                     "year": movie.year,
                     "poster_url": movie.poster_url,
@@ -212,11 +212,11 @@ def _sign_in_notice_view(request: Request) -> dict | None:
 
 
 def _apply_tracking(
-    movies: list[dict], histories: dict[str, list[tuple[str, int, int, str]]]
+    movies: list[dict], histories: dict[str, list[tuple[str, int, int, ChartScope]]]
 ) -> None:
     """Annotate each library title with the two box-office figures its card can show.
 
-    Both are reported in ONE currency — the freshest sighting's — and weeks in any other
+    Both are reported for ONE chart — the freshest sighting's — and weeks from any other
     are left out of the arithmetic rather than converted, because this app knows no
     exchange rate and inventing one would be worse than saying less.
 
@@ -229,16 +229,21 @@ def _apply_tracking(
     the scraper read Mojo's Total Gross column.
     """
     for movie in movies:
-        history = histories.get(movie["normalized_title"], [])
-        currency = movie["currency"]
-        movie["weeks_tracked"] = len(history)
-        # Only the weeks in this card's own currency. A history that mixes them is
-        # possible now that the region is a setting, and adding pounds to dollars would
-        # not be a formatting slip — it would be a number that means nothing, printed with
-        # the confidence of one that does.
-        movie["gross_total_display"] = format_gross(
-            sum(gross for _, _, gross, money in history if money == currency), currency
-        )
+        scope = movie["scope"]
+        currency = scope.currency
+        # Only the weeks from this card's own chart. A history that mixes them is possible
+        # now that the region is a setting, and adding pounds to dollars would not be a
+        # formatting slip — it would be a number that means nothing, printed with the
+        # confidence of one that does. Counted the same way, so the count describes the sum.
+        grosses = [
+            gross
+            for _, _, gross, week_scope in histories.get(movie["normalized_title"], [])
+            if week_scope == scope
+        ]
+        movie["weeks_tracked"] = len(grosses)
+        movie["gross_total_display"] = format_gross(sum(grosses), currency)
+        # Named unless it is the chart a reader assumes, so a German card reads as German.
+        movie["tracked_chart"] = None if scope == ChartScope() else scope.chart_name
         movie["lifetime_display"] = (
             format_gross(movie["total_gross"], currency) if movie["total_gross"] else None
         )
@@ -264,19 +269,6 @@ def _holding_line(series: CachedSeries) -> str:
         return f"Complete — {series.episode_count} episodes"
     missing = series.missing_episode_count
     return f"Missing {missing} episode{'s' if missing != 1 else ''}"
-
-
-def _sonarr_url_for(app: ExternalApp, series: CachedSeries) -> str | None:
-    """That series\' page on that Sonarr, or None when it cannot be addressed.
-
-    `radarr_url_for`\'s twin, and the same reasoning: `titleSlug` is what Sonarr\'s own UI
-    routes on, the base is the admin-configured address rather than anything
-    request-derived, and a record without a slug yields no link instead of a guessed one.
-    """
-    if not series.title_slug:
-        return None
-    base = safe_external_url(app.url)
-    return f"{base}/series/{quote(series.title_slug, safe='')}" if base else None
 
 
 def _series_views(request: Request) -> list[dict]:
@@ -315,11 +307,31 @@ def _series_views(request: Request) -> list[dict]:
                 "tvdb_id": series.tvdb_id,
                 "poster_url": series.poster_url,
                 "connection": app.name,
-                "sonarr_url": _sonarr_url_for(app, series),
+                "sonarr_url": sonarr_url_for(app, series),
                 "complete": series.complete,
                 "holding": _holding_line(series),
                 "band_step": _completeness_step(series),
             })
+    return views
+
+
+def _stale_sonarr_views(request: Request) -> list[dict]:
+    """The Sonarr connections this page could not get a current library from.
+
+    Read after the page's own top-up, so anything still stale did not answer. Its cards stay,
+    because what it held is still the best knowledge there is, but "complete" on one of them
+    is only as true as this date.
+    """
+    cache = request.app.state.series_cache
+    views = []
+    for app in request.app.state.apps.list_apps(KIND_SONARR):
+        if not cache.is_stale(app.id):
+            continue
+        read_at = cache.last_read_at(app.id)
+        views.append({
+            "name": app.name,
+            "since": format_timestamp(datetime.fromtimestamp(read_at, UTC)) if read_at else None,
+        })
     return views
 
 
@@ -459,6 +471,7 @@ async def library(
         unreachable=[
             apps_by_id[app_id].name for app_id in libraries if app_id not in answered
         ],
+        stale_sonarr=_stale_sonarr_views(request),
         has_any_reports=bool(reports),
         has_any_series=bool(series),
         sign_in_notice=sign_in_notice,

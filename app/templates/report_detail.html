@@ -3,7 +3,7 @@
 {% block content %}
 <section class="page-header">
   <h2 class="headline-lg">Report — week {{ report.week }}</h2>
-  <p class="subtle">{{ display_time }} · Trigger: {{ report.trigger }} · Movies: {{ report.totals.movies }} · In library: {{ report.totals.matched }}</p>
+  <p class="subtle">{{ report.chart_scope.label }} · {{ display_time }} · Trigger: {{ report.trigger }} · Movies: {{ report.totals.movies }} · In library: {{ report.totals.matched }}</p>
 </section>
 
 {% if previous_week or next_week %}
@@ -52,13 +52,13 @@
       <div class="poster-empty">Poster</div>
       {% endif %}
       <div class="badge">
-        <span class="dot dot-{{ movie.badge_dot }}"></span><span>{{ movie.badge_label }}</span>
+        <span class="dot {% if movie.badge_dot == 'in_library' %}dot-in-library{% elif movie.badge_dot == 'wanted' %}dot-wanted{% elif movie.badge_dot == 'ignored' %}dot-ignored{% else %}dot-missing{% endif %}"></span><span>{{ movie.badge_label }}</span>
       </div>
       <div class="rank-chip">#{{ movie.rank }}</div>
     </a>
     <div class="poster-title">{{ movie.title }}</div>
     <div class="poster-meta">
-      <span class="gross">{{ movie.gross_display }} (Wk {{ movie.weeks_in_release }})</span>
+      <span class="gross">{{ movie.gross_display }}{% if movie.weeks_in_release %} (Wk {{ movie.weeks_in_release }}){% endif %}</span>
       <span class="links">
         {% if movie.imdb_url %}<a href="{{ movie.imdb_url }}" target="_blank" rel="noopener noreferrer">IMDB</a>{% endif %}
         {% if movie.wiki_url %}<a href="{{ movie.wiki_url }}" target="_blank" rel="noopener noreferrer">Wiki</a>{% endif %}
@@ -97,7 +97,9 @@
        suggestion. Said in the card body rather than over the poster: the badge shares
        that row with the rank chip and its edge with the "where it lives" chips, and this
        belongs beside the control that fixes it anyway — which opens itself below. #}
-    {% if movie.guessed and not movie.in_radarr %}
+    {% if movie.ambiguous %}
+    <span class="guess-hint" title="Radarr has more than one film with this title and nothing confirmed which — this is the first of them, and any library status here is about that one">Best guess — verify</span>
+    {% elif movie.guessed and not movie.in_radarr %}
     <span class="guess-hint" title="No candidate matched the chart title — this is Radarr's first suggestion">Best guess — verify</span>
     {% endif %}
     {# The media server already holds this — say so before the Add button gets pressed.
@@ -154,9 +156,10 @@
       {% endwith %}
       {% endif %}
 
-      {% if not movie.in_radarr %}
+      {% if not movie.in_radarr or movie.ambiguous %}
         {# Chart titles Radarr couldn't identify — or matched to the wrong film — are
-           fixable here instead of being a dead end. #}
+           fixable here instead of being a dead end. Offered on an owned card only when the
+           ownership itself rests on a namesake. #}
         <details{% if movie.guessed %} open{% endif %}>
           <summary class="btn-ignore">{% if movie.tmdb_id %}Wrong match?{% else %}Find this film{% endif %}</summary>
           <form method="get" action="{{ url_base }}/reports/{{ report.id }}/fix-match" class="add-form">
@@ -166,6 +169,8 @@
             <button type="submit" class="btn-add">Search</button>
           </form>
         </details>
+      {% endif %}
+      {% if not movie.in_radarr %}
         {% if movie.ignored %}
         <form method="post" action="{{ url_base }}/unignore">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

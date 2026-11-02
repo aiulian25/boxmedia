@@ -8,7 +8,7 @@
      rather than only showing a confident next date — which is precisely how one that had
      never run once stayed invisible. Wraps as a paragraph, so a longer date format or a
      translated label takes a second line instead of overflowing. #}
-  <p class="subtle">Last check: {{ schedule.last_run }} · Next automatic check: {{ schedule.next_run }} · {{ schedule.rhythm }}</p>
+  <p class="subtle">Last check: {{ schedule.last_run }}{% if schedule.last_outcome %} ({{ schedule.last_outcome }}){% endif %} · Next automatic check: {{ schedule.next_run }} · {{ schedule.rhythm }}</p>
   {% endif %}
 </section>
 
@@ -19,7 +19,7 @@
 <section class="top-gross">
   <div class="top-gross-head">
     <h3 class="top-gross-title">{{ month_top.label }} — highest gross</h3>
-    <span class="top-gross-meta">{{ month_top.weeks_tracked }} week{% if month_top.weeks_tracked != 1 %}s{% endif %} tracked · {{ month_top.titles }} title{% if month_top.titles != 1 %}s{% endif %}{% if month_top.excluded_weeks %} · {{ month_top.excluded_weeks }} week{% if month_top.excluded_weeks != 1 %}s{% endif %} in another region excluded{% endif %}</span>
+    <span class="top-gross-meta">{{ month_top.scope_label }} · {{ month_top.weeks_tracked }} week{% if month_top.weeks_tracked != 1 %}s{% endif %} tracked · {{ month_top.titles }} title{% if month_top.titles != 1 %}s{% endif %}{% if month_top.excluded_weeks %} · {{ month_top.excluded_weeks }} week{% if month_top.excluded_weeks != 1 %}s{% endif %} from another chart excluded{% endif %}</span>
   </div>
   <div class="gross-strip">
     {% for entry in month_top.entries %}
@@ -74,9 +74,15 @@
    date pick and a POST per week. Weeks are named, not just counted, so the offer can be
    judged before it is taken. The list wraps: a dozen labels and a longer translation of
    the sentence around them both need the room. #}
+{% if failed_weeks and failed_weeks.retrying %}
+<p class="subtle">Could not fetch {{ failed_weeks.retrying|join(", ") }} — BoxMedia will try again after a later check.</p>
+{% endif %}
+{% if failed_weeks and failed_weeks.given_up %}
+<p class="subtle">No longer retrying {{ failed_weeks.given_up|join(", ") }} — use Re-run on the week's card to try again.</p>
+{% endif %}
 {% if backfill.running %}
 <p class="banner banner-progress" role="status">
-  Backfilling{% if backfill.current_week %} week {{ backfill.current_week }}{% endif %} — {{ backfill.done }} of {{ backfill.total }} fetched. Refresh to see new weeks.
+  Backfilling{% if backfill.current_week %} week {{ backfill.current_week }}{% endif %} — {{ backfill.done }} of {{ backfill.total }} fetched{% if backfill.failed %}, {{ backfill.failed }} failed{% endif %}{% if backfill.deferred %}, {{ backfill.deferred }} not published yet{% endif %}. Refresh to see new weeks.
 </p>
 {% elif missing %}
 <div class="backfill-offer">

@@ -442,6 +442,74 @@ def test_a_single_currency_month_says_nothing_about_exclusions(
     assert "excluded" not in page
 
 
+def test_two_markets_with_one_symbol_are_never_summed(harness: AppHarness) -> None:
+    """The audit's probe: DE €100 and FR €200 came to €300, with nothing excluded."""
+    harness.activate()
+    _save(
+        harness,
+        _in_currency(
+            _report("2026W28", [_movie(1, "Shared Film", 100 * MILLION, 1)],
+                    run_at="2026-08-20T10:00:00+00:00"),
+            "€", "DE",
+        ),
+        _in_currency(
+            _report("2026W29", [_movie(1, "Shared Film", 200 * MILLION, 1)], suffix="b",
+                    run_at="2026-08-01T10:00:00+00:00"),
+            "€", "FR",
+        ),
+    )
+
+    top = _month_top_grossers(harness.client.app.state.reports.list_reports())
+
+    assert top["entries"][0]["gross_amount"] == 100 * MILLION
+    assert top["weeks_tracked"] == 1
+    assert top["excluded_weeks"] == 1
+    assert top["scope_label"] == "Germany weekend · €"
+
+
+def test_a_domestic_week_and_a_weekend_chart_stay_apart_in_the_same_dollars(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    _save(
+        harness,
+        _report("2026W28", [_movie(1, "Shared Film", 40 * MILLION, 1)],
+                run_at="2026-08-20T10:00:00+00:00"),
+        _in_currency(
+            _report("2026W29", [_movie(1, "Shared Film", 9 * MILLION, 1)], suffix="b",
+                    run_at="2026-08-01T10:00:00+00:00"),
+            "$", "GB",
+        ),
+    )
+
+    top = _month_top_grossers(harness.client.app.state.reports.list_reports())
+
+    assert top["entries"][0]["gross_amount"] == 40 * MILLION
+    assert top["excluded_weeks"] == 1
+    assert top["scope_label"] == "Domestic (US & Canada) weekly · $"
+
+
+def test_one_region_across_a_month_still_adds_up(harness: AppHarness) -> None:
+    harness.activate()
+    _save(
+        harness,
+        _in_currency(_report("2026W28", [_movie(1, "Shared Film", 10 * MILLION, 1)]), "€", "DE"),
+        _in_currency(_report("2026W29", [_movie(1, "Shared Film", 5 * MILLION, 1)]), "€", "DE"),
+    )
+
+    top = _month_top_grossers(harness.client.app.state.reports.list_reports())
+
+    assert top["entries"][0]["gross_display"] == "€15.0M"
+    assert top["excluded_weeks"] == 0
+
+
+def test_the_heading_says_which_chart_the_board_is_built_from(harness: AppHarness) -> None:
+    harness.activate()
+    _save(harness, _in_currency(_report("2026W28", [_movie(1, "Film", MILLION, 1)]), "€", "DE"))
+
+    assert "Germany weekend · €" in harness.client.get("/reports").text
+
+
 def test_the_meta_line_names_what_it_left_out(harness: AppHarness) -> None:
     """A leaderboard quietly built from half a month is worse than one that admits it."""
     harness.activate()
@@ -458,4 +526,4 @@ def test_the_meta_line_names_what_it_left_out(harness: AppHarness) -> None:
     page = harness.client.get("/reports").text
 
     assert "1 week tracked" in page
-    assert "1 week in another region excluded" in page
+    assert "1 week from another chart excluded" in page

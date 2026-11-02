@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from app.services.boxoffice import ChartScope
 from app.services.reports import (
     MAX_BACKFILL_WEEKS,
     MAX_REPORTS,
@@ -76,10 +77,12 @@ def test_histories_are_chronological_and_dedupe_reruns(tmp_path: Path) -> None:
 
     histories = store.histories()
     # Oldest first; the re-run of W31 replaced it rather than adding a second entry.
-    # The currency travels with each figure — a gross without it cannot be added to
-    # anything safely, now that a history can legitimately mix them.
-    assert histories["dune"] == [("2026W30", 1, 80, "$"), ("2026W31", 4, 20, "$")]
-    assert histories["wicked"] == [("2026W30", 2, 40, "$")]
+    # The chart travels with each figure — a gross without it cannot be added to anything
+    # safely, now that a history can legitimately mix them.
+    assert histories["dune"] == [
+        ("2026W30", 1, 80, ChartScope()), ("2026W31", 4, 20, ChartScope()),
+    ]
+    assert histories["wicked"] == [("2026W30", 2, 40, ChartScope())]
 
 
 def test_histories_skip_failed_and_unresolved_runs(tmp_path: Path) -> None:
@@ -89,7 +92,7 @@ def test_histories_skip_failed_and_unresolved_runs(tmp_path: Path) -> None:
     store.save(failed.model_copy(update={"status": RunStatus.SCRAPE_FAILED}))
     store.save(_week_report(2, "current", [_movie(3, "Dune", 10)]))
 
-    assert store.histories()["dune"] == [("2026W30", 1, 80, "$")]
+    assert store.histories()["dune"] == [("2026W30", 1, 80, ChartScope())]
 
 
 # --- one unreadable file must not brick every page (review step 6) ---
@@ -345,7 +348,7 @@ def test_a_week_that_was_tried_and_failed_is_not_missing(tmp_path: Path) -> None
     """The trap this rule exists for. Box Office Mojo genuinely has no data for some
     weeks; the fetch fails and stores a failed report. Counting only COMPLETED weeks here
     would make that week a hole again on every visit, and re-fetch it on every backfill,
-    forever — an endless polite retry is still an endless retry.
+    forever. Failed weeks are `failed_weeks`, retried on a recorded and bounded backoff.
     """
     store = _store_with(tmp_path, [
         _gap_report("2026W30"),
@@ -354,6 +357,70 @@ def test_a_week_that_was_tried_and_failed_is_not_missing(tmp_path: Path) -> None
     ])
 
     assert store.missing_weeks() == []
+
+
+def test_a_history_is_in_chart_order_whatever_order_the_weeks_ran(tmp_path: Path) -> None:
+    """The audit's reproduction: W30 re-run after W32 read back as [W32, W30]."""
+    store = ReportsStore(tmp_path)
+    store.save(_week_report(0, "2026W32", [_movie(1, "Dune", 80)]))
+    store.save(_week_report(1, "2026W31", [_movie(2, "Dune", 70)]))  # a backfill
+    store.save(_week_report(2, "2026W30", [_movie(3, "Dune", 60)]))  # and a re-run
+
+    assert [point[0] for point in store.histories()["dune"]] == ["2026W30", "2026W31", "2026W32"]
+
+
+def test_completed_weeks_are_in_chart_order_too(tmp_path: Path) -> None:
+    store = ReportsStore(tmp_path)
+    store.save(_week_report(0, "2026W32", [_movie(1, "Dune", 80)]))
+    store.save(_week_report(1, "2026W30", [_movie(3, "Dune", 60)]))
+
+    assert [report.week for report in store.completed_weeks()] == ["2026W32", "2026W30"]
+
+
+def test_a_history_keeps_each_weeks_own_chart(tmp_path: Path) -> None:
+    store = ReportsStore(tmp_path)
+    store.save(_week_report(0, "2026W30", [_movie(1, "Dune", 80)]).model_copy(
+        update={"region": "DE", "currency": "€"}
+    ))
+    store.save(_week_report(1, "2026W31", [_movie(1, "Dune", 25)]).model_copy(
+        update={"region": "FR", "currency": "€"}
+    ))
+
+    assert [point[3] for point in store.histories()["dune"]] == [
+        ChartScope("DE", "€"), ChartScope("FR", "€"),
+    ]
+
+
+def test_a_report_from_before_regions_is_the_domestic_weekly_dollar_chart(tmp_path: Path) -> None:
+    report = _gap_report("2026W30")
+
+    assert report.chart_scope == ChartScope()
+    assert report.chart_scope.label == "Domestic (US & Canada) weekly · $"
+
+
+def test_failed_weeks_are_those_with_nothing_but_a_failure(tmp_path: Path) -> None:
+    store = _store_with(tmp_path, [
+        _gap_report("2026W30"),
+        _gap_report("2026W31", status=RunStatus.RADARR_FAILED),
+        _gap_report("2026W32"),
+        _gap_report("2026W32", status=RunStatus.SCRAPE_FAILED),  # has its chart anyway
+        _gap_report("current", status=RunStatus.SCRAPE_FAILED),  # no week to go back to
+    ])
+
+    assert list(store.failed_weeks()) == ["2026W31"]
+
+
+def test_dropping_a_weeks_failures_leaves_its_chart_and_other_weeks(tmp_path: Path) -> None:
+    store = _store_with(tmp_path, [
+        _gap_report("2026W30"),
+        _gap_report("2026W30", status=RunStatus.SCRAPE_FAILED),
+        _gap_report("2026W31", status=RunStatus.SCRAPE_FAILED),
+    ])
+
+    store.drop_failures_for_week("2026W30")
+
+    remaining = {(report.week, report.status) for report in store.list_reports()}
+    assert remaining == {("2026W30", RunStatus.OK), ("2026W31", RunStatus.SCRAPE_FAILED)}
 
 
 def test_the_unresolved_current_label_is_not_a_week(tmp_path: Path) -> None:
