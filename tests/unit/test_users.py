@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import yaml
 from app.core.audit import AuditLog
 from app.services.users import (
     PASSWORD_MIN_LENGTH,
+    ForcedChangeNotPendingError,
     PasswordPolicyError,
     User,
     UserStore,
@@ -18,6 +21,7 @@ from app.services.users import (
 )
 
 STRONG_PASSWORD = "correcthorse7battery"
+READ_WINDOW_SECONDS = 0.05
 
 
 @pytest.fixture
@@ -58,6 +62,64 @@ def test_set_password_clears_forced_change(store: UserStore) -> None:
     assert user.must_change_password is False
     assert user.password_changed_at is not None
     assert store.verify_password(STRONG_PASSWORD) is True
+
+
+def test_the_forced_change_clears_the_flag_once(store: UserStore) -> None:
+    store.bootstrap_if_missing()
+    store.complete_forced_change(STRONG_PASSWORD)
+
+    user = store.load()
+    assert user.must_change_password is False
+    assert user.password_changed_at is not None
+    assert store.verify_password(STRONG_PASSWORD) is True
+
+    with pytest.raises(ForcedChangeNotPendingError):
+        store.complete_forced_change("different7password")
+    assert store.verify_password(STRONG_PASSWORD) is True
+
+
+def test_the_forced_change_still_applies_the_password_policy(store: UserStore) -> None:
+    store.bootstrap_if_missing()
+    with pytest.raises(PasswordPolicyError):
+        store.complete_forced_change("weak")
+    assert store.load().must_change_password is True
+
+
+def test_two_forced_changes_in_flight_cannot_both_land(
+    store: UserStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bootstrap password is in the logs, so two sessions can hold it. The window around
+    the read is held open so unserialized callers both see the change as still owed, which
+    makes this decide the same way every run; under the lock the sleeps just queue."""
+    store.bootstrap_if_missing()
+    original_load = store.load
+
+    def load_slowly() -> User:
+        user = original_load()
+        time.sleep(READ_WINDOW_SECONDS)
+        return user
+
+    monkeypatch.setattr(store, "load", load_slowly)
+    outcomes: list[str] = []
+
+    def attempt(password: str) -> None:
+        try:
+            store.complete_forced_change(password)
+            outcomes.append(password)
+        except ForcedChangeNotPendingError:
+            pass
+
+    threads = [
+        threading.Thread(target=attempt, args=(password,))
+        for password in (STRONG_PASSWORD, "different7password")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert len(outcomes) == 1
+    assert store.verify_password(outcomes[0]) is True
 
 
 def test_bootstrap_password_satisfies_policy(store: UserStore) -> None:

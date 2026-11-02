@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import secrets
 import string
+import threading
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from argon2 import PasswordHasher
+from argon2 import PasswordHasher, extract_parameters
 from argon2.exceptions import VerifyMismatchError
 
 from app.core import filestore
@@ -51,6 +52,10 @@ class PasswordPolicyError(ValueError):
 
 class InvalidThemeError(ValueError):
     """A theme was submitted that this build does not ship."""
+
+
+class ForcedChangeNotPendingError(ValueError):
+    """The first-run password change was attempted on an account that no longer owes one."""
 
 
 @dataclass
@@ -133,6 +138,7 @@ class UserStore:
         # (identity, User) or None. One attribute, assigned in a single statement, so a
         # request thread can never observe a new user paired with a stale identity.
         self._cache: tuple[tuple[int, int, int], User] | None = None
+        self._forced_change_lock = threading.Lock()
 
     def exists(self) -> bool:
         return self._path.exists()
@@ -206,6 +212,21 @@ class UserStore:
     def _audit_log(self) -> AuditLog:
         return self._audit if self._audit is not None else get_audit_log()
 
+    def validate_stored(self) -> None:
+        """Raise unless the stored account is one somebody could log in to.
+
+        Stricter than `load`, which reads the fields without judging them: an unusable hash
+        only surfaces at login, as an error nobody can get past. Read-only, so a backup
+        preflight can ask this of a staged copy.
+        """
+        user = self.load()
+        for text in (user.username, user.display_name, user.email):
+            if not isinstance(text, str):
+                raise ValueError("account text fields must be strings")
+        if not user.username:
+            raise ValueError("account has no username")
+        extract_parameters(user.password_hash)
+
     def verify_password(self, password: str) -> bool:
         user = self.load()
         try:
@@ -225,6 +246,26 @@ class UserStore:
         if clear_forced_change:
             user.must_change_password = False
         self.save(user)
+
+    def complete_forced_change(self, new_password: str) -> None:
+        """Replace the bootstrap password, once. This route asks for no current password, so
+        whether one is still owed is decided here, at the write.
+
+        The bootstrap password was printed to the logs, so a second session can hold it too.
+        Checking only what the gate read would let two requests in flight both pass, and the
+        later one would silently replace the password the admin just chose. Hashed outside
+        the lock so a queued request does not wait out Argon2 as well.
+        """
+        validate_password_policy(new_password)
+        password_hash = _hasher.hash(new_password)
+        with self._forced_change_lock:
+            user = self.load()
+            if not user.must_change_password:
+                raise ForcedChangeNotPendingError("the forced password change is already done")
+            user.password_hash = password_hash
+            user.password_changed_at = datetime.now(UTC).isoformat()
+            user.must_change_password = False
+            self.save(user)
 
     def set_theme(self, theme: str) -> None:
         """Store the account's theme. Strict: an unknown value is refused, never coerced.

@@ -40,6 +40,12 @@ class SessionStore:
     def _now(self) -> datetime:
         return datetime.now(UTC)
 
+    def _expiry(self, created_at: datetime, now: datetime) -> datetime:
+        """The sliding idle window, capped by the absolute TTL: activity extends a session,
+        but never beyond ttl from when it was created."""
+        absolute = created_at + self._ttl
+        return absolute if self._idle is None else min(absolute, now + self._idle)
+
     def _sweep_locked(self, now: datetime) -> None:
         """Drop every expired session. Caller must already hold the lock."""
         expired = [key for key, session in self._sessions.items() if session.expires_at <= now]
@@ -58,7 +64,10 @@ class SessionStore:
         with self._lock:
             self._sweep_locked(now)  # cheap, and login is the natural moment to tidy up
             self._sessions[session_id] = Session(
-                username=username, created_at=now, expires_at=now + self._ttl, notice=notice
+                username=username,
+                created_at=now,
+                expires_at=self._expiry(now, now),
+                notice=notice,
             )
         return session_id
 
@@ -84,10 +93,7 @@ class SessionStore:
             if session.expires_at <= now:
                 del self._sessions[session_id]
                 return None
-            if self._idle is not None:
-                # Sliding idle window, still capped by the absolute TTL: activity extends
-                # the session, but never beyond ttl from when it was created.
-                session.expires_at = min(session.created_at + self._ttl, now + self._idle)
+            session.expires_at = self._expiry(session.created_at, now)
             return session
 
     def delete(self, session_id: str | None) -> None:

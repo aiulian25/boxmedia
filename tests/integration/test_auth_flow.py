@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 import pytest
 
-from tests.conftest import AppHarness, CsrfClient
+from tests.conftest import ACTIVE_PASSWORD, AppHarness, CsrfClient, build_harness
 
 STRONG_PASSWORD = "brandnew9password"
 # The Library is where a session lands and what the gate is tested against.
@@ -12,6 +15,11 @@ LIBRARY = "/library"
 RADARR_KEY = "0123456789abcdef0123456789abcdef"  # noqa: S105 — the suite's dummy key
 LOGIN = "/login"
 CHANGE_PW = "/change-password"
+SETTINGS = "/settings"
+
+
+def _audit_count(harness: AppHarness, action: str) -> int:
+    return sum(action in line for line in harness.audit_lines())
 
 
 def _login(harness: AppHarness, password: str):
@@ -340,6 +348,133 @@ def test_an_unreachable_radarr_stays_a_page_banner(harness: AppHarness) -> None:
 
     assert "Couldn’t reach Main" in page
     assert "Couldn’t reach Main" not in _toast_markup(page)
+
+
+# --- once activated, the first-run route cannot skip the current-password check ---
+
+
+def test_an_activated_account_is_sent_from_the_form_to_settings(harness: AppHarness) -> None:
+    harness.activate()
+    response = harness.client.get(CHANGE_PW, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].endswith(SETTINGS)
+
+
+def test_an_activated_session_cannot_change_the_password_without_the_current_one(
+    harness: AppHarness,
+) -> None:
+    from app.core.sessions import COOKIE_NAME
+
+    active = harness.activate()
+    session_before = harness.client.cookies.get(COOKIE_NAME)
+    audited_changes = _audit_count(harness, "password_changed")
+
+    response = harness.client.post(
+        CHANGE_PW,
+        data={"new_password": STRONG_PASSWORD, "confirm_password": STRONG_PASSWORD},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].endswith(SETTINGS)
+    assert harness.users.verify_password(active) is True
+    assert harness.users.verify_password(STRONG_PASSWORD) is False
+    assert harness.client.cookies.get(COOKIE_NAME) == session_before
+    assert _audit_count(harness, "password_changed") == audited_changes
+    assert "forced_change_not_pending" in "\n".join(harness.audit_lines())
+
+
+def test_a_refused_change_is_refused_before_the_form_is_validated(harness: AppHarness) -> None:
+    # A mismatch must not render the password form back to an activated account.
+    harness.activate()
+    response = harness.client.post(
+        CHANGE_PW,
+        data={"new_password": STRONG_PASSWORD, "confirm_password": "different9x"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].endswith(SETTINGS)
+
+
+def test_a_request_past_the_gate_loses_to_a_change_that_finished_first(
+    harness: AppHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate read `must_change_password` before the other session's write landed, so the
+    route's own check passes and only the store's can refuse."""
+    _login(harness, harness.bootstrap_password)
+    store = harness.client.app.state.users
+    original = store.complete_forced_change
+    admins_password = "theadmins9password"
+
+    def other_session_wins_first(new_password: str) -> None:
+        monkeypatch.setattr(store, "complete_forced_change", original)
+        original(admins_password)
+        original(new_password)
+
+    monkeypatch.setattr(store, "complete_forced_change", other_session_wins_first)
+
+    response = harness.client.post(
+        CHANGE_PW,
+        data={"new_password": STRONG_PASSWORD, "confirm_password": STRONG_PASSWORD},
+        follow_redirects=False,
+    )
+
+    assert response.headers["location"].endswith(SETTINGS)
+    assert harness.users.verify_password(admins_password) is True
+    assert harness.users.verify_password(STRONG_PASSWORD) is False
+    assert "forced_change_not_pending" in "\n".join(harness.audit_lines())
+
+
+def test_a_session_replaced_by_the_forced_change_cannot_retry_it(harness: AppHarness) -> None:
+    _login(harness, harness.bootstrap_password)
+    other = CsrfClient(harness.client.app)
+    other.post(
+        LOGIN,
+        data={"username": "admin", "password": harness.bootstrap_password},
+        follow_redirects=False,
+    )
+    harness.client.post(
+        CHANGE_PW,
+        data={"new_password": STRONG_PASSWORD, "confirm_password": STRONG_PASSWORD},
+        follow_redirects=False,
+    )
+
+    late = other.post(
+        CHANGE_PW,
+        data={"new_password": "attackers9password", "confirm_password": "attackers9password"},
+        follow_redirects=False,
+    )
+
+    assert late.headers["location"].endswith(LOGIN)
+    assert harness.users.verify_password(STRONG_PASSWORD) is True
+
+
+def test_an_anonymous_visitor_is_sent_to_login_from_the_change_form(harness: AppHarness) -> None:
+    response = harness.client.get(CHANGE_PW, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].endswith(LOGIN)
+
+
+def test_a_login_left_unused_past_the_idle_limit_is_signed_out(tmp_path: Path) -> None:
+    from app.core.sessions import SessionStore
+
+    harness = build_harness(tmp_path, session_idle_minutes=30)
+    harness.activate()
+    harness.client.post("/logout", follow_redirects=False)
+    sessions: SessionStore = harness.client.app.state.sessions
+    login_time = datetime.now(UTC)
+    sessions._now = lambda: login_time  # noqa: SLF001 — the injectable clock seam
+    login = harness.client.post(
+        LOGIN,
+        data={"username": "admin", "password": ACTIVE_PASSWORD},
+        follow_redirects=False,
+    )
+    assert login.status_code == 303
+
+    sessions._now = lambda: login_time + timedelta(minutes=31)  # noqa: SLF001
+
+    after = harness.client.get(LIBRARY, follow_redirects=False)
+    assert after.headers["location"].endswith(LOGIN)
 
 
 def test_the_forced_change_ends_every_other_session(harness: AppHarness) -> None:

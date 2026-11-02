@@ -2,7 +2,8 @@
 
 The forced-change page is what the gate redirects a freshly-bootstrapped admin
 to; it does not require the current password because the user just authenticated
-this session. The voluntary change (Step 8) is separate and does require it.
+this session. That only holds while the change is owed: afterwards both routes send
+the user to Settings, where the voluntary change (Step 8) does require it.
 """
 
 from __future__ import annotations
@@ -13,7 +14,12 @@ from fastapi.responses import RedirectResponse
 from app.core.audit import AuditAction, AuditLog
 from app.core.config import Settings
 from app.core.sessions import COOKIE_NAME
-from app.services.users import PasswordPolicyError, burn_password_check
+from app.services.users import (
+    ForcedChangeNotPendingError,
+    PasswordPolicyError,
+    User,
+    burn_password_check,
+)
 from app.web.deps import client_ip, current_user, render
 
 router = APIRouter()
@@ -24,6 +30,14 @@ LIBRARY_PATH = "/library"
 SETTINGS_PATH = "/settings"
 # How far back to look for the previous sign-in when building the post-login notice.
 SIGN_IN_HISTORY_LIMIT = 500
+FORCED_CHANGE_NOT_PENDING_REASON = "forced_change_not_pending"
+STATUS_QUERY_KEY = "status"
+# A restore signs everybody out, so its result is said here. A closed set keyed by the same
+# codes Settings uses: nothing a link carries can put text on the sign-in page.
+LOGIN_NOTICES = {
+    "backup_restored": "Backup restored. Sign in with the password from that backup.",
+    "backup_imported": "Backup imported. Sign in with the password from that backup.",
+}
 
 
 def _redirect(request: Request, path: str) -> RedirectResponse:
@@ -73,6 +87,10 @@ def _set_session_cookie(request: Request, response: RedirectResponse, session_id
     )
 
 
+def clear_session_cookie(request: Request, response: RedirectResponse) -> None:
+    response.delete_cookie(COOKIE_NAME, path=_cookie_path(request.app.state.settings))
+
+
 def rotate_session(request: Request, response: RedirectResponse, username: str) -> None:
     """Invalidate every session, then sign THIS browser back in on a fresh one.
 
@@ -100,7 +118,8 @@ def login_form(request: Request) -> object:
     # admin where to find the credentials. Cleared automatically after they change it.
     users = request.app.state.users
     first_run = users.exists() and users.load().must_change_password
-    return render(request, "login.html", error=None, first_run=first_run)
+    notice = LOGIN_NOTICES.get(request.query_params.get(STATUS_QUERY_KEY, ""))
+    return render(request, "login.html", error=None, first_run=first_run, notice=notice)
 
 
 @router.post(LOGIN_PATH)
@@ -162,14 +181,28 @@ def logout(request: Request) -> RedirectResponse:
         source_ip=client_ip(request),
     )
     response = _redirect(request, LOGIN_PATH)
-    response.delete_cookie(COOKIE_NAME, path=_cookie_path(request.app.state.settings))
+    clear_session_cookie(request, response)
     return response
 
 
 @router.get(CHANGE_PASSWORD_PATH)
 def change_password_form(request: Request) -> object:
-    current_user(request)  # gate guarantees a user; 401 otherwise
+    user = current_user(request)  # gate guarantees a user; 401 otherwise
+    if not user.must_change_password:
+        return _redirect(request, SETTINGS_PATH)
     return render(request, "change_password.html", error=None)
+
+
+def _refuse_finished_forced_change(request: Request, user: User) -> RedirectResponse:
+    """Audited because nothing in the app links here once activated: this is a stale tab,
+    or someone holding a session and trying to skip the current-password check."""
+    request.app.state.audit.record(
+        AuditAction.PASSWORD_CHANGE_REJECTED,
+        actor=user.username,
+        source_ip=client_ip(request),
+        reason=FORCED_CHANGE_NOT_PENDING_REASON,
+    )
+    return _redirect(request, SETTINGS_PATH)
 
 
 @router.post(CHANGE_PASSWORD_PATH)
@@ -181,13 +214,17 @@ def change_password_submit(
     user = current_user(request)
     users = request.app.state.users
 
+    if not user.must_change_password:
+        return _refuse_finished_forced_change(request, user)
     if new_password != confirm_password:
         return render(
             request, "change_password.html",
             status_code=status.HTTP_400_BAD_REQUEST, error="Passwords do not match.",
         )
     try:
-        users.set_password(new_password)
+        users.complete_forced_change(new_password)
+    except ForcedChangeNotPendingError:
+        return _refuse_finished_forced_change(request, user)
     except PasswordPolicyError as exc:
         return render(
             request, "change_password.html",

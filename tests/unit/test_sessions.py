@@ -67,6 +67,45 @@ def test_idle_never_extends_past_absolute_ttl() -> None:
     assert store.get(session_id) is None  # the 1h ceiling still wins
 
 
+def test_a_session_never_read_still_expires_at_the_idle_limit() -> None:
+    """A login whose redirect is delayed has not been active: the window runs from creation,
+    not from the first lookup."""
+    clock = FakeClock()
+    store = _store(clock, ttl=timedelta(hours=12), idle=timedelta(minutes=30))
+    session_id = store.create("admin")
+
+    clock.advance(timedelta(minutes=31))
+    assert store.get(session_id) is None
+
+
+def test_a_session_read_inside_the_first_idle_window_survives() -> None:
+    clock = FakeClock()
+    store = _store(clock, ttl=timedelta(hours=12), idle=timedelta(minutes=30))
+    session_id = store.create("admin")
+
+    clock.advance(timedelta(minutes=29))
+    assert store.get(session_id) is not None
+
+
+def test_an_idle_limit_longer_than_the_ttl_does_not_extend_a_new_session() -> None:
+    clock = FakeClock()
+    store = _store(clock, ttl=timedelta(minutes=10), idle=timedelta(hours=1))
+    session_id = store.create("admin")
+
+    clock.advance(timedelta(minutes=11))
+    assert store.get(session_id) is None
+
+
+def test_an_unread_idle_session_is_swept() -> None:
+    clock = FakeClock()
+    store = _store(clock, ttl=timedelta(hours=12), idle=timedelta(minutes=30))
+    store.create("admin")
+
+    clock.advance(timedelta(minutes=31))
+    store.sweep()
+    assert store._sessions == {}  # noqa: SLF001
+
+
 def test_expired_entries_are_swept() -> None:
     clock = FakeClock()
     store = _store(clock, ttl=timedelta(minutes=10))
