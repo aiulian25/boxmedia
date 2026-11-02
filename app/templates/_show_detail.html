@@ -48,18 +48,23 @@
 
       {# The two registers, unchanged from everywhere else in the app: green states a
          fact, amber states a guess and asks you to check it. #}
+      {% if held_confirmed %}
+      <span class="server-hint">In {% if holder_url %}<a href="{{ holder_url }}" target="_blank" rel="noopener noreferrer">{{ holder_name or "Sonarr" }}</a>{% else %}{{ holder_name or "Sonarr" }}{% endif %}{% if held.series.complete %} — complete, {{ held.series.episode_count }} episodes{% else %} — missing {{ held.series.missing_episode_count }} episode{{ '' if held.series.missing_episode_count == 1 else 's' }}{% endif %}</span>
+      {% else %}
       {% if held %}
-      <span class="server-hint">In {{ held.series.title }}{% if held.series.complete %} — complete, {{ held.series.episode_count }} episodes{% else %} — missing {{ held.series.missing_episode_count }} episode{% if held.series.missing_episode_count != 1 %}s{% endif %}{% endif %}</span>
-      {% elif server_state == 'yes' %}
+      <span class="guess-hint" title="A series with this name and year, and nothing verified it is the same show">Best guess — verify: {% if holder_url %}<a href="{{ holder_url }}" target="_blank" rel="noopener noreferrer">{{ holder_name or "Sonarr" }}</a>{% else %}{{ holder_name or "Sonarr" }}{% endif %} may have this as {{ held.series.title }}</span>
+      {% endif %}
+      {% if server_state == 'yes' %}
       <span class="server-hint" title="Your {{ server_name }} holds this series (matched by id) — Sonarr does not">Already on {{ server_name }} — Sonarr does not have it</span>
       {% elif server_state == 'probably' %}
       <span class="guess-hint" title="A {{ server_name }} series of the same name and year — nothing verified it is the same show">Probably on {{ server_name }} — verify</span>
       {% endif %}
+      {% endif %}
 
       {# The add block. It asks ONE question, and says in words why it asks no more. #}
       <div class="movie-actions">
-        {% if held %}
-        <span class="field-note">Already in Sonarr — open it there to change what is monitored.</span>
+        {% if held_confirmed %}
+        <span class="field-note">Already in {{ holder_name or "Sonarr" }} — open it there to change what is monitored.</span>
         {% elif not show.addable %}
         {# An honest refusal beats an Add that could not work: Sonarr identifies series
            by TVDB id and TMDB has none for this one. #}
@@ -82,7 +87,7 @@
 
       {# Said once, in words, rather than as four more controls. The rule is the film
          add's rule, and stating it is what stops someone hunting for a quality picker. #}
-      {% if targets and not held and show.addable %}
+      {% if targets and not held_confirmed and show.addable %}
       <p class="field-note">Quality, folder, series type and season folders come from that connection, set once in <a href="{{ url_base }}/settings">Settings</a> — they are per connection, not per show.</p>
       {% endif %}
     </div>

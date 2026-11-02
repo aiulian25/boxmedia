@@ -22,6 +22,7 @@ from app.core import security
 from app.core.sessions import COOKIE_NAME
 from app.services.apps import (
     KIND_SONARR,
+    AppNotFoundError,
     ExternalApp,
     InvalidAppError,
     client_for_credentials,
@@ -36,6 +37,7 @@ from app.services.mediaserver import (
 from app.services.posters import POSTER_WIDTH, sized
 from app.services.radarr import RadarrClient, RadarrError, RadarrMovie
 from app.services.radarr_options import RadarrOptions, fetch_options
+from app.services.series import CachedSeries, SeriesMatch
 from app.services.sonarr import SonarrClient, SonarrError
 from app.services.users import THEME_DARK, User
 
@@ -381,8 +383,12 @@ async def load_media_server_snapshot(request: Request) -> MediaServerSnapshot | 
     return cached[0] if cached is not None else None
 
 
-async def refresh_media_server_snapshot(app: FastAPI) -> None:
-    """Re-read the media server into the cache — the half of the above nobody waits for.
+async def refresh_media_server_snapshot(app: FastAPI) -> bool:
+    """Re-read the media server into the cache. True when it did.
+
+    The half of the above nobody waits for, and what the Settings Refresh button waits for,
+    so the two cannot disagree about what a refresh replaces. A read that fails part-way
+    raises before anything is saved, so what was known stays known.
 
     Takes the app rather than the request: it runs after the response has gone. Bounded by
     the client's own per-request timeout, so a server that hangs ends the refresh rather
@@ -398,9 +404,10 @@ async def refresh_media_server_snapshot(app: FastAPI) -> None:
         fetch = await client.list_library(include_series=include_series)
     except MediaServerError:
         backoff.note_failure(MEDIA_SERVER_BACKOFF_KEY)
-        return
+        return False
     backoff.note_success(MEDIA_SERVER_BACKOFF_KEY)
     await asyncio.to_thread(app.state.media_server_cache.save, fetch)
+    return True
 
 
 async def load_radarr_options(request: Request, app_id: str | None = None) -> RadarrOptions:
@@ -538,7 +545,7 @@ async def load_all_radarr_libraries(
 
 
 async def load_radarr_queue(
-    request: Request, app_id: str | None = None
+    request: Request, app_id: str | None = None, *, probing: bool = False
 ) -> dict[int, float] | None:
     """One Radarr's download progress by movie id, or None when it could not be read.
 
@@ -550,31 +557,40 @@ async def load_radarr_queue(
     app_id = app_id or request.app.state.apps.primary_id()
     if app_id is None:
         return None
-    if radarr_backoff(request).should_skip(app_id):
+    if not probing and radarr_backoff(request).should_skip(app_id):
         return None
     try:
         client = radarr_client_for(request, app_id, timeout=RADARR_LIBRARY_TIMEOUT_SECONDS)
-        return await asyncio.wait_for(
+        queue = await asyncio.wait_for(
             client.queue(), timeout=RADARR_LIBRARY_TIMEOUT_SECONDS
         )
     except (RadarrError, TimeoutError, KeyError):
         radarr_backoff(request).note_failure(app_id)
         return None
+    if probing:
+        radarr_backoff(request).note_success(app_id)
+    return queue
 
 
 async def load_all_radarr_queues(
-    request: Request,
+    request: Request, *, probing: bool = False
 ) -> dict[str, dict[int, float] | None]:
     """Every connection's queue, concurrently — the libraries' counterpart.
 
-    Note what this does NOT do: it never calls `note_success`. The library read beside it
-    already answers "is this box up", and a queue that failed on its own should not clear
-    a backoff the library set.
+    Note what this does NOT do for a page: it never calls `note_success`. The library read
+    beside it already answers "is this box up", and a queue that failed on its own should not
+    clear a backoff the library set.
+
+    `probing` is for the progress poller. It asks whether a down server is back, nobody is
+    waiting on the answer, and the script already asks less often while one is down, so the
+    backoff that protects pages is not for it. A server answering clears that backoff.
     """
     apps = request.app.state.apps.list_apps()
     if not apps:
         return {}
-    results = await asyncio.gather(*[load_radarr_queue(request, app.id) for app in apps])
+    results = await asyncio.gather(
+        *[load_radarr_queue(request, app.id, probing=probing) for app in apps]
+    )
     return dict(zip([app.id for app in apps], results, strict=True))
 
 
@@ -628,6 +644,34 @@ def radarr_url_for(app: ExternalApp, movie: RadarrMovie) -> str | None:
         return None
     base = safe_external_url(app.url)
     return f"{base}/movie/{quote(movie.title_slug, safe='')}" if base else None
+
+
+def sonarr_url_for(app: ExternalApp, series: CachedSeries) -> str | None:
+    """That series' page on that Sonarr, or None when it cannot be addressed.
+
+    `radarr_url_for`'s twin, and the same reasoning: `titleSlug` is what Sonarr's own UI
+    routes on, the base is the admin-configured address rather than anything
+    request-derived, and a record without a slug yields no link instead of a guessed one.
+    """
+    if not series.title_slug:
+        return None
+    base = safe_external_url(app.url)
+    return f"{base}/series/{quote(series.title_slug, safe='')}" if base else None
+
+
+def series_holder(request: Request, held: SeriesMatch | None) -> dict[str, str | None]:
+    """The connection a match is on, for naming it and linking to it.
+
+    Empty for a connection the cache remembers and Settings no longer has: the cache is
+    derived, and an entry can briefly outlive the connection that filled it.
+    """
+    if held is None:
+        return {"holder_name": None, "holder_url": None}
+    try:
+        app = request.app.state.apps.get(held.app_id)
+    except AppNotFoundError:
+        return {"holder_name": None, "holder_url": None}
+    return {"holder_name": app.name, "holder_url": sonarr_url_for(app, held.series)}
 
 
 def _queued_percent(

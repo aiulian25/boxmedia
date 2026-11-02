@@ -37,9 +37,9 @@
 
 {# Persistent, not a toast: "we could not look" is a state that lasts until the box comes
    back, and the entries below are older than the page claims because of exactly this. #}
-{% if incomplete_notice %}
-<p class="banner-warn" role="status">{{ incomplete_notice }}</p>
-{% endif %}
+{% for source in unavailable_sources %}
+<p class="banner-warn" role="status">No answer from {{ source.name }} — {% if source.since %}its entries here are from {{ source.since }}{% else %}nothing from it has been read yet, so this week may be missing things{% endif %}.</p>
+{% endfor %}
 
 {# Above the grid rather than under it: seven columns of "Nothing" answer the question
    wrongly, and this is the one empty state with something to do about it. #}

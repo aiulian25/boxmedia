@@ -181,7 +181,7 @@ class TestTheCalendar:
         entries = CalendarCache(tmp_path).load()
         assert {entry.kind for entry in entries} == {KIND_MOVIE, KIND_SERIES}
         assert {entry.connection for entry in entries} == {
-            SONARR_CONNECTION, RADARR_CONNECTION
+            "sonarr-1", "radarr-1"
         }
 
     def test_refreshing_twice_does_not_double_the_week(self, tmp_path: Path) -> None:
@@ -261,7 +261,7 @@ class TestTheCalendar:
 
         # The film is still on the week — "we could not look" is not "nothing is due".
         assert {entry.connection for entry in CalendarCache(tmp_path).load()} == {
-            SONARR_CONNECTION, RADARR_CONNECTION
+            "sonarr-1", "radarr-1"
         }
 
     def test_a_connection_that_is_down_is_not_asked_again_straight_away(
@@ -309,9 +309,7 @@ class TestTheCalendar:
         asyncio.run(_refresher(tmp_path, apps, clients).calendar())
 
         assert asyncio.run(_refresher(tmp_path, apps[:1], clients).calendar()) is True
-        assert {entry.connection for entry in CalendarCache(tmp_path).load()} == {
-            SONARR_CONNECTION
-        }
+        assert {entry.connection for entry in CalendarCache(tmp_path).load()} == {"sonarr-1"}
 
     def test_no_connections_at_all_is_an_honest_empty_week(self, tmp_path: Path) -> None:
         assert asyncio.run(_refresher(tmp_path, [], {}).calendar()) is True
@@ -514,8 +512,7 @@ def test_two_overlapping_calendar_merges_keep_both_weeks(tmp_path: Path, monkeyp
     the later writer builds its document from a read that predates the earlier one's
     write and drops that connection's whole week.
     """
-    refresher = _refresher(tmp_path, [], {})
-    cache = refresher._calendar_cache
+    cache = CalendarCache(tmp_path)
     original_load = cache.load
 
     def load_slowly() -> list[CalendarEntry]:
@@ -528,8 +525,11 @@ def test_two_overlapping_calendar_merges_keep_both_weeks(tmp_path: Path, monkeyp
     # Each writer refreshed one connection and keeps whatever the other one left behind.
     threads = [
         threading.Thread(
-            target=refresher._merge_calendar,
-            args=([_entry(mine)], {theirs}),
+            target=cache.merge,
+            args=([_entry(mine)],),
+            kwargs={
+                "answered": {mine}, "unanswered": {theirs}, "legacy_names": {}, "now": 1000.0,
+            },
         )
         for mine, theirs in ((RADARR_CONNECTION, SONARR_CONNECTION),
                              (SONARR_CONNECTION, RADARR_CONNECTION))
@@ -542,3 +542,99 @@ def test_two_overlapping_calendar_merges_keep_both_weeks(tmp_path: Path, monkeyp
     assert {entry.connection for entry in original_load()} == {
         RADARR_CONNECTION, SONARR_CONNECTION
     }
+
+
+class TestCalendarSources:
+    """Two connections, one of them going down, renamed, coming back and being removed."""
+
+    def _apps(self, radarr_name: str = RADARR_CONNECTION) -> list[ExternalApp]:
+        return [
+            _app("sonarr-1", SONARR_CONNECTION, KIND_SONARR),
+            _app("radarr-1", radarr_name, KIND_RADARR),
+        ]
+
+    def _both_answer(self, tmp_path: Path) -> dict[str, _StubClient]:
+        clients = {
+            "sonarr-1": _StubClient([_episode()]),
+            "radarr-1": _StubClient([_release()]),
+        }
+        asyncio.run(_refresher(tmp_path, self._apps(), clients).calendar())
+        return clients
+
+    def test_each_connection_keeps_its_own_record(self, tmp_path: Path) -> None:
+        clients = self._both_answer(tmp_path)
+        first_success = CalendarCache(tmp_path).sources()["radarr-1"].last_success
+        clients["radarr-1"] = _StubClient(error=RadarrError("down"))
+
+        asyncio.run(_refresher(tmp_path, self._apps(), clients).calendar())
+
+        sources = CalendarCache(tmp_path).sources()
+        assert sources["radarr-1"].failed is True
+        assert sources["radarr-1"].last_success == first_success  # not renewed by the refresh
+        assert sources["sonarr-1"].failed is False
+
+    def test_a_rename_during_an_outage_keeps_the_rows(self, tmp_path: Path) -> None:
+        """The audit's reproduction: the old name matched nothing, so the rows went."""
+        clients = self._both_answer(tmp_path)
+        clients["radarr-1"] = _StubClient(error=RadarrError("down"))
+
+        apps = self._apps(radarr_name="Renamed Radarr")
+        asyncio.run(_refresher(tmp_path, apps, clients).calendar())
+
+        assert "radarr-1" in {entry.connection for entry in CalendarCache(tmp_path).load()}
+
+    def test_recovery_replaces_the_rows_and_clears_the_failure(self, tmp_path: Path) -> None:
+        clients = self._both_answer(tmp_path)
+        clients["radarr-1"] = _StubClient(error=RadarrError("down"))
+        backoff = RadarrBackoff()
+        refresher = _refresher(tmp_path, self._apps(), clients)
+        refresher._backoff = backoff
+        asyncio.run(refresher.calendar())
+
+        clients["radarr-1"] = _StubClient([])
+        backoff.note_success("radarr-1")
+        asyncio.run(refresher.calendar())
+
+        cache = CalendarCache(tmp_path)
+        assert cache.sources()["radarr-1"].failed is False
+        # An empty answer is a real one: its old rows go, and it is not reported as a failure.
+        assert {entry.connection for entry in cache.load()} == {"sonarr-1"}
+
+    def test_a_removed_connection_takes_its_record_and_rows_and_nothing_else(
+        self, tmp_path: Path
+    ) -> None:
+        clients = self._both_answer(tmp_path)
+
+        asyncio.run(_refresher(tmp_path, self._apps()[:1], clients).calendar())
+
+        cache = CalendarCache(tmp_path)
+        assert set(cache.sources()) == {"sonarr-1"}
+        assert {entry.connection for entry in cache.load()} == {"sonarr-1"}
+
+    def test_nothing_answering_records_the_failure_but_not_a_fetch(self, tmp_path: Path) -> None:
+        clients = {
+            "sonarr-1": _StubClient(error=SonarrError("x")),
+            "radarr-1": _StubClient(error=RadarrError("x")),
+        }
+
+        asyncio.run(_refresher(tmp_path, self._apps(), clients).calendar())
+
+        cache = CalendarCache(tmp_path)
+        assert all(source.failed for source in cache.sources().values())
+        assert cache.fetched_at() is None
+        assert cache.is_stale() is True
+
+    def test_a_row_written_under_a_name_finds_its_connection(self, tmp_path: Path) -> None:
+        """Files from before rows carried ids. Names were unique, so this is unambiguous."""
+        cache = CalendarCache(tmp_path)
+        cache.save([_entry(RADARR_CONNECTION), _entry("A Box Long Gone")])
+        clients = {
+            "sonarr-1": _StubClient([_episode()]),
+            "radarr-1": _StubClient(error=RadarrError("down")),
+        }
+
+        asyncio.run(_refresher(tmp_path, self._apps(), clients).calendar())
+
+        titles = {entry.title: entry.connection for entry in cache.load()}
+        assert titles[f"Arrival from {RADARR_CONNECTION}"] == "radarr-1"
+        assert "Arrival from A Box Long Gone" not in titles

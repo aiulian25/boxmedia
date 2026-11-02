@@ -15,7 +15,6 @@ and "there is nothing" are different claims, and only one of them is true.
 from __future__ import annotations
 
 import asyncio
-import threading
 from datetime import UTC, datetime
 
 from app.core.config import Settings
@@ -62,8 +61,6 @@ class ServerRefresher:
         self._calendar_cache = calendar_cache
         self._series_cache = series_cache
         self._backoff = backoff
-        # Guards the calendar's read-modify-write; see `_merge_calendar`.
-        self._calendar_write_lock = threading.Lock()
 
     # --- the calendar ---
 
@@ -71,11 +68,8 @@ class ServerRefresher:
         """Re-read every connection's window into the merged cache. True when all answered.
 
         A connection that does not answer keeps the rows it contributed last time rather
-        than vanishing from the week; the caller gets False so a page can say which it is.
-
-        Rows from a connection that no longer exists are dropped rather than kept —
-        otherwise a deleted Radarr would go on filling days forever, with nothing left to
-        refresh it.
+        than vanishing from the week, and the cache records that, so every later view can
+        say so and not only this request.
         """
         now = datetime.now(UTC)
         start, end = window_for(now.date())
@@ -85,36 +79,18 @@ class ServerRefresher:
             *[self._read_calendar(app, start=start, end=end, now=now) for app in apps]
         )
         answered = {
-            app.name for app, rows in zip(apps, results, strict=True) if rows is not None
+            app.id for app, rows in zip(apps, results, strict=True) if rows is not None
         }
-        configured = {app.name for app in apps}
         fresh = [entry for rows in results if rows is not None for entry in rows]
-        if answered or not apps:
-            # Nothing answered means nothing was learned. Writing an empty week here would
-            # stamp it fresh and turn "we could not look" into "nothing is due" — so the
-            # previous answer keeps its own timestamp and stays visibly stale instead. With
-            # no connections configured at all, an empty week is the true answer.
-            await asyncio.to_thread(self._merge_calendar, fresh, configured - answered)
+        await asyncio.to_thread(
+            self._calendar_cache.merge,
+            fresh,
+            answered=answered,
+            unanswered={app.id for app in apps} - answered,
+            legacy_names={app.name: app.id for app in apps},
+            now=now.timestamp(),
+        )
         return all(rows is not None for rows in results)
-
-    def _merge_calendar(self, fresh: list[CalendarEntry], keep: set[str]) -> None:
-        """Write `fresh`, plus the rows still held by the connections `keep` names.
-
-        A connection that did not answer keeps the rows it contributed last time; one
-        that no longer exists is dropped, or a deleted Radarr would fill days forever
-        with nothing left to refresh it.
-
-        Read and write happen together, on one worker thread, under one lock, because
-        they are a read-modify-write: the morning job can overlap a page render that
-        found the cache stale. Split across an await, the later writer would build its
-        document from a read taken before the earlier one's write and lose a
-        connection's whole week.
-        """
-        with self._calendar_write_lock:
-            kept = [
-                entry for entry in self._calendar_cache.load() if entry.connection in keep
-            ]
-            self._calendar_cache.save(fresh + kept)
 
     async def _read_calendar(
         self, app: ExternalApp, *, start: datetime, end: datetime, now: datetime
@@ -143,13 +119,13 @@ class ServerRefresher:
         if not is_series:
             return [
                 entry_from_release(
-                    row, connection=app.name, progress=progress.get(row.radarr_id), now=now
+                    row, connection=app.id, progress=progress.get(row.radarr_id), now=now
                 )
                 for row in rows
             ]
         episodes = [
             entry_from_episode(
-                row, connection=app.name, progress=progress.get(row.series_id), now=now
+                row, connection=app.id, progress=progress.get(row.series_id), now=now
             )
             for row in rows
         ]

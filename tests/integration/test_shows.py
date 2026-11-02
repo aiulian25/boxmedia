@@ -7,6 +7,8 @@ wrong series or a second copy of the right one.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import respx
 
@@ -496,7 +498,7 @@ def test_the_tmdb_client_ignores_the_home_server_tls_escape_hatch(tmp_path) -> N
     it, while Discover's refresh (which never passed it) kept working.
 
     Built adversarially: verification disabled AND a private CA named. The client must
-    still verify against the system trust store, which is what the README promises for
+    still verify against the pinned CA bundle, which is what the README promises for
     every public endpoint.
     """
     from types import SimpleNamespace
@@ -518,3 +520,135 @@ def test_the_tmdb_client_ignores_the_home_server_tls_escape_hatch(tmp_path) -> N
 
     assert client is not None
     assert client._verify is True
+
+
+# --- only an exact id blocks an Add ---
+
+
+ADD_SERIES_PATH_ATTR = 'action="/add-series"'
+
+
+def _sonarr_holding(harness: AppHarness, *, tvdb_id: int, title: str = "The Hollow Coast") -> str:
+    app_id = _sonarr(harness)
+    harness.client.app.state.series_cache.save(app_id, (
+        SonarrSeries(
+            sonarr_id=14, tvdb_id=tvdb_id, title=title, year=2023,
+            monitored=True, ended=False, episode_count=18, episode_file_count=10,
+            title_slug="the-hollow-coast",
+        ),
+    ))
+    return app_id
+
+
+def _detail_page(harness: AppHarness) -> str:
+    return harness.client.get("/shows/1396").text
+
+
+@respx.mock
+def test_an_exact_id_names_and_links_the_owner_and_hides_add(harness: AppHarness) -> None:
+    """It printed the series' own title where it meant the connection."""
+    _mock_detail()
+    harness.activate()
+    _keys(harness)
+    _sonarr_holding(harness, tvdb_id=121361)
+
+    page = _detail_page(harness)
+
+    assert f'href="{SONARR_URL}/series/the-hollow-coast"' in page
+    assert ">Sonarr</a> — missing 8 episodes" in page
+    assert "Already in Sonarr" in page
+    assert ADD_SERIES_PATH_ATTR not in page
+
+
+@respx.mock
+def test_a_namesake_with_another_id_keeps_add_and_claims_nothing(harness: AppHarness) -> None:
+    _mock_detail()
+    harness.activate()
+    _keys(harness)
+    _sonarr_holding(harness, tvdb_id=999)
+
+    page = _detail_page(harness)
+
+    assert ADD_SERIES_PATH_ATTR in page
+    assert "Already in" not in page
+    assert "Best guess" not in page
+    assert "missing 8 episodes" not in page
+
+
+@respx.mock
+def test_a_name_match_with_no_id_warns_links_to_check_and_keeps_add(harness: AppHarness) -> None:
+    _mock_detail()
+    harness.activate()
+    _keys(harness)
+    _sonarr_holding(harness, tvdb_id=0)
+
+    page = _detail_page(harness)
+
+    assert "Best guess — verify" in page
+    assert f'href="{SONARR_URL}/series/the-hollow-coast"' in page
+    assert ADD_SERIES_PATH_ATTR in page
+    assert "missing 8 episodes" not in page
+
+
+@respx.mock
+def test_add_goes_through_past_a_name_match_with_the_right_id(harness: AppHarness) -> None:
+    """Checked at the wire: a guess on the page must not become a refusal here."""
+    route = respx.post(SERIES_POST).mock(return_value=httpx.Response(201, json={"id": 15}))
+    respx.get(SERIES_POST).mock(return_value=httpx.Response(200, json=[]))
+    harness.activate()
+    _keys(harness)
+    _sonarr_holding(harness, tvdb_id=0)
+
+    response = harness.client.post("/add-series", data={
+        "tmdb_id": "1396", "title": "The Hollow Coast", "tvdb_id": "121361",
+    }, follow_redirects=False)
+
+    assert ShowStatus.ADDED in response.headers["location"]
+    assert json.loads(route.calls.last.request.content)["tvdbId"] == 121361
+
+
+@respx.mock
+def test_add_goes_through_past_a_namesake_with_another_id(harness: AppHarness) -> None:
+    route = respx.post(SERIES_POST).mock(return_value=httpx.Response(201, json={"id": 15}))
+    respx.get(SERIES_POST).mock(return_value=httpx.Response(200, json=[]))
+    harness.activate()
+    _keys(harness)
+    _sonarr_holding(harness, tvdb_id=999)
+
+    response = harness.client.post("/add-series", data={
+        "tmdb_id": "1396", "title": "The Hollow Coast", "tvdb_id": "121361",
+    }, follow_redirects=False)
+
+    assert ShowStatus.ADDED in response.headers["location"]
+    assert route.called
+
+
+@respx.mock
+def test_an_exact_id_on_another_connection_still_blocks_the_add(harness: AppHarness) -> None:
+    """The stated policy for several Sonarrs: a show is fetched by one of them. The owner on
+    the page is the connection actually holding it, not the first or the chosen one."""
+    _mock_detail()
+    route = respx.post(SERIES_POST).mock(return_value=httpx.Response(201, json={"id": 15}))
+    harness.activate()
+    _keys(harness)
+    chosen = _sonarr(harness)
+    apps = harness.client.app.state.apps
+    apps.add(name="Attic", url="http://attic.local:8989", api_key="e" * 32, kind="sonarr")
+    attic = next(app.id for app in apps.list_apps("sonarr") if app.name == "Attic")
+    harness.client.app.state.series_cache.save(attic, (
+        SonarrSeries(
+            sonarr_id=9, tvdb_id=121361, title="The Hollow Coast", year=2023,
+            monitored=True, ended=False, episode_count=18, episode_file_count=18,
+            title_slug="the-hollow-coast",
+        ),
+    ))
+
+    page = _detail_page(harness)
+    response = harness.client.post("/add-series", data={
+        "tmdb_id": "1396", "title": "The Hollow Coast", "tvdb_id": "121361", "target": chosen,
+    }, follow_redirects=False)
+
+    assert 'href="http://attic.local:8989/series/the-hollow-coast"' in page
+    assert ">Attic</a> — complete" in page
+    assert ShowStatus.ALREADY in response.headers["location"]
+    assert not route.called

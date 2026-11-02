@@ -602,3 +602,48 @@ def test_monitor_options_are_sonarrs_own_spellings() -> None:
 
     assert MONITOR_OPTIONS == (MONITOR_ALL, "future", MONITOR_FIRST_SEASON, "none")
     assert MONITOR_FIRST_SEASON == "firstSeason"
+
+
+# --- whether the queue answered in full ---
+
+
+@pytest.mark.parametrize(
+    ("payload", "complete"),
+    [
+        ({"totalRecords": 1, "records": [{"seriesId": 7, "size": 10, "sizeleft": 5}]}, True),
+        ({"totalRecords": 0, "records": []}, True),
+        ({"totalRecords": 250, "records": [{"seriesId": 7, "size": 10, "sizeleft": 5}]}, False),
+        ({"records": [{"seriesId": 7, "size": 10, "sizeleft": 5}]}, True),
+        ({"records": [{"seriesId": n, "size": 1, "sizeleft": 0} for n in range(QUEUE_PAGE_SIZE)]},
+         False),
+        ({"totalRecords": "lots", "records": []}, True),
+    ],
+    ids=["whole", "empty", "truncated", "no-total-short", "no-total-full-page", "bad-total"],
+)
+@respx.mock
+async def test_the_queue_says_whether_it_is_whole(payload: dict, complete: bool) -> None:
+    respx.get(f"{API}/queue").mock(return_value=httpx.Response(200, json=payload))
+
+    progress = await SonarrClient(BASE_URL, "apikey").queue()
+
+    assert progress.complete is complete
+
+
+@respx.mock
+async def test_a_library_with_no_readable_row_is_a_failure_not_an_empty_library() -> None:
+    respx.get(f"{API}/series").mock(return_value=httpx.Response(200, json=[1, "x", None]))
+
+    with pytest.raises(SonarrError):
+        await SonarrClient(BASE_URL, "apikey").list_series()
+
+
+@respx.mock
+async def test_one_odd_series_row_costs_only_that_row() -> None:
+    respx.get(f"{API}/series").mock(return_value=httpx.Response(200, json=[
+        {"id": 1, "tvdbId": 5, "title": "Good"}, 7,
+    ]))
+
+    series = await SonarrClient(BASE_URL, "apikey").list_series()
+
+    assert [item.tvdb_id for item in series] == [5]
+

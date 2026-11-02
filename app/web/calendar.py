@@ -81,9 +81,6 @@ KIND_LABELS = {KIND_MOVIE: "Film", KIND_SERIES: "TV"}
 # Which cached kind each chip keeps. `all` keeps everything and so is absent by design.
 CHIP_KINDS = {TYPE_MOVIES: KIND_MOVIE, TYPE_TV: KIND_SERIES}
 
-INCOMPLETE_NOTICE = (
-    "Some connections did not answer — their entries below are the last ones fetched."
-)
 # Said instead of `format_timestamp`'s "—", for the reason the weekly page says it: the
 # two are different facts. "—" reads as a time we do not know; this is a fetch that has
 # not happened, which is the state the line exists to make visible.
@@ -209,9 +206,8 @@ async def calendar(
     week_start = _resolve_week(week, today)
 
     cache = request.app.state.calendar_cache
-    complete = True
     if cache.is_stale():
-        complete = await refresh_calendar(request)
+        await refresh_calendar(request)
     entries = _kept(cache.load(), media_type)
 
     earliest, latest = _reachable_weeks(today)
@@ -243,9 +239,27 @@ async def calendar(
         # actually happens instead of promising a time nothing keeps, which is the weekly
         # page's own rule: a schedule that has never fired says so.
         next_fetch=_next_fetch_display(request),
-        incomplete_notice=None if complete else INCOMPLETE_NOTICE,
+        unavailable_sources=_unavailable_sources(request, cache),
         configured=bool(request.app.state.apps.list_apps(kind=None)),
     )
+
+
+def _unavailable_sources(request: Request, cache: object) -> list[dict]:
+    """The connections whose part of this page is not current, from what the cache recorded,
+    so the warning lasts as long as the outage and not just the request that met it. A
+    connection with no record has not been asked, which is no more an answer than a failure."""
+    recorded = cache.sources()
+    views = []
+    for app in request.app.state.apps.list_apps(kind=None):
+        source = recorded.get(app.id)
+        if source is not None and not source.failed:
+            continue
+        success = source.last_success if source else None
+        views.append({
+            "name": app.name,
+            "since": format_timestamp(datetime.fromtimestamp(success, UTC)) if success else None,
+        })
+    return views
 
 
 def _next_fetch_display(request: Request) -> str | None:

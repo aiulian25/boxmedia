@@ -880,6 +880,34 @@ async def test_a_movies_only_install_never_walks_the_tv_library() -> None:
 
 
 @respx.mock
+async def test_a_failed_show_read_fails_the_whole_read() -> None:
+    """Rather than answering with the films alone, which a save would take as the whole
+    library and lose every show that was known."""
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=_sections_body())
+    )
+    respx.get(f"{PLEX_URL}/library/sections/1/all").mock(return_value=_page([], 0))
+    respx.get(f"{PLEX_URL}/library/sections/5/all").mock(return_value=_page([], 0))
+    respx.get(f"{PLEX_URL}/library/sections/2/all").mock(return_value=httpx.Response(500))
+
+    with pytest.raises(MediaServerError):
+        await _client().list_library()
+
+
+@respx.mock
+async def test_a_failed_series_read_fails_jellyfins_whole_read_too() -> None:
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.params["IncludeItemTypes"] == "Series":
+            return httpx.Response(500)
+        return _items([])
+
+    respx.get(f"{JELLYFIN_URL}/Items").mock(side_effect=answer)
+
+    with pytest.raises(MediaServerError):
+        await _jf_client().list_library()
+
+
+@respx.mock
 async def test_a_trimmed_show_list_makes_the_whole_answer_partial() -> None:
     """The card that says "truncated" must not claim completeness because the other half
     fitted."""
@@ -1080,3 +1108,114 @@ async def test_a_refresh_that_fails_keeps_the_old_snapshot_and_backs_off() -> No
 
     assert app.state.media_server_cache.saved == []
     assert app.state.media_server_backoff.should_skip(MEDIA_SERVER_BACKOFF_KEY)
+
+
+# --- an answer that is not a library must not read as an empty one ---
+
+_NOT_A_PLEX_LIBRARY = [
+    [], "oops", 7, None, {}, {"MediaContainer": None}, {"MediaContainer": 5},
+    {"MediaContainer": {"Directory": 3}},
+]
+
+
+@pytest.mark.parametrize("body", _NOT_A_PLEX_LIBRARY, ids=repr)
+@respx.mock
+async def test_plex_answering_something_else_is_a_controlled_failure(body: object) -> None:
+    """A proxy's answer, say. These raised errors nothing caught, or `{}` read as a library
+    with nothing in it, which a save would put in place of everything known."""
+    respx.get(f"{PLEX_URL}/library/sections").mock(return_value=httpx.Response(200, json=body))
+
+    with pytest.raises(MediaServerError):
+        await _client().list_library()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"MediaContainer": {"Metadata": 4}},
+        {"MediaContainer": {"Metadata": [_movie_item("Film", 2020, [])], "totalSize": "lots"}},
+        {"MediaContainer": {"Metadata": [1, None], "totalSize": 2}},
+    ],
+    ids=["rows-not-a-list", "unusable-total", "no-readable-row"],
+)
+@respx.mock
+async def test_a_plex_section_answering_something_else_is_a_controlled_failure(
+    body: dict,
+) -> None:
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=_sections_body())
+    )
+    respx.get(url__regex=rf"{PLEX_URL}/library/sections/\d+/all").mock(
+        return_value=httpx.Response(200, json=body)
+    )
+
+    with pytest.raises(MediaServerError):
+        await _client().list_library(include_series=False)
+
+
+@respx.mock
+async def test_a_plex_section_with_nothing_in_it_is_still_empty_and_fine() -> None:
+    """Plex leaves `Metadata` out of an empty section, so that has to stay legitimate."""
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=_sections_body())
+    )
+    respx.get(url__regex=rf"{PLEX_URL}/library/sections/\d+/all").mock(
+        return_value=httpx.Response(200, json={"MediaContainer": {"size": 0}})
+    )
+
+    fetch = await _client().list_library(include_series=False)
+
+    assert fetch.movies == ()
+
+
+@respx.mock
+async def test_one_odd_plex_row_costs_only_that_row() -> None:
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=_sections_body())
+    )
+    respx.get(url__regex=rf"{PLEX_URL}/library/sections/\d+/all").mock(return_value=_page(
+        [_movie_item("Good Film", 2020, ["tmdb://5"]), 7, {"title": "Odd", "Guid": 3}], 3
+    ))
+
+    fetch = await _client().list_library(include_series=False)
+
+    assert "Good Film" in [movie.title for movie in fetch.movies]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        [], "oops", 7, None, {}, {"Items": None}, {"Items": "no"},
+        {"Items": [_jf_item("Film", 2020, {})], "TotalRecordCount": "lots"},
+        {"Items": [1, None], "TotalRecordCount": 2},
+    ],
+    ids=repr,
+)
+@respx.mock
+async def test_jellyfin_answering_something_else_is_a_controlled_failure(body: object) -> None:
+    respx.get(f"{JELLYFIN_URL}/Items").mock(return_value=httpx.Response(200, json=body))
+
+    with pytest.raises(MediaServerError):
+        await _jf_client().list_library()
+
+
+@respx.mock
+async def test_an_empty_jellyfin_library_is_still_empty_and_fine() -> None:
+    respx.get(f"{JELLYFIN_URL}/Items").mock(return_value=_items([]))
+
+    fetch = await _jf_client().list_library()
+
+    assert fetch.movies == ()
+    assert fetch.series == ()
+
+
+@respx.mock
+async def test_one_odd_jellyfin_row_costs_only_that_row() -> None:
+    respx.get(f"{JELLYFIN_URL}/Items").mock(return_value=_items(
+        [_jf_item("Good Film", 2020, {"Tmdb": "5"}), 7, {"Name": "Odd", "ProviderIds": 3}]
+    ))
+
+    movies, _ = await _jf_client()._paged("Movie", _movie_from_jellyfin_item)
+
+    assert [movie.title for movie in movies] == ["Good Film"]
+

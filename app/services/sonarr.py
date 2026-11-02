@@ -38,7 +38,7 @@ from datetime import datetime
 
 import httpx
 
-from app.core.values import int_or_none
+from app.core.values import QueueProgress, int_or_none, queue_is_complete, readable_rows
 from app.services.radarr import build_verify, home_server_timeout
 
 API_PREFIX = "/api/v3"
@@ -49,7 +49,8 @@ API_KEY_HEADER = "X-Api-Key"
 # same trap settings.py already guards for Radarr.
 APP_NAME = "sonarr"
 # One page of the queue. It decorates a grid, and a queue longer than the page is a
-# queue whose tail nobody is looking at. Matches radarr.QUEUE_PAGE_SIZE.
+# queue whose tail nobody is looking at, and says so: see `QueueProgress`. Matches
+# radarr.QUEUE_PAGE_SIZE.
 QUEUE_PAGE_SIZE = 200
 
 # How much of a series Sonarr should monitor on add. Sonarr's own vocabulary, and the
@@ -372,11 +373,7 @@ class SonarrClient:
 
     async def list_series(self) -> list[SonarrSeries]:
         response = await self._request("GET", "/series")
-        return [
-            _library_series(item)
-            for item in self._json_list(response)
-            if isinstance(item, dict)
-        ]
+        return readable_rows(_library_series, self._json_list(response), SonarrError)
 
     async def series_by_tvdb(self, tvdb_id: int) -> SonarrSeries | None:
         """One library entry by TVDB id, or None when Sonarr does not have it.
@@ -414,7 +411,10 @@ class SonarrClient:
         payload = self._json(response)
         if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
             raise SonarrError("unexpected Sonarr queue response shape")
-        progress: dict[int, float] = {}
+        progress = QueueProgress()
+        progress.complete = queue_is_complete(
+            payload, len(payload["records"]), QUEUE_PAGE_SIZE
+        )
         for record in payload["records"]:
             if not isinstance(record, dict):
                 continue

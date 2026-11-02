@@ -237,9 +237,8 @@ class AppsStore:
         connection being edited, which is allowed to keep its own name.
 
         Compared case- and whitespace-insensitively, because the point is what a
-        person reads: the calendar cache and the target badges identify a connection
-        BY NAME, so two boxes called Radarr collapse into one row and one badge, and
-        the rows of the one that is down vanish the moment its namesake answers.
+        person reads: the target badges identify a connection BY NAME, so two boxes
+        called Radarr collapse into one badge.
 
         Tolerant about what it reads and strict about what it accepts, like
         `_validated_kind`: a hand-edited apps.yml missing a name must not turn a form

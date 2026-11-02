@@ -917,8 +917,9 @@ async def test_progress_reports_what_every_connection_is_downloading(
 
     assert response.status_code == 200
     body = response.json()
-    assert round(body[f"{app_id}:7"]) == 42
-    assert body[f"{app_id}:9"] == 100.0
+    assert round(body["progress"][f"{app_id}:7"]) == 42
+    assert body["progress"][f"{app_id}:9"] == 100.0
+    assert body["sources"] == {app_id: {"available": True, "complete": True}}
     # A percentage is stale the moment it is cached.
     assert "no-store" in response.headers["cache-control"]
 
@@ -940,10 +941,69 @@ async def test_a_connection_that_cannot_be_read_contributes_nothing(
     """Not zeroes. A Radarr that went away must leave the last-known figures on screen
     rather than resetting every bar to "just started"."""
     harness.activate()
-    _configured_app(harness)
+    app_id = _configured_app(harness)
     respx.routes[QUEUE_ROUTE].mock(side_effect=httpx.ConnectError("gone"))
 
-    assert harness.client.get("/progress").json() == {}
+    assert harness.client.get("/progress").json() == {
+        "sources": {app_id: {"available": False, "complete": False}},
+        "progress": {},
+    }
+
+
+@respx.mock
+async def test_an_empty_queue_is_not_an_outage(harness: AppHarness) -> None:
+    """The two used to be the same `{}`, so an outage read as every download finishing."""
+    harness.activate()
+    app_id = _configured_app(harness)
+    queue_records([])
+
+    assert harness.client.get("/progress").json() == {
+        "sources": {app_id: {"available": True, "complete": True}},
+        "progress": {},
+    }
+
+
+@respx.mock
+async def test_a_queue_longer_than_the_page_does_not_claim_to_be_whole(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    app_id = _configured_app(harness)
+    respx.routes[QUEUE_ROUTE].mock(return_value=httpx.Response(200, json={
+        "totalRecords": 250,
+        "records": [{"movieId": 7, "size": 100, "sizeleft": 50}],
+    }))
+
+    body = harness.client.get("/progress").json()
+
+    assert body["sources"][app_id] == {"available": True, "complete": False}
+    assert body["progress"] == {f"{app_id}:7": 50.0}
+
+
+@respx.mock
+async def test_one_silent_connection_does_not_speak_for_another(harness: AppHarness) -> None:
+    """Two boxes can use the same Radarr id for different films, hence the key's two halves."""
+    harness.activate()
+    first = _configured_app(harness)
+    second = harness.client.app.state.apps.add(
+        name="Other", url="http://other.local:7878", api_key="b" * 32
+    ).id
+    respx.get("http://other.local:7878/api/v3/queue").mock(
+        side_effect=httpx.ConnectError("gone")
+    )
+    # Ahead of the default route, which answers for every host.
+    respx.routes.pop(QUEUE_ROUTE)
+    respx.get(url__regex=r"https?://[^/]+/api/v3/queue", name=QUEUE_ROUTE).mock(
+        return_value=httpx.Response(200, json={
+            "records": [{"movieId": 7, "size": 100, "sizeleft": 50}],
+        })
+    )
+
+    body = harness.client.get("/progress").json()
+
+    assert body["progress"] == {f"{first}:7": 50.0}
+    assert body["sources"][first]["available"] is True
+    assert body["sources"][second]["available"] is False
 
 
 def test_the_page_tells_the_script_where_to_ask(harness: AppHarness) -> None:
@@ -955,3 +1015,37 @@ def test_the_page_tells_the_script_where_to_ask(harness: AppHarness) -> None:
 
     harness.activate()
     assert 'data-progress-url="/progress"' in harness.client.get("/library").text
+
+
+# --- the poller finds out a server is back ---
+
+
+@respx.mock
+async def test_progress_asks_a_backed_off_server_and_its_answer_clears_the_backoff(
+    harness: AppHarness,
+) -> None:
+    """Pages leave a failed server alone for five minutes. Nobody waits on this request, so it
+    is what notices recovery, and pages benefit straight away."""
+    harness.activate()
+    app_id = _configured_app(harness)
+    backoff = harness.client.app.state.radarr_backoff
+    backoff.note_failure(app_id)
+    queue_records([{"movieId": 7, "size": 100, "sizeleft": 50}])
+
+    body = harness.client.get("/progress").json()
+
+    assert body["sources"][app_id]["available"] is True
+    assert body["progress"] == {f"{app_id}:7": 50.0}
+    assert backoff.should_skip(app_id) is False
+
+
+@respx.mock
+async def test_a_probe_that_fails_keeps_the_pages_backoff_running(harness: AppHarness) -> None:
+    harness.activate()
+    app_id = _configured_app(harness)
+    respx.routes[QUEUE_ROUTE].mock(side_effect=httpx.ConnectError("gone"))
+
+    harness.client.get("/progress")
+
+    assert harness.client.app.state.radarr_backoff.should_skip(app_id) is True
+

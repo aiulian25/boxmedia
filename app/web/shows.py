@@ -39,6 +39,7 @@ from app.services.apps import (
 from app.services.discovery import PROVIDER_TMDB, DiscoveryError
 from app.services.ignore import KIND_SERIES
 from app.services.matcher import normalize_title
+from app.services.mediaserver import HOLDS_YES
 from app.services.posters import HEADSHOT_WIDTH, SERIES_POSTER_WIDTH
 from app.services.reports import imdb_url
 from app.services.sonarr import (
@@ -55,6 +56,7 @@ from app.web.deps import (
     optional_int,
     refresh_series_library,
     render,
+    series_holder,
     sonarr_client_for,
 )
 from app.web.profile import STATUS_QUERY_KEY
@@ -149,7 +151,7 @@ def _tmdb_client(request: Request) -> TmdbClient | None:
     # certificate then fails. Passing it here broke the show page for every install with
     # a self-signed home server, while Discover's own refresh (which never passed it)
     # kept working. The README's promise is the rule: public endpoints are always
-    # verified, against the system trust store.
+    # verified, against the pinned CA bundle.
     return TmdbClient(key, timeout=DETAIL_TIMEOUT_SECONDS)
 
 
@@ -251,6 +253,8 @@ async def show_detail(request: Request, tmdb_id: int) -> HTMLResponse:
         add_series_path=ADD_SERIES_PATH,
         ignore_series_path=IGNORE_SERIES_PATH,
         held=held,
+        held_confirmed=held is not None and held.state == HOLDS_YES,
+        **series_holder(request, held),
         server_state=server_state,
         server_name=server_name,
         ignored=ignored,
@@ -362,6 +366,10 @@ async def add_series(
         # so no button here could have worked; the page offers a Sonarr search instead.
         return _redirect(request, tmdb, ShowStatus.NO_TVDB)
 
+    # An exact id on ANY connection is a duplicate, whichever one was chosen: two Sonarrs
+    # downloading one show is the outcome this exists to stop. A name match is deliberately
+    # not asked about here, because a guess must not be able to block the right show.
+    #
     # The duplicate guard is a snapshot lookup, never a string match on Sonarr's error
     # body — tv-discovery.md §11 found exactly that resting on the literal phrases
     # "SeriesExistsValidator" and "already been added", so any rewording broke it.

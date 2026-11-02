@@ -445,7 +445,8 @@ def test_a_first_open_against_a_dead_server_says_never(harness: AppHarness) -> N
     page = harness.client.get("/calendar").text
 
     assert f"Last fetch: {NEVER_FETCHED}" in page
-    assert "Some connections did not answer" in page
+    assert "No answer from" in page
+    assert "nothing from it has been read yet" in page
 
 
 def test_the_header_states_the_refresh_that_actually_happens(
@@ -547,8 +548,95 @@ def test_a_connection_that_does_not_answer_keeps_its_rows_and_says_so(
 
     page = harness.client.get("/calendar").text
 
-    assert "Some connections did not answer" in page
+    assert f"No answer from {RADARR_NAME}" in page
+    assert f"No answer from {SONARR_NAME}" not in page
     assert "Paper Comet" in page  # the Radarr's last known rows are still on the week
+
+
+def _mock_calendars(*, radarr_status: int) -> None:
+    respx.get(url__startswith=SONARR_CALENDAR).mock(return_value=httpx.Response(200, json=[]))
+    respx.get(url__startswith=RADARR_CALENDAR).mock(
+        return_value=httpx.Response(radarr_status, json=[])
+    )
+    respx.get(url__regex=rf"({SONARR_URL}|{RADARR_URL})/api/v3/queue").mock(
+        return_value=httpx.Response(200, json={"records": []})
+    )
+
+
+@respx.mock
+def test_a_partial_failure_is_still_said_on_the_next_view(harness: AppHarness) -> None:
+    """The warning used to live only on the request that met the failure. The next view found
+    the cache fresh and showed the old rows with nothing to say about them."""
+    harness.activate()
+    _sonarr(harness)
+    _radarr(harness)
+    _mock_calendars(radarr_status=500)
+    assert f"No answer from {RADARR_NAME}" in harness.client.get("/calendar").text
+    calls = len(respx.calls)
+
+    again = harness.client.get("/calendar").text
+
+    assert len(respx.calls) == calls  # read from the cache, not asked again
+    assert f"No answer from {RADARR_NAME}" in again
+
+
+@respx.mock
+def test_it_says_when_the_rows_it_kept_were_read(harness: AppHarness) -> None:
+    harness.activate()
+    _sonarr(harness)
+    radarr_id = _radarr(harness)
+    state = harness.client.app.state
+    state.calendar_cache.merge(
+        [_film(connection=radarr_id)], answered={radarr_id}, unanswered=set(),
+        legacy_names={}, now=datetime(2026, 8, 3, 9, 30, tzinfo=UTC).timestamp(),
+    )
+    _stale(harness)
+    _mock_calendars(radarr_status=500)
+
+    page = harness.client.get("/calendar").text
+
+    assert "its entries here are from 3/8/2026 09:30" in page  # day first, always
+    assert "Paper Comet" in page
+
+
+@respx.mock
+def test_recovery_clears_the_warning(harness: AppHarness) -> None:
+    harness.activate()
+    _sonarr(harness)
+    _radarr(harness)
+    _mock_calendars(radarr_status=500)
+    harness.client.get("/calendar")
+    _stale(harness)
+    harness.client.app.state.radarr_backoff.note_success(
+        harness.client.app.state.apps.list_apps("radarr")[0].id
+    )
+    respx.reset()
+    _mock_calendars(radarr_status=200)
+
+    assert "No answer from" not in harness.client.get("/calendar").text
+
+
+def test_a_renamed_connection_is_warned_about_under_its_new_name(harness: AppHarness) -> None:
+    harness.activate()
+    sonarr_id = _sonarr(harness)
+    radarr_id = _radarr(harness)
+    state = harness.client.app.state
+    moment = time.time()
+    state.calendar_cache.merge(
+        [_film(connection=radarr_id)], answered={radarr_id}, unanswered=set(),
+        legacy_names={}, now=moment - 60,
+    )
+    state.calendar_cache.merge(
+        [], answered={sonarr_id}, unanswered={radarr_id}, legacy_names={}, now=moment,
+    )
+    app = state.apps.get(radarr_id)
+    state.apps.update(radarr_id, name="Upstairs", url=app.url, api_key=None)
+
+    page = harness.client.get("/calendar").text
+
+    assert "No answer from Upstairs" in page
+    assert RADARR_NAME not in page
+    assert "Paper Comet" in page
 
 
 def test_a_fresh_cache_is_not_refetched(harness: AppHarness) -> None:

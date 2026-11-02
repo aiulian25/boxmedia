@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 
 import httpx
 
+from app.core.values import QueueProgress, queue_is_complete, readable_rows
+
 API_PREFIX = "/api/v3"
 REQUEST_TIMEOUT_SECONDS = 15.0
 API_KEY_HEADER = "X-Api-Key"
@@ -195,7 +197,7 @@ def _ratings_from(ratings: dict) -> tuple[tuple[str, str], ...]:
 
 # One page of the download queue. It decorates a grid of at most 100 cards; a queue
 # deeper than this has a tail nobody is looking at, and an unbounded page is a request
-# whose size Radarr decides.
+# whose size Radarr decides. A longer queue says so: see `QueueProgress`.
 QUEUE_PAGE_SIZE = 200
 
 
@@ -231,6 +233,19 @@ def _library_movie(item: dict) -> RadarrMovie:
         quality_profile_id=item.get("qualityProfileId"),
         poster_url=_image_from(item.get("images", []), "poster"),
         title_slug=item.get("titleSlug"),
+    )
+
+
+def _lookup_result(item: dict) -> RadarrLookupResult:
+    return RadarrLookupResult(
+        tmdb_id=item.get("tmdbId", 0),
+        title=item.get("title", ""),
+        year=item.get("year"),
+        overview=item.get("overview"),
+        poster_url=_image_from(item.get("images", []), "poster"),
+        genres=tuple(item.get("genres", [])),
+        imdb_id=item.get("imdbId"),
+        rating=_rating_from(item.get("ratings", {})),
     )
 
 
@@ -350,7 +365,10 @@ class RadarrClient:
         payload = self._json(response)
         if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
             raise RadarrError("unexpected Radarr queue response shape")
-        progress: dict[int, float] = {}
+        progress = QueueProgress()
+        progress.complete = queue_is_complete(
+            payload, len(payload["records"]), QUEUE_PAGE_SIZE
+        )
         for record in payload["records"]:
             if not isinstance(record, dict):
                 continue
@@ -368,7 +386,7 @@ class RadarrClient:
 
     async def list_movies(self) -> list[RadarrMovie]:
         response = await self._request("GET", "/movie")
-        return [_library_movie(item) for item in self._json_list(response)]
+        return readable_rows(_library_movie, self._json_list(response), RadarrError)
 
     async def movie_by_tmdb(self, tmdb_id: int) -> RadarrMovie | None:
         """One library entry by TMDB id, or None when Radarr does not have it.
@@ -383,10 +401,8 @@ class RadarrClient:
         raises, so the caller can tell "not in the library" from "could not look".
         """
         response = await self._request("GET", "/movie", params={"tmdbId": tmdb_id})
-        matches = self._json(response)
-        if not isinstance(matches, list) or not matches:
-            return None
-        return _library_movie(matches[0])
+        matches = readable_rows(_library_movie, self._json_list(response), RadarrError)
+        return matches[0] if matches else None
 
     async def upgrade_movie(self, radarr_id: int, quality_profile_id: int) -> None:
         """Point an existing movie at a new quality profile and trigger a search.
@@ -414,19 +430,7 @@ class RadarrClient:
 
     async def lookup(self, term: str) -> list[RadarrLookupResult]:
         response = await self._request("GET", "/movie/lookup", params={"term": term})
-        return [
-            RadarrLookupResult(
-                tmdb_id=item.get("tmdbId", 0),
-                title=item.get("title", ""),
-                year=item.get("year"),
-                overview=item.get("overview"),
-                poster_url=_image_from(item.get("images", []), "poster"),
-                genres=tuple(item.get("genres", [])),
-                imdb_id=item.get("imdbId"),
-                rating=_rating_from(item.get("ratings", {})),
-            )
-            for item in self._json_list(response)
-        ]
+        return readable_rows(_lookup_result, self._json_list(response), RadarrError)
 
     async def movie_detail(self, tmdb_id: int) -> MovieDetail:
         """One film by TMDB id — a direct lookup, not a title search."""
@@ -602,6 +606,7 @@ class LibrarySnapshots:
     def __init__(self, ttl_seconds: float = LIBRARY_SNAPSHOT_SECONDS) -> None:
         self._ttl = ttl_seconds
         self._entries: dict[str, tuple[float, dict[int, RadarrMovie]]] = {}
+        self._read_at: dict[str, float] = {}
 
     def get(self, app_id: str) -> dict[int, RadarrMovie] | None:
         """A fresh copy of the last read, or None once it is older than the TTL.
@@ -616,7 +621,18 @@ class LibrarySnapshots:
 
     def put(self, app_id: str, library: dict[int, RadarrMovie]) -> None:
         self._entries[app_id] = (time.monotonic(), dict(library))
+        self._read_at[app_id] = time.time()
+
+    def last_read(self, app_id: str) -> tuple[dict[int, RadarrMovie], float] | None:
+        """The last read and when it happened, however old. For a page that may not ask Radarr
+        and says how old its answer is. Gone at a restart, since these live in memory."""
+        entry = self._entries.get(app_id)
+        return (dict(entry[1]), self._read_at[app_id]) if entry is not None else None
 
     def forget(self, app_id: str) -> None:
         """Drop one connection's read — it was just written to, edited, or removed."""
         self._entries.pop(app_id, None)
+
+    def clear(self) -> None:
+        """Drop every read — a restore may have replaced every connection."""
+        self._entries.clear()

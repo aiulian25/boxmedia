@@ -582,3 +582,79 @@ def test_a_page_editing_what_it_was_handed_cannot_change_the_next_page() -> None
     snapshots.get("app-1").clear()
 
     assert set(snapshots.get("app-1")) == {1}
+
+
+# --- whether the queue answered in full ---
+
+
+@pytest.mark.parametrize(
+    ("payload", "complete"),
+    [
+        ({"totalRecords": 1, "records": [{"movieId": 7, "size": 10, "sizeleft": 5}]}, True),
+        ({"totalRecords": 0, "records": []}, True),
+        ({"totalRecords": 250, "records": [{"movieId": 7, "size": 10, "sizeleft": 5}]}, False),
+        ({"records": [{"movieId": 7, "size": 10, "sizeleft": 5}]}, True),
+        ({"records": [{"movieId": n, "size": 1, "sizeleft": 0} for n in range(QUEUE_PAGE_SIZE)]},
+         False),
+        ({"totalRecords": "lots", "records": []}, True),
+    ],
+    ids=["whole", "empty", "truncated", "no-total-short", "no-total-full-page", "bad-total"],
+)
+@respx.mock
+async def test_the_queue_says_whether_it_is_whole(payload: dict, complete: bool) -> None:
+    respx.get(f"{API}/queue").mock(return_value=httpx.Response(200, json=payload))
+
+    progress = await _client().queue()
+
+    assert progress.complete is complete
+
+
+# --- rows that cannot be read ---
+
+
+@respx.mock
+async def test_one_odd_library_row_costs_only_that_row() -> None:
+    respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[
+        {"tmdbId": 5, "title": "Good", "hasFile": True},
+        7,
+        {"tmdbId": 6, "title": "Odd", "images": 3},
+    ]))
+
+    assert [movie.tmdb_id for movie in await _client().list_movies()] == [5]
+
+
+@pytest.mark.parametrize("body", [[1, "x", None], [{"tmdbId": 6, "images": 3}]], ids=repr)
+@respx.mock
+async def test_a_library_with_no_readable_row_is_a_failure_not_an_empty_library(
+    body: list,
+) -> None:
+    respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=body))
+
+    with pytest.raises(RadarrError):
+        await _client().list_movies()
+
+
+@respx.mock
+async def test_an_empty_library_is_still_empty_and_fine() -> None:
+    respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json=[]))
+
+    assert await _client().list_movies() == []
+
+
+@respx.mock
+async def test_a_surprising_answer_about_one_film_is_not_radarr_saying_it_lacks_it() -> None:
+    """None means "it answered, and does not have it", which a card reads as Missing."""
+    respx.get(f"{API}/movie").mock(return_value=httpx.Response(200, json={"oops": 1}))
+
+    with pytest.raises(RadarrError):
+        await _client().movie_by_tmdb(5)
+
+
+@respx.mock
+async def test_an_odd_lookup_row_costs_only_that_row() -> None:
+    respx.get(f"{API}/movie/lookup").mock(return_value=httpx.Response(200, json=[
+        {"tmdbId": 5, "title": "Good"}, {"tmdbId": 6, "genres": 3},
+    ]))
+
+    assert [result.tmdb_id for result in await _client().lookup("x")] == [5]
+

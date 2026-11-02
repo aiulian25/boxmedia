@@ -32,6 +32,7 @@ import httpx
 
 from app.core import crypto, filestore
 from app.core.audit import AuditAction, AuditLog
+from app.core.values import readable_rows
 from app.services.apps import API_KEY_MASK, InvalidAppError, normalize_url
 from app.services.matcher import normalize_title
 from app.services.radarr import build_verify, home_server_timeout
@@ -344,6 +345,31 @@ def client_for_credentials(
     )
 
 
+def _plex_container(document: dict) -> dict:
+    """Plex's envelope. Required: without it the answer is not a library with nothing in it,
+    and saving it as one would replace everything known about the real one."""
+    container = document.get("MediaContainer")
+    if not isinstance(container, dict):
+        raise PlexError("Plex answered with an unexpected shape")
+    return container
+
+
+def _plex_rows(container: dict, key: str) -> list:
+    """A list inside the envelope. Plex leaves the key out when there is nothing to list."""
+    rows = container.get(key, [])
+    if not isinstance(rows, list):
+        raise PlexError("Plex answered with an unexpected shape")
+    return rows
+
+
+def _count_from(value: object, error: type[MediaServerError]) -> int:
+    """A server's total. Guessing here would stop paging early and hide most of a library."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise error("the server answered with an unusable total") from exc
+
+
 class PlexClient:
     """Two GET endpoints and nothing else — sections, and a section's movies.
 
@@ -382,16 +408,19 @@ class PlexClient:
         if response.is_error:
             raise PlexError(f"Plex answered HTTP {response.status_code}")
         try:
-            return response.json()
+            document = response.json()
         except ValueError as exc:
             raise PlexError("Plex answered something that is not JSON") from exc
+        if not isinstance(document, dict):
+            raise PlexError("Plex answered with an unexpected shape")
+        return document
 
     async def movie_section_keys(self) -> list[str]:
         """Every movie library's section key — plural, because users split libraries
         (Movies, Kids, Concerts) and a film in any of them is still held."""
         async with self._client() as client:
             document = await self._get_json(client, "/library/sections")
-        directories = document.get("MediaContainer", {}).get("Directory", [])
+        directories = _plex_rows(_plex_container(document), "Directory")
         return [
             str(entry["key"])
             for entry in directories
@@ -403,7 +432,7 @@ class PlexClient:
         people split libraries (TV, Anime, Documentaries) and a show in any is held."""
         async with self._client() as client:
             document = await self._get_json(client, "/library/sections")
-        directories = document.get("MediaContainer", {}).get("Directory", [])
+        directories = _plex_rows(_plex_container(document), "Directory")
         return [
             str(entry["key"])
             for entry in directories
@@ -438,13 +467,13 @@ class PlexClient:
                             "X-Plex-Container-Size": PLEX_PAGE_SIZE,
                         },
                     )
-                    container = document.get("MediaContainer", {})
-                    items = container.get("Metadata", []) or []
-                    shows.extend(_series_from_item(item) for item in items)
+                    container = _plex_container(document)
+                    items = _plex_rows(container, "Metadata")
+                    shows.extend(readable_rows(_series_from_item, items, PlexError))
                     pages += 1
                     start += len(items)
                     total = container.get("totalSize", container.get("size", 0))
-                    if not items or start >= int(total or 0):
+                    if not items or start >= _count_from(total, PlexError):
                         break
         return tuple(shows), truncated
 
@@ -495,13 +524,13 @@ class PlexClient:
                             "X-Plex-Container-Size": PLEX_PAGE_SIZE,
                         },
                     )
-                    container = document.get("MediaContainer", {})
-                    items = container.get("Metadata", []) or []
-                    movies.extend(_movie_from_item(item) for item in items)
+                    container = _plex_container(document)
+                    items = _plex_rows(container, "Metadata")
+                    movies.extend(readable_rows(_movie_from_item, items, PlexError))
                     pages += 1
                     start += len(items)
                     total = container.get("totalSize", container.get("size", 0))
-                    if not items or start >= int(total or 0):
+                    if not items or start >= _count_from(total, PlexError):
                         break
         return MediaServerFetch(movies=tuple(movies), truncated=truncated)
 
@@ -568,9 +597,12 @@ class JellyfinClient:
         if response.is_error:
             raise JellyfinError(f"Jellyfin answered HTTP {response.status_code}")
         try:
-            return response.json()
+            document = response.json()
         except ValueError as exc:
             raise JellyfinError("Jellyfin answered something that is not JSON") from exc
+        if not isinstance(document, dict):
+            raise JellyfinError("Jellyfin answered with an unexpected shape")
+        return document
 
     async def movie_section_keys(self) -> list[str]:
         """Whether there is a movie library to read, in the shape the Plex client
@@ -581,7 +613,7 @@ class JellyfinClient:
         """
         async with self._client() as client:
             document = await self._items(client, start=0, limit=0)
-        return ["movies"] if int(document.get("TotalRecordCount") or 0) > 0 else []
+        return ["movies"] if _count_from(document.get("TotalRecordCount"), JellyfinError) else []
 
     async def _paged(
         self, item_type: str, read: Callable[[dict[str, Any]], Any]
@@ -601,11 +633,13 @@ class JellyfinClient:
                 document = await self._items(
                     client, start=start, limit=JELLYFIN_PAGE_SIZE, item_type=item_type
                 )
-                items = document.get("Items") or []
-                collected.extend(read(item) for item in items)
+                items = document.get("Items")
+                if not isinstance(items, list):
+                    raise JellyfinError("Jellyfin answered with an unexpected shape")
+                collected.extend(readable_rows(read, items, JellyfinError))
                 pages += 1
                 start += len(items)
-                total = int(document.get("TotalRecordCount") or 0)
+                total = _count_from(document.get("TotalRecordCount"), JellyfinError)
                 if not items or start >= total:
                     break
         return tuple(collected), truncated

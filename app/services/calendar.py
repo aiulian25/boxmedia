@@ -28,15 +28,19 @@ grabbed, and the amber register already carries exactly that meaning everywhere 
 ## A cache, not a record
 
 Unreadable, hand-edited, or written by a newer build all read as empty. A connection that
-does not answer leaves its PREVIOUS entries in place and the answer is marked stale —
-"we could not look" and "nothing is due" are different claims, and only one of them is
-true.
+does not answer leaves its PREVIOUS entries in place and its own record says so, on every
+later render until it answers — "we could not look" and "nothing is due" are different
+claims, and only one of them is true.
+
+Rows and records are owned by the connection's id, so a rename keeps them. The name is
+resolved when a page renders.
 """
 
 from __future__ import annotations
 
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -48,6 +52,7 @@ from app.services.sonarr import SonarrCalendarEpisode
 CALENDAR_CACHE_SCHEMA_VERSION = 1
 CALENDAR_CACHE_FILENAME = "calendar.json"
 ENTRIES_KEY = "entries"
+SOURCES_KEY = "sources"
 FETCHED_AT_KEY = "fetched_at"
 # Long enough that clicking between weeks costs nothing, short enough that a grab that
 # landed while you were reading shows up on the next page you open. The morning job
@@ -87,7 +92,7 @@ class CalendarEntry:
     sub: str
     when: datetime
     state: str
-    connection: str
+    connection: str  # the id of the connection it came from, never its name
     tmdb_id: int | None = None
     tvdb_id: int | None = None
     progress: float | None = None
@@ -241,6 +246,29 @@ def sorted_entries(entries: list[CalendarEntry]) -> list[CalendarEntry]:
     return sorted(entries, key=lambda entry: (entry.when, entry.title, entry.sub))
 
 
+@dataclass(frozen=True)
+class CalendarSource:
+    """How one connection's part of the cache stands. An empty week it really reported is
+    a success with no rows, which nothing here confuses with having failed to look."""
+
+    last_attempt: float
+    last_success: float | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.last_success is None or self.last_success < self.last_attempt
+
+
+def _source_from_document(row: object) -> CalendarSource | None:
+    if not isinstance(row, dict) or not isinstance(row.get("last_attempt"), int | float):
+        return None
+    success = row.get("last_success")
+    return CalendarSource(
+        last_attempt=float(row["last_attempt"]),
+        last_success=float(success) if isinstance(success, int | float) else None,
+    )
+
+
 class CalendarCache:
     """The last merged calendar on disk.
 
@@ -250,6 +278,11 @@ class CalendarCache:
 
     def __init__(self, cache_dir: Path) -> None:
         self._path = cache_dir / CALENDAR_CACHE_FILENAME
+        # Guards the read-modify-writes below. The morning job can overlap a page render that
+        # found the cache stale, and a later writer building its document from a read taken
+        # before the earlier one's write would lose a connection's whole week. Always taken
+        # BEFORE the filestore lock, as the series cache's is.
+        self._lock = threading.Lock()
 
     def _document(self) -> dict:
         if not self._path.exists():
@@ -264,14 +297,79 @@ class CalendarCache:
     def save(self, entries: list[CalendarEntry]) -> None:
         """Written in whatever order they were fetched — `load` is what puts them in
         order, because it has to do that for a hand-edited file anyway."""
+        self._write(entries, {}, time.time())
+
+    def _write(
+        self,
+        entries: list[CalendarEntry],
+        sources: dict[str, CalendarSource],
+        fetched_at: float | None,
+    ) -> None:
         filestore.write_json(
             self._path,
             {
-                FETCHED_AT_KEY: time.time(),
+                FETCHED_AT_KEY: fetched_at,
+                SOURCES_KEY: {
+                    app_id: {
+                        "last_attempt": source.last_attempt,
+                        "last_success": source.last_success,
+                    }
+                    for app_id, source in sources.items()
+                },
                 ENTRIES_KEY: [entry.document() for entry in entries],
             },
             schema_version=CALENDAR_CACHE_SCHEMA_VERSION,
         )
+
+    def merge(
+        self,
+        fresh: list[CalendarEntry],
+        *,
+        answered: set[str],
+        unanswered: set[str],
+        legacy_names: dict[str, str],
+        now: float,
+    ) -> None:
+        """Write one refresh: `fresh`, plus the rows still held by `unanswered` connections.
+
+        A connection in neither set no longer exists, so its rows and record go: a deleted
+        Radarr would otherwise fill days forever with nothing left to refresh it.
+
+        If nothing answered and something was asked, nothing was learned, so the cache keeps
+        its own age and stays stale. Stamping it would turn "we could not look" into "nothing
+        is due". With no connections at all, an empty week is the true answer.
+
+        `legacy_names` maps a name to its id, for rows written before rows carried ids. Names
+        were unique, so that is unambiguous, and a row naming nothing current is dropped.
+        """
+        with self._lock:
+            previous = self.sources()
+            kept = []
+            for entry in self.load():
+                owner = legacy_names.get(entry.connection, entry.connection)
+                if owner in unanswered:
+                    kept.append(replace(entry, connection=owner))
+            sources = {app_id: CalendarSource(now, now) for app_id in answered}
+            for app_id in unanswered:
+                earlier = previous.get(app_id)
+                sources[app_id] = CalendarSource(now, earlier.last_success if earlier else None)
+            learned = bool(answered) or not unanswered
+            self._write(fresh + kept, sources, now if learned else self.fetched_at())
+
+    def forget_connection(self, app_id: str) -> None:
+        """Drop what one connection contributed, and only that: it is gone, or it now points
+        at a different server. The age goes too, so the next view reads the week again."""
+        with self._lock:
+            entries = [entry for entry in self.load() if entry.connection != app_id]
+            sources = {key: item for key, item in self.sources().items() if key != app_id}
+            self._write(entries, sources, None)
+
+    def sources(self) -> dict[str, CalendarSource]:
+        """Each connection's record, by id. Empty for a file that has none."""
+        stored = self._document().get(SOURCES_KEY)
+        rows = stored.items() if isinstance(stored, dict) else ()
+        parsed = {app_id: _source_from_document(row) for app_id, row in rows}
+        return {app_id: source for app_id, source in parsed.items() if source}
 
     def load(self) -> list[CalendarEntry]:
         """Everything cached, in order. Empty when nothing is, which a page renders as an
@@ -287,9 +385,12 @@ class CalendarCache:
         return float(value) if isinstance(value, int | float) else None
 
     def is_stale(self, ttl_seconds: float = CALENDAR_CACHE_TTL_SECONDS) -> bool:
-        """Whether it is worth asking again. Never-fetched counts as stale."""
+        """Whether it is worth asking again. Never-fetched counts as stale, and so does a
+        file from before sources were recorded, which cannot say who answered."""
         fetched_at = self.fetched_at()
-        return fetched_at is None or (time.time() - fetched_at) > ttl_seconds
+        if fetched_at is None or SOURCES_KEY not in self._document():
+            return True
+        return (time.time() - fetched_at) > ttl_seconds
 
     def forget(self) -> None:
         self._path.unlink(missing_ok=True)

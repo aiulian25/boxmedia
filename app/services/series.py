@@ -130,6 +130,9 @@ class SeriesSnapshot:
         considered: a title guess on one Sonarr must never beat an exact id match on
         another. That ordering is the whole reason this is one lookup over all
         connections rather than a loop of per-connection lookups.
+
+        Two known ids that differ are two shows, however alike their names: Sonarr identifies
+        a series by exactly that id. Only where one side has none can the title stand in.
         """
         if tvdb_id is not None:
             held = self.by_tvdb.get(tvdb_id)
@@ -141,6 +144,8 @@ class SeriesSnapshot:
         if not candidates:
             return None
         for app_id, series in candidates:
+            if tvdb_id and series.tvdb_id and series.tvdb_id != tvdb_id:
+                continue
             # A stored series with no year of its own cannot contradict the asked year:
             # absence of evidence is not a conflicting year.
             if year is None or series.year is None or series.year == year:
@@ -318,6 +323,11 @@ class SeriesLibraryCache:
             if loaded is not None:
                 libraries[app_id] = loaded[0]
         return libraries
+
+    def last_read_at(self, app_id: str) -> float | None:
+        """When this connection's library was last read successfully, if ever."""
+        loaded = self.load(app_id)
+        return (loaded[1] or None) if loaded is not None else None
 
     def snapshot(self) -> SeriesSnapshot:
         """Everything held, ready to judge a page against. Empty when nothing is cached,

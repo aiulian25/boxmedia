@@ -346,3 +346,59 @@ def test_saving_every_library_at_once_keeps_them_all(tmp_path: Path, monkeypatch
         thread.join(timeout=5.0)
 
     assert all(cache.load(app_id) is not None for app_id in CONCURRENT_CONNECTIONS)
+
+
+# --- only an id confirms ---
+
+
+def _held(*series: CachedSeries, app_id: str = LOCAL) -> object:
+    return snapshot_from({app_id: tuple(series)})
+
+
+def test_two_known_ids_that_differ_are_two_shows(tmp_path: Path) -> None:
+    """The audit's reproduction: a namesake with a different TVDB id came back as a guess
+    the template then rendered as owned and complete."""
+    snapshot = _held(_cached(tvdb_id=999))
+
+    assert snapshot.find(tvdb_id=121361, title="The Hollow Coast", year=2023) is None
+
+
+def test_a_conflicting_namesake_does_not_hide_the_one_that_could_be_it(tmp_path: Path) -> None:
+    snapshot = _held(_cached(sonarr_id=1, tvdb_id=999), _cached(sonarr_id=2, tvdb_id=0))
+
+    match = snapshot.find(tvdb_id=121361, title="The Hollow Coast", year=2023)
+
+    assert match.state == HOLDS_PROBABLY
+    assert match.series.sonarr_id == 2
+
+
+def test_a_stored_series_with_no_id_can_only_be_a_guess(tmp_path: Path) -> None:
+    match = _held(_cached(tvdb_id=0)).find(tvdb_id=121361, title="The Hollow Coast", year=2023)
+
+    assert match.state == HOLDS_PROBABLY
+
+
+def test_an_asked_show_with_no_id_can_only_be_a_guess(tmp_path: Path) -> None:
+    match = _held(_cached()).find(tvdb_id=None, title="The Hollow Coast", year=2023)
+
+    assert match.state == HOLDS_PROBABLY
+
+
+def test_an_absent_year_is_still_only_a_guess(tmp_path: Path) -> None:
+    match = _held(_cached(year=None)).find(tvdb_id=None, title="The Hollow Coast", year=2023)
+
+    assert match.state == HOLDS_PROBABLY
+
+
+def test_the_exact_id_on_the_second_connection_beats_a_guess_on_the_first(
+    tmp_path: Path,
+) -> None:
+    snapshot = snapshot_from({
+        LOCAL: (_cached(tvdb_id=0),),
+        REMOTE: (_cached(tvdb_id=121361),),
+    })
+
+    match = snapshot.find(tvdb_id=121361, title="The Hollow Coast", year=2023)
+
+    assert match.state == HOLDS_YES
+    assert match.app_id == REMOTE

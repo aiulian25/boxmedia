@@ -345,10 +345,12 @@ async def progress(request: Request) -> JSONResponse:
 
     A connection that cannot be read contributes nothing rather than zeroes, so a Radarr
     that went away leaves the last-known figures on screen instead of resetting them all
-    to "just started".
+    to "just started". `sources` is what makes a missing figure mean something: a film absent
+    from a connection that answered with its whole queue has finished, and absent from any
+    other it is simply unknown.
     """
     current_user(request)
-    queues = await load_all_radarr_queues(request)
+    queues = await load_all_radarr_queues(request, probing=True)
     live = {
         key: percent
         for app_id, queue in queues.items()
@@ -356,6 +358,12 @@ async def progress(request: Request) -> JSONResponse:
         for radarr_id, percent in queue.items()
         if (key := progress_key(app_id, radarr_id)) is not None
     }
+    sources = {
+        app_id: {"available": queue is not None, "complete": queue is not None and queue.complete}
+        for app_id, queue in queues.items()
+    }
     # no-store: a percentage is stale the moment it is cached, and a proxy replaying one
     # would make the page confidently wrong rather than merely out of date.
-    return JSONResponse(live, headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        {"sources": sources, "progress": live}, headers={"Cache-Control": "no-store"}
+    )

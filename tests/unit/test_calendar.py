@@ -396,3 +396,49 @@ class TestTheCache:
         cache.forget()
         assert cache.load() == []
         assert not (tmp_path / CALENDAR_CACHE_FILENAME).exists()
+
+
+class TestSources:
+    def _entry(self, connection: str) -> CalendarEntry:
+        return CalendarEntry(
+            kind=KIND_MOVIE, title=connection, sub="Digital", when=NOW,
+            state=STATE_MONITORED, connection=connection,
+        )
+
+    def test_a_file_from_before_sources_is_read_again_once(self, tmp_path: Path) -> None:
+        path = tmp_path / CALENDAR_CACHE_FILENAME
+        path.write_text(json.dumps({
+            "schema_version": CALENDAR_CACHE_SCHEMA_VERSION,
+            "fetched_at": NOW.timestamp() * 2,  # as fresh as can be
+            "entries": [self._entry("Old Name").document()],
+        }), "utf-8")
+        cache = CalendarCache(tmp_path)
+
+        assert cache.is_stale() is True
+        assert cache.sources() == {}
+        assert [entry.title for entry in cache.load()] == ["Old Name"]
+
+    def test_a_damaged_record_is_no_record(self, tmp_path: Path) -> None:
+        path = tmp_path / CALENDAR_CACHE_FILENAME
+        path.write_text(json.dumps({
+            "schema_version": CALENDAR_CACHE_SCHEMA_VERSION,
+            "sources": {"one": "nonsense", "two": {"last_attempt": 5.0, "last_success": "x"}},
+        }), "utf-8")
+
+        sources = CalendarCache(tmp_path).sources()
+
+        assert set(sources) == {"two"}
+        assert sources["two"].failed is True
+
+    def test_forgetting_a_connection_leaves_the_others_and_asks_again(self, tmp_path: Path) -> None:
+        cache = CalendarCache(tmp_path)
+        cache.merge(
+            [self._entry("one"), self._entry("two")],
+            answered={"one", "two"}, unanswered=set(), legacy_names={}, now=NOW.timestamp(),
+        )
+
+        cache.forget_connection("one")
+
+        assert [entry.connection for entry in cache.load()] == ["two"]
+        assert set(cache.sources()) == {"two"}
+        assert cache.is_stale() is True

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 import respx
 
 from app.services.mediaserver import (
@@ -12,6 +13,7 @@ from app.services.mediaserver import (
     MEDIA_SERVER_FILENAME,
     MediaServerFetch,
     MediaServerMovie,
+    MediaServerSeries,
 )
 from app.services.reports import (
     MovieAction,
@@ -22,6 +24,7 @@ from app.services.reports import (
     RunStatus,
     RunTrigger,
 )
+from app.web.deps import MEDIA_SERVER_BACKOFF_KEY
 from tests.conftest import AppHarness
 
 PLEX_URL = "http://plex.local:32400"
@@ -585,3 +588,163 @@ def test_a_stored_token_that_will_not_decrypt_blames_neither_the_server_nor_the_
     assert "can’t be read" in response.text
     assert "rejected the credential" not in response.text
     assert "Could not reach it" not in response.text
+
+
+# --- the Refresh button and television ---
+
+KNOWN_FILM_TMDB = 52001
+KNOWN_SHOW_TVDB = 121361
+SONARR_URL_FOR_TESTS = "http://sonarr.local:8989"
+SONARR_KEY_FOR_TESTS = "0123456789abcdef0123456789abcdef"
+MIXED_SECTIONS = {"MediaContainer": {"Directory": [
+    {"key": "1", "type": "movie"}, {"key": "2", "type": "show"},
+]}}
+
+
+def _mock_plex_library(*, tv_status: int = 200) -> respx.Route:
+    respx.get(f"{PLEX_URL}/library/sections").mock(
+        return_value=httpx.Response(200, json=MIXED_SECTIONS)
+    )
+    respx.get(f"{PLEX_URL}/library/sections/1/all").mock(
+        return_value=httpx.Response(200, json=_movies_body(
+            _plex_item("Neon Rain", 2026, KNOWN_FILM_TMDB)
+        ))
+    )
+    show = {
+        "title": "The Hollow Coast", "year": 2023, "guid": "plex://show/hollow",
+        "Guid": [{"id": f"tvdb://{KNOWN_SHOW_TVDB}"}],
+    }
+    return respx.get(f"{PLEX_URL}/library/sections/2/all").mock(
+        return_value=httpx.Response(tv_status, json=_movies_body(show))
+    )
+
+
+def _mock_jellyfin_library(*, tv_status: int = 200) -> list[str]:
+    asked: list[str] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        kind = request.url.params["IncludeItemTypes"]
+        asked.append(kind)
+        if kind == "Series":
+            if tv_status != 200:
+                return httpx.Response(tv_status)
+            return _jellyfin_items([{
+                "Name": "The Hollow Coast", "ProductionYear": 2023,
+                "ProviderIds": {"Tvdb": str(KNOWN_SHOW_TVDB)},
+            }])
+        return _jellyfin_items([{
+            "Name": "Neon Rain", "ProductionYear": 2026,
+            "ProviderIds": {"Tmdb": str(KNOWN_FILM_TMDB)},
+        }])
+
+    respx.get(f"{JELLYFIN_URL}/Items").mock(side_effect=answer)
+    return asked
+
+
+def _connect_provider(harness: AppHarness, provider: str, *, tv_status: int = 200) -> None:
+    if provider == KIND_PLEX:
+        _connect(harness)
+        _mock_plex_library(tv_status=tv_status)
+        return
+    _connect(harness, kind=KIND_JELLYFIN, url=JELLYFIN_URL)
+    _mock_jellyfin_library(tv_status=tv_status)
+
+
+def _with_sonarr(harness: AppHarness) -> None:
+    harness.client.app.state.apps.add(
+        name="Sonarr", url=SONARR_URL_FOR_TESTS, api_key=SONARR_KEY_FOR_TESTS, kind="sonarr"
+    )
+
+
+def _seed_known_library(harness: AppHarness) -> None:
+    harness.client.app.state.media_server_cache.save(MediaServerFetch(
+        movies=(MediaServerMovie(
+            title="Old Film", year=2020, tmdb_id=KNOWN_FILM_TMDB + 1, imdb_id=None
+        ),),
+        truncated=False,
+        series=(MediaServerSeries(
+            title="Old Show", year=2020, tvdb_id=KNOWN_SHOW_TVDB + 1, tmdb_id=None, imdb_id=None
+        ),),
+    ))
+
+
+def _holds_show(harness: AppHarness, tvdb_id: int) -> str | None:
+    snapshot = harness.client.app.state.media_server_cache.load()[0]
+    return snapshot.holds_series(tvdb_id, None, None, "x", None)
+
+
+def _holds_film(harness: AppHarness, tmdb_id: int) -> str | None:
+    snapshot = harness.client.app.state.media_server_cache.load()[0]
+    return snapshot.holds(tmdb_id, None, "x", None)
+
+
+@pytest.mark.parametrize("provider", [KIND_PLEX, KIND_JELLYFIN])
+@respx.mock
+def test_refresh_reads_films_and_shows_together(harness: AppHarness, provider: str) -> None:
+    """The audit's reproduction: the button read films only and saved that as everything, so
+    a show the server held stopped being known, with a fresh timestamp on the loss."""
+    harness.activate()
+    _connect_provider(harness, provider)
+    _with_sonarr(harness)
+
+    response = harness.client.post("/settings/media-server/refresh", follow_redirects=False)
+
+    assert "server_refreshed" in response.headers["location"]
+    assert _holds_film(harness, KNOWN_FILM_TMDB) == "yes"
+    assert _holds_show(harness, KNOWN_SHOW_TVDB) == "yes"
+
+
+@pytest.mark.parametrize("provider", [KIND_PLEX, KIND_JELLYFIN])
+@respx.mock
+def test_a_tv_failure_erases_nothing(harness: AppHarness, provider: str) -> None:
+    harness.activate()
+    _connect_provider(harness, provider, tv_status=500)
+    _with_sonarr(harness)
+    _seed_known_library(harness)
+    before = harness.client.app.state.media_server_cache.load()[1]
+
+    response = harness.client.post("/settings/media-server/refresh", follow_redirects=False)
+
+    assert "server_refresh_failed" in response.headers["location"]
+    assert _holds_show(harness, KNOWN_SHOW_TVDB + 1) == "yes"
+    assert _holds_film(harness, KNOWN_FILM_TMDB + 1) == "yes"
+    assert harness.client.app.state.media_server_cache.load()[1] == before  # not stamped fresh
+
+
+@respx.mock
+def test_without_a_sonarr_refresh_does_not_walk_plex_tv(harness: AppHarness) -> None:
+    harness.activate()
+    _connect(harness)
+    shows = _mock_plex_library()
+
+    response = harness.client.post("/settings/media-server/refresh", follow_redirects=False)
+
+    assert "server_refreshed" in response.headers["location"]
+    assert not shows.called
+    assert _holds_film(harness, KNOWN_FILM_TMDB) == "yes"
+
+
+@respx.mock
+def test_without_a_sonarr_refresh_does_not_walk_jellyfin_tv(harness: AppHarness) -> None:
+    harness.activate()
+    _connect(harness, kind=KIND_JELLYFIN, url=JELLYFIN_URL)
+    asked = _mock_jellyfin_library()
+
+    harness.client.post("/settings/media-server/refresh", follow_redirects=False)
+
+    assert "Series" not in asked
+    assert _holds_film(harness, KNOWN_FILM_TMDB) == "yes"
+
+
+@respx.mock
+def test_a_failed_refresh_leaves_pages_alone_for_a_while_like_any_other(
+    harness: AppHarness,
+) -> None:
+    harness.activate()
+    _connect(harness)
+    respx.get(f"{PLEX_URL}/library/sections").mock(return_value=httpx.Response(500))
+
+    harness.client.post("/settings/media-server/refresh", follow_redirects=False)
+
+    assert harness.client.app.state.media_server_backoff.should_skip(MEDIA_SERVER_BACKOFF_KEY)
+
