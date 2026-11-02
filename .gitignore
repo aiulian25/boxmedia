@@ -9,10 +9,13 @@ venv/
 
 # Runtime data volume (config, history, logs, cache, backups) — never commit
 /data/
+/data-dev/
 
 # Secrets and local env
 .env
+.env.dev
 /secrets/
+/secrets-dev/
 
 # Local stash of pre-release docs/mockups moved out of the repo root — kept on disk,
 # not tracked (the originals remain in git history).

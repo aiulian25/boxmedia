@@ -11,8 +11,11 @@ __pycache__/
 
 # Never ship data, secrets, or local env into an image layer
 /data/
+/data-dev/
 /secrets/
+/secrets-dev/
 .env
+.env.dev
 
 # Dev-only Tailwind CLI (the assets build stage fetches its own, checksum-verified)
 /tools/

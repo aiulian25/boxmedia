@@ -9,6 +9,12 @@
 # is why `test_the_dev_stack_cannot_adopt_the_published_stacks_container` now refuses
 # any overlap between this file and docker-compose.yml: not the container names, not the
 # image tag, not the host port.
+#
+# Names alone do not isolate persisted state, so nothing here reads what production reads.
+# Compose loads a `.env` beside this file for every ${VAR} below whether asked to or not,
+# which is why they are all BM_DEV_*: a production .env cannot reach them. Set up with
+# `cp .env.dev.example .env.dev`, then always pass it, or BM_DEV_* fall back to the defaults:
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev up -d --build
 name: boxmedia-dev
 
 # The one place the image tag is written. Both services take it from here, so they
@@ -17,7 +23,7 @@ name: boxmedia-dev
 # image nobody has, which is how the gate came to scan a tag that did not exist.
 x-image: &image boxmedia:dev
 
-x-data: &data ${BM_DATA_PATH:-./data}:/data
+x-data: &data ${BM_DEV_DATA_PATH:-./data-dev}:/data
 
 services:
   # Runs once, exits, and is the only thing here that is root. Docker creates a missing
@@ -32,14 +38,15 @@ services:
     container_name: boxmedia-dev-init
     user: "0:0"
     entrypoint: ["/usr/bin/python3.11", "-m", "app.core.provision"]
-    # The same .env, so it prepares whatever BM_DATA_DIR and BM_ENCRYPTION_KEY_FILE
-    # actually name — a rotated key has a different filename.
-    env_file: .env
+    # The same .env.dev, so it prepares whatever BM_DATA_DIR and BM_ENCRYPTION_KEY_FILE
+    # actually name — a rotated key has a different filename. Required on purpose: a missing
+    # file stops `up` here rather than starting an install nobody configured.
+    env_file: .env.dev
     volumes:
       - *data
       # Writable here and read-only on the app: this is the one moment the key is
       # created, and nothing afterwards has any business changing it.
-      - ${BM_SECRETS_PATH:-./secrets}:/secrets
+      - ${BM_DEV_SECRETS_PATH:-./secrets-dev}:/secrets
     # It only ever touches those two paths: no network, and only the capabilities a
     # chown needs.
     network_mode: none
@@ -59,7 +66,7 @@ services:
     depends_on:
       init:
         condition: service_completed_successfully
-    env_file: .env
+    env_file: .env.dev
     environment:
       # DELIBERATELY NARROW, and the opposite of the published stack's `*`. The rule is
       # the same in both files — trust follows the bind — and these two files bind
@@ -74,19 +81,19 @@ services:
       # The cost is the one this stack already had — the peer is Docker's bridge
       # gateway, so LAN clients share a single lockout bucket. Correct for a dev box on
       # a trusted network; do not copy it to anything exposed.
-      FORWARDED_ALLOW_IPS: ${BM_FORWARDED_ALLOW_IPS:-127.0.0.1}
+      FORWARDED_ALLOW_IPS: ${BM_DEV_FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
-      # Host port from .env (ruling #10); container-internal port is fixed at 8686.
+      # Host port from .env.dev (ruling #10); container-internal port is fixed at 8686.
       # DEV: bound to 0.0.0.0 so other machines on the LAN can reach it directly.
       # 58547, one past the published stack's 58546, so both can run at once.
-      - "0.0.0.0:${BM_HOST_PORT:-58547}:8686"
+      - "0.0.0.0:${BM_DEV_HOST_PORT:-58547}:8686"
     volumes:
       - *data
       # Encryption key mounted read-only from OUTSIDE ./data, so a backup of the
       # data dir can never contain the key that decrypts it (ruling #9 / Step 4).
       # The whole directory rather than the file: Docker answers a missing file mount
       # by creating a DIRECTORY of that name, which is its own confusing failure.
-      - ${BM_SECRETS_PATH:-./secrets}:/secrets:ro
+      - ${BM_DEV_SECRETS_PATH:-./secrets-dev}:/secrets:ro
     read_only: true
     tmpfs:
       - /tmp
